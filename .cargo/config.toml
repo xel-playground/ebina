@@ -1,0 +1,5 @@
+[target.wasm32-wasip1]
+# `syscall` is a host import provided by the kernel's wasmtime Linker at
+# instantiation time (kernel/src/abi.rs), not a libc symbol — wasm-ld needs
+# to be told it's OK for it to stay unresolved at link time.
+rustflags = ["-C", "link-arg=--import-undefined"]

@@ -1,0 +1,129 @@
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+/// PROJECT.md 4.6/4.7: anything that isn't a plain `open`-mode GET — a new
+/// domain under `tofu`, or any write (`http_fetch` POST/PUT/etc) — hangs
+/// here until a human approves it via the gateway, instead of the guest
+/// ever getting to make that call itself.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PendingGrant {
+    pub id: String,
+    /// "tofu_domain" (approving unlocks the whole domain permanently) or
+    /// "http_write" (approving allows only this one call to proceed)
+    pub kind: String,
+    pub method: String,
+    pub url: String,
+    pub domain: String,
+    pub created_at: i64,
+    pub status: String, // "pending" | "approved" | "denied"
+}
+
+fn grants_path(agent_home: &Path) -> PathBuf {
+    agent_home.join("logs/grants.json")
+}
+
+fn approved_domains_path(agent_home: &Path) -> PathBuf {
+    agent_home.join("logs/approved_domains.json")
+}
+
+pub fn load_grants(agent_home: &Path) -> Vec<PendingGrant> {
+    std::fs::read_to_string(grants_path(agent_home))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_grants(agent_home: &Path, grants: &[PendingGrant]) -> anyhow::Result<()> {
+    let path = grants_path(agent_home);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_vec_pretty(grants)?)?;
+    Ok(())
+}
+
+/// Called from `http_fetch` itself — creates a pending entry and returns its
+/// id for the guest's `pending_approval` error, without blocking (kernel
+/// syscalls are synchronous; a human isn't going to click "approve" within
+/// an epoch-interruption window, so the guest just gets told to try again
+/// on a later wake).
+pub fn request_grant(agent_home: &Path, kind: &str, method: &str, url: &str, domain: &str) -> anyhow::Result<String> {
+    let mut grants = load_grants(agent_home);
+    let id = format!("{}-{}", crate::logs::now_unix_secs(), grants.len());
+    grants.push(PendingGrant {
+        id: id.clone(),
+        kind: kind.to_string(),
+        method: method.to_string(),
+        url: url.to_string(),
+        domain: domain.to_string(),
+        created_at: crate::logs::now_unix_secs(),
+        status: "pending".to_string(),
+    });
+    save_grants(agent_home, &grants)?;
+    Ok(id)
+}
+
+pub fn approve(agent_home: &Path, id: &str) -> anyhow::Result<Option<PendingGrant>> {
+    let mut grants = load_grants(agent_home);
+    let Some(grant) = grants.iter_mut().find(|g| g.id == id) else {
+        return Ok(None);
+    };
+    grant.status = "approved".to_string();
+    let approved = grant.clone();
+    if approved.kind == "tofu_domain" {
+        add_approved_domain(agent_home, &approved.domain)?;
+    }
+    save_grants(agent_home, &grants)?;
+    Ok(Some(approved))
+}
+
+pub fn deny(agent_home: &Path, id: &str) -> anyhow::Result<Option<PendingGrant>> {
+    let mut grants = load_grants(agent_home);
+    let Some(grant) = grants.iter_mut().find(|g| g.id == id) else {
+        return Ok(None);
+    };
+    grant.status = "denied".to_string();
+    let denied = grant.clone();
+    save_grants(agent_home, &grants)?;
+    Ok(Some(denied))
+}
+
+fn add_approved_domain(agent_home: &Path, domain: &str) -> anyhow::Result<()> {
+    let mut domains = load_approved_domains(agent_home);
+    if !domains.iter().any(|d| d == domain) {
+        domains.push(domain.to_string());
+        let path = approved_domains_path(agent_home);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, serde_json::to_vec_pretty(&domains)?)?;
+    }
+    Ok(())
+}
+
+pub fn load_approved_domains(agent_home: &Path) -> Vec<String> {
+    std::fs::read_to_string(approved_domains_path(agent_home))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn is_domain_approved(agent_home: &Path, domain: &str) -> bool {
+    load_approved_domains(agent_home).iter().any(|d| d == domain)
+}
+
+/// Consumes a still-pending `http_write` grant for this exact method+url if
+/// one has been approved — write approvals are one-shot, not a standing
+/// permission (unlike `tofu_domain`, which is permanent once granted).
+pub fn take_approved_write(agent_home: &Path, method: &str, url: &str) -> anyhow::Result<bool> {
+    let mut grants = load_grants(agent_home);
+    let Some(pos) = grants
+        .iter()
+        .position(|g| g.kind == "http_write" && g.method == method && g.url == url && g.status == "approved")
+    else {
+        return Ok(false);
+    };
+    grants.remove(pos);
+    save_grants(agent_home, &grants)?;
+    Ok(true)
+}
