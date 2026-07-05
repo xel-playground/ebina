@@ -6,13 +6,17 @@ const items = [
   ['chat', '💬', 'Chat'],
   ['status', '📊', 'Status'],
   ['scheduler', '🗓️', 'Scheduler'],
+  ['schedule-history', '🕓', 'Schedule history'],
   ['notes', '🗒️', 'Memory notes'],
+  ['soul', '🫧', 'Soul'],
   ['skills', '🧠', 'Skills'],
   ['grants', '✅', 'Grants'],
   ['report', '📄', 'Report'],
   ['config', '⚙️', 'Config'],
   ['secrets', '🔒', 'Secrets'],
   ['logs', '📡', 'Live log'],
+  ['egress', '🌐', 'Egress log'],
+  ['llm-logs', '🧾', 'LLM logs'],
 ]
 </script>
 

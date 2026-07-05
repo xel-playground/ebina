@@ -31,6 +31,15 @@ struct AppState {
     agent_home: PathBuf,
     wasm_path: PathBuf,
     token: String,
+    /// serializes every wasm run — chat (`/api/message`), manual (`/api/wake`),
+    /// session compact, and all three scheduler-driven kinds all funnel
+    /// through `run_trigger` below, which holds this for the run's duration.
+    /// `tokio::sync::Mutex` (not `std::sync::Mutex`) because the guard needs
+    /// to stay held across the `spawn_blocking(...).await`. Without it two
+    /// runs could land on the same `memory/index.db` connection-per-run at
+    /// once — fresh `Store`/`Connection` each time, so not a Rust data race,
+    /// but SQLite itself only tolerates one writer at a time.
+    run_lock: tokio::sync::Mutex<()>,
 }
 
 /// Kernel space: this is the only piece of the system that knows agent-home
@@ -41,6 +50,7 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
         agent_home: cfg.agent_home,
         wasm_path: cfg.wasm_path,
         token: cfg.token,
+        run_lock: tokio::sync::Mutex::new(()),
     });
 
     let api = Router::new()
@@ -50,6 +60,7 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
         .route("/memory/notes", get(get_notes))
         .route("/memory/reports", get(get_reports))
         .route("/config", get(get_config).post(post_config))
+        .route("/soul", get(get_soul).post(post_soul))
         .route("/secrets", post(post_secret))
         .route("/logs", get(get_logs_sse))
         .route("/thinking", get(get_thinking_sse))
@@ -61,10 +72,16 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
         .route("/grants/{id}/approve", post(post_grant_approve))
         .route("/grants/{id}/deny", post(post_grant_deny))
         .route("/egress", get(get_egress))
+        .route("/llm/logs", get(get_llm_logs))
+        .route("/scheduler/runs", get(get_scheduled_runs))
+        .route("/scheduler/tasks", get(get_scheduler_tasks).post(post_scheduler_task))
+        .route("/scheduler/tasks/{id}", axum::routing::put(put_scheduler_task).delete(delete_scheduler_task))
         .route("/skills", get(get_skills).post(post_skill))
         .route("/skills/{name}", axum::routing::delete(delete_skill))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state.clone());
+
+    tokio::spawn(scheduler_loop(state.clone()));
 
     let app = Router::new().nest("/api", api);
 
@@ -72,6 +89,153 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
     println!("[gateway] listening on http://0.0.0.0:{}", cfg.port);
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// PROJECT.md 4.5: "tokio loop,管 next-wake + daily_maintenance cron" — until
+/// now nothing drove this; the agent only ever ran in response to a human
+/// hitting `/api/message` or `/api/wake`. Ticks every 30s and fires two
+/// kinds of self-driven wake, neither carrying chat `history` (so each is
+/// structurally a fresh session — `agent_loop.rs` only continues a
+/// conversation when `trigger.history` is present):
+///
+/// - `daily_maintenance`, once `memory/maintenance_reports/<today>.md` is
+///   missing (retried at most every 15 min if a run doesn't produce it)
+/// - `cron`, once the agent's own last-requested `sleep_until` has passed
+/// - one `scheduled_task` wake per enabled, cron-matching entry under
+///   `crate::scheduler_tasks` — user/agent-defined jobs (`data_path` points
+///   the woken session at its own instructions), independent of the two
+///   built-in wakes above
+async fn scheduler_loop(state: Arc<AppState>) {
+    let mut last_daily_maintenance_attempt: Option<i64> = None;
+    let mut last_handled_sleep_until: Option<i64> = None;
+    loop {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let now = crate::logs::now_unix_secs();
+
+        let report_path = state.agent_home.join(format!("memory/maintenance_reports/{}.md", crate::logs::today_utc()));
+        if !report_path.exists() && last_daily_maintenance_attempt.is_none_or(|last| now - last >= 900) {
+            last_daily_maintenance_attempt = Some(now);
+            run_scheduled(state.clone(), json!({"type": "daily_maintenance"})).await;
+        }
+
+        let last_run: Option<Value> = std::fs::read_to_string(state.agent_home.join("logs/last_run.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok());
+        if let Some(sleep_until) = last_run.and_then(|v| v.get("sleep_until").and_then(Value::as_i64)) {
+            if now >= sleep_until && last_handled_sleep_until != Some(sleep_until) {
+                last_handled_sleep_until = Some(sleep_until);
+                run_scheduled(state.clone(), json!({"type": "cron"})).await;
+            }
+        }
+
+        for task in crate::scheduler_tasks::load_tasks(&state.agent_home) {
+            if !task.enabled || !crate::cron::matches(&task.cron, now) {
+                continue;
+            }
+            // one fire per matching minute — a tick every 30s would
+            // otherwise double-fire any spec that matches for a whole minute
+            if task.last_run.is_some_and(|last| last / 60 == now / 60) {
+                continue;
+            }
+            crate::scheduler_tasks::mark_run(&state.agent_home, &task.id, now);
+            run_scheduled(state.clone(), json!({"type": "scheduled_task", "task_id": task.id, "data_path": task.data_path})).await;
+        }
+    }
+}
+
+/// Runs a self-driven trigger (as opposed to a human hitting `/api/message`/
+/// `/api/wake`) and, since nothing else logs these, records `{trigger,
+/// outcome}` to `logs/scheduled_runs/<ts>-<type>.json` — "要有 session 紀錄"
+/// for scheduler-driven wakes, browsable via `GET /api/scheduler/runs`.
+async fn run_scheduled(state: Arc<AppState>, trigger: Value) {
+    let ts = crate::logs::now_unix_secs();
+    let trigger_type = trigger.get("type").and_then(|t| t.as_str()).unwrap_or("cron").to_string();
+    let outcome = run_trigger(state.clone(), trigger.clone()).await;
+    let dir = state.agent_home.join("logs/scheduled_runs");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let record = json!({"ts": ts, "trigger": trigger, "outcome": outcome});
+    let _ = std::fs::write(dir.join(format!("{ts}-{trigger_type}.json")), serde_json::to_vec_pretty(&record).unwrap_or_default());
+}
+
+async fn get_scheduled_runs(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let dir = state.agent_home.join("logs/scheduled_runs");
+    let mut runs = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                    runs.push(v);
+                }
+            }
+        }
+    }
+    runs.sort_by(|a, b| b["ts"].as_i64().cmp(&a["ts"].as_i64())); // newest first
+    Json(json!({"runs": runs}))
+}
+
+// ---- scheduler tasks (user/agent-defined recurring jobs, CRUD) ----
+
+async fn get_scheduler_tasks(State(state): State<Arc<AppState>>) -> Json<Value> {
+    Json(json!({"tasks": crate::scheduler_tasks::load_tasks(&state.agent_home)}))
+}
+
+#[derive(Deserialize)]
+struct AddTaskBody {
+    cron: String,
+    data_path: String,
+    #[serde(default)]
+    description: String,
+}
+
+async fn post_scheduler_task(State(state): State<Arc<AppState>>, Json(body): Json<AddTaskBody>) -> impl IntoResponse {
+    match crate::scheduler_tasks::add_task(&state.agent_home, &body.cron, &body.data_path, &body.description) {
+        Ok(task) => (StatusCode::OK, Json(json!({"ok": true, "task": task}))),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"ok": false, "error": e}))),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct UpdateTaskBody {
+    cron: Option<String>,
+    data_path: Option<String>,
+    description: Option<String>,
+    enabled: Option<bool>,
+}
+
+/// Full edit — any subset of fields — for a task viewed in the UI (or by
+/// the agent via `read_file` on its own `scheduler/<id>.json`) and then
+/// changed. `PUT` rather than `POST` since it's idempotent replace-by-field.
+async fn put_scheduler_task(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<UpdateTaskBody>,
+) -> impl IntoResponse {
+    match crate::scheduler_tasks::update_task(
+        &state.agent_home,
+        &id,
+        body.cron.as_deref(),
+        body.data_path.as_deref(),
+        body.description.as_deref(),
+        body.enabled,
+    ) {
+        Ok(Some(task)) => (StatusCode::OK, Json(json!({"ok": true, "task": task}))),
+        Ok(None) => (StatusCode::NOT_FOUND, Json(json!({"ok": false, "error": "no such task"}))),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"ok": false, "error": e}))),
+    }
+}
+
+async fn delete_scheduler_task(State(state): State<Arc<AppState>>, AxumPath(id): AxumPath<String>) -> Json<Value> {
+    match crate::scheduler_tasks::remove_task(&state.agent_home, &id) {
+        Ok(true) => Json(json!({"ok": true})),
+        Ok(false) => Json(json!({"ok": false, "error": "no such task"})),
+        Err(e) => Json(json!({"ok": false, "error": e.to_string()})),
+    }
 }
 
 async fn auth(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
@@ -125,6 +289,8 @@ async fn post_wake(State(state): State<Arc<AppState>>, Json(trigger): Json<Value
 }
 
 async fn run_trigger(state: Arc<AppState>, trigger: Value) -> Value {
+    let _permit = state.run_lock.lock().await; // held for the whole run below — see AppState::run_lock
+
     let agent_home = state.agent_home.clone();
     let wasm_path = state.wasm_path.clone();
     let trigger_str = trigger.to_string();
@@ -243,6 +409,19 @@ async fn post_config(State(state): State<Arc<AppState>>, body: String) -> impl I
     }
     match std::fs::write(state.agent_home.join("config.toml"), &body) {
         Ok(()) => (StatusCode::OK, "config updated".to_string()),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("write failed: {e}")),
+    }
+}
+
+// ---- soul (persona/identity — free-form markdown, no schema to validate) ----
+
+async fn get_soul(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    (StatusCode::OK, std::fs::read_to_string(state.agent_home.join("SOUL.md")).unwrap_or_default())
+}
+
+async fn post_soul(State(state): State<Arc<AppState>>, body: String) -> impl IntoResponse {
+    match std::fs::write(state.agent_home.join("SOUL.md"), &body) {
+        Ok(()) => (StatusCode::OK, "soul updated".to_string()),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("write failed: {e}")),
     }
 }
@@ -383,6 +562,34 @@ async fn get_egress(State(state): State<Arc<AppState>>) -> Json<Value> {
     let text = std::fs::read_to_string(state.agent_home.join("logs/egress.jsonl")).unwrap_or_default();
     let entries: Vec<Value> = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
     Json(json!({"entries": entries}))
+}
+
+// ---- llm call log viewer (browses logs/transcripts/, written by
+// kernel/src/syscalls/llm_call.rs's write_transcript for every single
+// llm_call — one file per call, filename is the nanosecond timestamp) ----
+
+/// Capped to the most recent 100 — transcripts can grow one file per call,
+/// no pagination yet, just enough to "quickly see what's going on".
+const MAX_LLM_LOGS: usize = 100;
+
+async fn get_llm_logs(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let dir = state.agent_home.join("logs/transcripts");
+    let mut logs = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(stem) = path.file_name().and_then(|f| f.to_str()).and_then(|f| f.strip_suffix("-llm_call.json")) else {
+                continue;
+            };
+            let Ok(ts_nanos) = stem.parse::<u128>() else { continue };
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
+            logs.push(json!({"ts": (ts_nanos / 1_000_000_000) as i64, "request": v["request"], "response": v["response"]}));
+        }
+    }
+    logs.sort_by(|a, b| b["ts"].as_i64().cmp(&a["ts"].as_i64())); // newest first
+    logs.truncate(MAX_LLM_LOGS);
+    Json(json!({"logs": logs}))
 }
 
 // ---- skills browser (mirrors agent/src/skills.rs's file format exactly,

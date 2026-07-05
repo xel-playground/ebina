@@ -2,36 +2,94 @@
 import { ref, onMounted } from 'vue'
 import { api } from '../api'
 
-const status = ref(null)
-const wakeResult = ref('')
+const tasks = ref([])
+const selectedTask = ref(null)
+const isNewTask = ref(false)
+const taskResult = ref('')
 
-async function refresh() { status.value = (await api('/status')).body }
-async function wakeNow() {
-  const { body } = await api('/wake', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ type: 'manual', text: 'manual wake-up check' }),
-  })
-  wakeResult.value = JSON.stringify(body, null, 2)
-  refresh()
+async function refresh() {
+  tasks.value = (await api('/scheduler/tasks')).body.tasks || []
+  const stillThere = tasks.value.find(t => t.id === selectedTask.value?.id)
+  if (stillThere) selectedTask.value = stillThere
+}
+
+function selectTask(t) {
+  isNewTask.value = false
+  taskResult.value = ''
+  selectedTask.value = { ...t }
+}
+function newTask() {
+  isNewTask.value = true
+  taskResult.value = ''
+  selectedTask.value = { cron: '0 9 * * *', data_path: '/workspace/tasks/', description: '', enabled: true }
+}
+async function saveTask() {
+  const t = selectedTask.value
+  const { body } = isNewTask.value
+    ? await api('/scheduler/tasks', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cron: t.cron, data_path: t.data_path, description: t.description }),
+      })
+    : await api('/scheduler/tasks/' + encodeURIComponent(t.id), {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cron: t.cron, data_path: t.data_path, description: t.description, enabled: t.enabled }),
+      })
+  taskResult.value = typeof body === 'string' ? body : JSON.stringify(body)
+  isNewTask.value = false
+  await refresh()
+}
+async function deleteTask() {
+  if (!selectedTask.value?.id) return
+  await api('/scheduler/tasks/' + encodeURIComponent(selectedTask.value.id), { method: 'DELETE' })
+  selectedTask.value = null
+  await refresh()
 }
 onMounted(refresh)
 defineExpose({ refresh })
 </script>
 
 <template>
-  <div>
-    <h2>Scheduler <button class="secondary" @click="refresh">Refresh</button></h2>
-    <div class="card">
-      <p class="hint">No background scheduler loop yet (PROJECT.md Phase 4.5) — the agent only wakes when
-        you send a chat message or hit "Wake now" below. This just shows the next wake time it last asked for.</p>
-      <dl class="kv">
-        <dt>next requested wake</dt>
-        <dd>{{ status?.last_run?.sleep_until ? new Date(status.last_run.sleep_until * 1000).toLocaleString() : '—' }}</dd>
-        <dt>last run</dt>
-        <dd>{{ status?.last_run ? new Date(status.last_run.ts * 1000).toLocaleString() : '—' }}</dd>
-      </dl>
-      <div class="row"><button @click="wakeNow">Wake now</button></div>
-      <pre v-if="wakeResult">{{ wakeResult }}</pre>
+  <div class="split-section">
+    <h2>
+      Scheduler
+      <span class="row" style="margin:0; gap:0.4rem;">
+        <button class="secondary" @click="newTask">New</button>
+        <button class="secondary" @click="refresh">Refresh</button>
+      </span>
+    </h2>
+    <p class="hint">One file per task under `scheduler/&lt;id&gt;.json` — the agent can set these up itself
+      via chat (`schedule_task`/`update_task`/`delete_task`), or add/edit them here. `cron` is 5-field
+      (minute hour day month weekday, UTC): `*`, a number, a comma list, or `*/step`.
+      `data_path` is a guest-absolute path the agent read_files for its instructions when woken.</p>
+    <div class="hint" v-if="tasks.length === 0 && !selectedTask">no scheduled tasks yet — click New to add one</div>
+    <div class="split-body" v-else>
+      <div class="split-list">
+        <div class="hint" v-if="tasks.length === 0">no scheduled tasks yet</div>
+        <div v-for="t in tasks" :key="t.id" class="split-item"
+             :class="{ active: selectedTask && selectedTask.id === t.id }"
+             @click="selectTask(t)">
+          {{ t.enabled ? '⏰' : '⏸️' }} {{ t.cron }} — {{ t.description || t.data_path }}
+        </div>
+      </div>
+      <div class="split-content">
+        <div v-if="selectedTask">
+          <div class="row">
+            <input type="text" v-model="selectedTask.cron" placeholder="0 9 * * *">
+            <label v-if="!isNewTask" class="row" style="margin:0"><input type="checkbox" v-model="selectedTask.enabled"> enabled</label>
+          </div>
+          <input type="text" v-model="selectedTask.data_path" placeholder="/workspace/tasks/x.md">
+          <input type="text" v-model="selectedTask.description" placeholder="one-line description">
+          <div class="hint" v-if="!isNewTask">
+            id: {{ selectedTask.id }} — last run: {{ selectedTask.last_run ? new Date(selectedTask.last_run * 1000).toLocaleString() : 'never' }}
+          </div>
+          <div class="row">
+            <button @click="saveTask">Save</button>
+            <button class="secondary" @click="deleteTask" v-if="!isNewTask">Delete</button>
+          </div>
+          <pre v-if="taskResult">{{ taskResult }}</pre>
+        </div>
+        <div class="hint" v-else>select a task on the left, or click New</div>
+      </div>
     </div>
   </div>
 </template>

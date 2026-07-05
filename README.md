@@ -83,12 +83,37 @@ api_key = "{secrets.ollama}"   # name of an entry in tmp/secrets.toml
 ollama = "the-real-key"
 ```
 
+## Persona (`SOUL.md`)
+
+`tmp/agent-home/SOUL.md` — free-form markdown, no required shape (persona,
+values, tone, whatever). If present, it's included **in full** in every
+system prompt (unlike skills, which are progressive-disclosure: name +
+description until asked for). No dedicated action for it — the agent reads
+and edits it with the same `read_file`/`write_file` actions it uses for
+anything else at `/SOUL.md`; a human can do the same via `GET`/`POST
+/api/soul` (raw text, same shape as `/api/config`) or the webui's Soul tab.
+It's fine for the file not to exist yet.
+
 ## LLM / embed providers
 
-`[llm]`/`[embed]` each have a `provider` field (`"anthropic"` or `"ollama"`)
-that controls request/response shaping (auth header style, `messages` vs
-Anthropic's top-level `system`, token-usage field names, etc.) — the guest
-never needs to know which provider is behind `llm_call`/`embed`.
+`[llm]`/`[embed]` each have a `provider` field (`"anthropic"`, `"ollama"`, or
+`[llm]`-only `"openai"`) that controls request/response shaping (auth header
+style, `messages` vs Anthropic's top-level `system`, token-usage field
+names, etc.) — the guest never needs to know which provider is behind
+`llm_call`/`embed`.
+
+`provider = "openai"` is the generic OpenAI-compatible chat completions
+shape (Bearer auth, `choices[].message.content`,
+`usage.prompt_tokens`/`completion_tokens`, non-streaming) — covers any
+OpenAI-style API, e.g. [Kimi/Moonshot](https://platform.kimi.ai):
+
+```toml
+[llm]
+base_url = "https://api.moonshot.ai/v1/chat/completions"
+model = "kimi-k2.6"
+provider = "openai"
+api_key = "{secrets.kimi}"
+```
 
 ### No embed provider available? Run one locally
 

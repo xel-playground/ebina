@@ -64,7 +64,7 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
     let client = reqwest::blocking::Client::new();
     let mut request = client.post(&state.config.llm.base_url).header("content-type", "application/json");
     request = match provider.as_str() {
-        "ollama" => request.bearer_auth(&api_key),
+        "ollama" | "openai" => request.bearer_auth(&api_key),
         _ => request.header("x-api-key", &api_key).header("anthropic-version", "2023-06-01"),
     };
     let http_result = request.json(&body).send();
@@ -88,17 +88,33 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
         return error_json("llm_error", &format!("HTTP {status}: {response_json}"));
     }
 
-    // only Anthropic (or an ollama error body) reaches here — ollama success is streamed above
-    let input_tokens = response_json.get("usage").and_then(|u| u.get("input_tokens")).and_then(|v| v.as_u64()).unwrap_or(0);
-    let output_tokens = response_json.get("usage").and_then(|u| u.get("output_tokens")).and_then(|v| v.as_u64()).unwrap_or(0);
-    let text = response_json
-        .get("content")
-        .and_then(|c| c.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|block| block.get("text"))
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
+    // only Anthropic/OpenAI-shaped (or an ollama error body) reaches here — ollama success is streamed above
+    let (text, input_tokens, output_tokens) = if provider == "openai" {
+        let text = response_json
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|choice| choice.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let input = response_json.get("usage").and_then(|u| u.get("prompt_tokens")).and_then(|v| v.as_u64()).unwrap_or(0);
+        let output = response_json.get("usage").and_then(|u| u.get("completion_tokens")).and_then(|v| v.as_u64()).unwrap_or(0);
+        (text, input, output)
+    } else {
+        let input = response_json.get("usage").and_then(|u| u.get("input_tokens")).and_then(|v| v.as_u64()).unwrap_or(0);
+        let output = response_json.get("usage").and_then(|u| u.get("output_tokens")).and_then(|v| v.as_u64()).unwrap_or(0);
+        let text = response_json
+            .get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|block| block.get("text"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        (text, input, output)
+    };
 
     record_usage(state, input_tokens, output_tokens);
     ok_json(serde_json::json!({
@@ -118,13 +134,15 @@ fn abort_flag_path(agent_home: &Path) -> PathBuf {
 /// Reads Ollama's NDJSON stream (one `{"message":{"content","thinking"},...}`
 /// object per line, deltas rather than cumulative text) line by line —
 /// `reqwest::blocking::Response` implements `Read`, so this is plain
-/// synchronous I/O, no async runtime needed. Tails `thinking` deltas into a
-/// file the gateway can stream live, and checks the abort flag between
-/// lines so an operator can cut a runaway generation short.
+/// synchronous I/O, no async runtime needed. Appends `thinking` deltas to
+/// the same live-progress file `agent_loop.rs` writes its per-turn action
+/// trace to (cleared once per *run*, not per call — this is one `llm_call`
+/// among possibly several turns in that run, so clearing here would erase
+/// earlier turns' trace lines), and checks the abort flag between lines so
+/// an operator can cut a runaway generation short.
 fn handle_ollama_stream(state: &mut AgentState, body: Value, response: reqwest::blocking::Response) -> Value {
     let think_path = thinking_path(&state.agent_home);
     let _ = std::fs::create_dir_all(think_path.parent().unwrap());
-    let _ = std::fs::write(&think_path, "");
 
     let abort_path = abort_flag_path(&state.agent_home);
     // clear out anything left over from a previous, already-finished call
@@ -154,7 +172,10 @@ fn handle_ollama_stream(state: &mut AgentState, body: Value, response: reqwest::
             }
             if let Some(t) = msg.get("thinking").and_then(|v| v.as_str()) {
                 full_thinking.push_str(t);
-                let _ = std::fs::write(&think_path, &full_thinking);
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&think_path) {
+                    use std::io::Write as _;
+                    let _ = f.write_all(t.as_bytes());
+                }
             }
         }
         if chunk.get("done").and_then(|v| v.as_bool()) == Some(true) {

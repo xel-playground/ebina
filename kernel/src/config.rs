@@ -38,7 +38,11 @@ pub struct LlmConfig {
     pub api_key: String,
     pub model: String,
     /// "anthropic" (x-api-key + anthropic-version headers, Messages API
-    /// request/response shape) or "ollama" (Bearer auth, /api/chat shape)
+    /// request/response shape), "ollama" (Bearer auth, /api/chat NDJSON
+    /// streaming shape), or "openai" (Bearer auth, standard OpenAI chat
+    /// completions shape — `choices[].message.content` +
+    /// `usage.prompt_tokens/completion_tokens`, non-streaming; covers any
+    /// OpenAI-compatible API such as Kimi/Moonshot, DeepSeek, etc.)
     pub provider: String,
 }
 

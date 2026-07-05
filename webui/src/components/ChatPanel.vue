@@ -1,6 +1,16 @@
 <script setup>
 import { ref, nextTick, onMounted, onUnmounted } from 'vue'
 import { api, eventSource } from '../api'
+import { marked } from 'marked'
+import DOMPurify from 'dompurify'
+
+// agent replies can themselves contain content the agent read off the open
+// internet (http_fetch/search_web results it summarized) — sanitize before
+// v-html, same "untrusted content" treatment agent_loop.rs's system prompt
+// already tells the agent to apply when reading fetched pages
+function renderMarkdown(text) {
+  return DOMPurify.sanitize(marked.parse(text, { breaks: true }))
+}
 
 const chatMessages = ref([])
 const msg = ref('')
@@ -20,6 +30,7 @@ async function refreshSession() {
     role: t.role === 'user' ? 'user' : (t.role === 'system' ? 'system' : 'agent'),
     text: t.content,
     time: new Date(t.ts * 1000).toLocaleTimeString(),
+    raw: false,
   }))
   scrollToBottom()
 }
@@ -75,8 +86,13 @@ defineExpose({ refreshSession })
     </h2>
     <div class="chat-log" ref="chatLog">
       <div v-for="(m, i) in chatMessages" :key="i" class="bubble" :class="m.role">
-        <div class="meta" v-if="m.role !== 'system'">{{ m.role === 'user' ? 'you' : 'agent' }} · {{ m.time }}</div>
-        <div>{{ m.text }}</div>
+        <div class="meta" v-if="m.role !== 'system'">
+          {{ m.role === 'user' ? 'you' : 'agent' }} · {{ m.time }}
+          <button v-if="m.role === 'agent'" class="link-btn" @click="m.raw = !m.raw">{{ m.raw ? 'rendered' : 'raw' }}</button>
+        </div>
+        <div v-if="m.role === 'agent' && !m.raw" class="md" v-html="renderMarkdown(m.text)"></div>
+        <pre v-else-if="m.role === 'agent'" class="raw-text">{{ m.text }}</pre>
+        <div v-else>{{ m.text }}</div>
       </div>
       <div class="bubble agent" v-if="sending">
         <div class="meta">agent · thinking…</div>

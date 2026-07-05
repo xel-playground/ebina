@@ -50,9 +50,10 @@ defineExpose({ refresh })
         <button class="secondary" @click="refresh">Refresh</button>
       </span>
     </h2>
-    <div class="hint" v-if="skills.length === 0">no skills saved yet — the agent saves these itself via `save_skill`, or add one here</div>
+    <div class="hint" v-if="skills.length === 0 && !selectedSkill">no skills saved yet — the agent saves these itself via `save_skill`, or add one here</div>
     <div class="split-body" v-else>
       <div class="split-list">
+        <div class="hint" v-if="skills.length === 0">no skills saved yet</div>
         <div v-for="s in skills" :key="s.name" class="split-item"
              :class="{ active: selectedSkill && selectedSkill.name === s.name }"
              @click="selectSkill(s)">

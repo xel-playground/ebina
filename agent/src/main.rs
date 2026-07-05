@@ -1,5 +1,6 @@
 mod agent_loop;
 mod memory;
+mod scheduler;
 mod skills;
 mod syscall;
 mod time;
