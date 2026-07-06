@@ -31,7 +31,6 @@ fn main() {
         "http_fetch_ssrf_metadata" => http_fetch_url("http://169.254.169.254/"),
         "http_fetch_post" => http_fetch_post_demo(),
         "http_fetch_long_url" => http_fetch_url(&format!("https://example.com/?q={}", "a".repeat(3000))),
-        "exec_wasm_demo" => exec_wasm_demo(),
         "search_web_demo" => search_web_demo(),
         "read_path" => read_path_mode(),
         "run" => run_mode(),
@@ -148,17 +147,8 @@ fn http_fetch_post_demo() {
     println!("RESULT:{resp}");
 }
 
-fn exec_wasm_demo() {
-    let resp = syscall::call(
-        "exec_wasm",
-        &serde_json::json!({"wasm_path": "bin/tool.wasm", "args": ["read_path", "/memory/notes/pet.md"]}),
-    );
-    println!("RESULT:{resp}");
-}
-
-/// reads the path given as argv[2] — used both directly (host-driven tests)
-/// and as the payload run *inside* an `exec_wasm` sub-Store, where "/" is
-/// scoped to `workspace/` instead of the whole agent-home
+/// reads the path given as argv[2] — used directly by host-driven
+/// traversal/symlink-escape tests
 fn read_path_mode() {
     let path = std::env::args().nth(2).unwrap_or_default();
     try_read(&path);

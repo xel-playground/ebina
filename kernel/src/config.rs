@@ -11,6 +11,7 @@ pub struct Config {
     pub ratelimit: RateLimitConfig,
     pub db: DbConfig,
     pub network: NetworkConfig,
+    pub chat: ChatConfig,
 }
 
 impl Default for Config {
@@ -23,6 +24,7 @@ impl Default for Config {
             ratelimit: RateLimitConfig::default(),
             db: DbConfig::default(),
             network: NetworkConfig::default(),
+            chat: ChatConfig::default(),
         }
     }
 }
@@ -175,6 +177,24 @@ impl Default for DbConfig {
         DbConfig {
             query_timeout_secs: 10,
         }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(default)]
+pub struct ChatConfig {
+    /// once a chat session's last-measured context window (`context_tokens`,
+    /// see gateway.rs `last_chat_context_tokens`) exceeds this, the *next*
+    /// chat turn on that session auto-compacts it in the background (same
+    /// summarize-then-replace mechanism as `/api/session/compact`). Mainly
+    /// for Discord threads, which have no manual reset button — left alone
+    /// they'd grow the context window forever.
+    pub auto_compact_tokens: u64,
+}
+
+impl Default for ChatConfig {
+    fn default() -> Self {
+        ChatConfig { auto_compact_tokens: 50_000 }
     }
 }
 

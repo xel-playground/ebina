@@ -16,6 +16,7 @@ const chatMessages = ref([])
 const msg = ref('')
 const sending = ref(false)
 const thinkingText = ref('')
+const contextTokens = ref(null)
 const chatLog = ref(null)
 let thinkingSource = null
 
@@ -32,6 +33,7 @@ async function refreshSession() {
     time: new Date(t.ts * 1000).toLocaleTimeString(),
     raw: false,
   }))
+  contextTokens.value = body.context_tokens ?? null
   scrollToBottom()
 }
 
@@ -79,6 +81,9 @@ defineExpose({ refreshSession })
   <div class="chat-section">
     <h2>
       Chat
+      <span class="hint" v-if="contextTokens != null" style="font-size:0.75rem; margin-left:0.5rem;">
+        context: ~{{ contextTokens.toLocaleString() }} tokens
+      </span>
       <span class="row" style="margin:0; gap:0.4rem;">
         <button class="secondary" @click="compactSession" v-if="chatMessages.length">Compact</button>
         <button class="secondary" @click="resetSession" v-if="chatMessages.length">Reset</button>

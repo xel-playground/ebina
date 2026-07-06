@@ -4,6 +4,37 @@ use crate::state::AgentState;
 use serde_json::Value;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+const MAX_SEND_ATTEMPTS: u32 = 3;
+const RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// Retries only a transient failure to even establish the connection
+/// (DNS/connect/timeout) — linear backoff (500ms, 1s). A response that came
+/// back but with an HTTP error status (4xx/5xx) is `Ok(response)` as far as
+/// reqwest is concerned and reaches the normal status-check path below
+/// unaffected; retrying *that* here would risk resending a non-idempotent
+/// request the provider may have already partially processed.
+fn send_with_retries(request: reqwest::blocking::RequestBuilder) -> Result<reqwest::blocking::Response, reqwest::Error> {
+    let mut last_err = None;
+    for attempt in 0..MAX_SEND_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(RETRY_DELAY * attempt);
+        }
+        let cloned = request.try_clone().expect("llm_call bodies are always in-memory JSON, always clonable");
+        match cloned.send() {
+            Ok(resp) => return Ok(resp),
+            Err(e) => {
+                let transient = e.is_connect() || e.is_timeout();
+                last_err = Some(e);
+                if !transient {
+                    break;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap())
+}
 
 /// `llm_call({messages: [{role, content}], ...}) -> {text, usage}` — host
 /// holds the API key and normalizes provider-specific request/response
@@ -51,9 +82,15 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
         Err(e) => return error_json("no_api_key", &e),
     };
 
+    // `_meta` (session_key/channel — set by agent_loop.rs from the trigger
+    // it's currently handling) is logging-only, never sent to the provider;
+    // pulled out before `body` becomes the actual outgoing request.
+    let source = req.get("_meta").cloned().unwrap_or(Value::Null);
+
     let provider = state.config.llm.provider.clone();
     let mut body = req.clone();
     if let Value::Object(ref mut map) = body {
+        map.remove("_meta");
         map.entry("model").or_insert_with(|| Value::String(state.config.llm.model.clone()));
         map.insert("stream".to_string(), Value::Bool(provider == "ollama"));
     }
@@ -67,7 +104,7 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
         "ollama" | "openai" => request.bearer_auth(&api_key),
         _ => request.header("x-api-key", &api_key).header("anthropic-version", "2023-06-01"),
     };
-    let http_result = request.json(&body).send();
+    let http_result = send_with_retries(request.json(&body));
 
     let response = match http_result {
         Ok(resp) => resp,
@@ -76,14 +113,14 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
     let status = response.status();
 
     if provider == "ollama" && status.is_success() {
-        return handle_ollama_stream(state, body, response);
+        return handle_ollama_stream(state, body, response, &source);
     }
 
     let response_json: Value = match response.json() {
         Ok(v) => v,
         Err(e) => return error_json("bad_response", &e.to_string()),
     };
-    write_transcript(state, &body, &response_json);
+    write_transcript(state, &body, &response_json, &source);
     if !status.is_success() {
         return error_json("llm_error", &format!("HTTP {status}: {response_json}"));
     }
@@ -116,7 +153,7 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
         (text, input, output)
     };
 
-    record_usage(state, input_tokens, output_tokens);
+    record_usage(state, input_tokens, output_tokens, &source);
     ok_json(serde_json::json!({
         "text": text,
         "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
@@ -140,7 +177,7 @@ fn abort_flag_path(agent_home: &Path) -> PathBuf {
 /// among possibly several turns in that run, so clearing here would erase
 /// earlier turns' trace lines), and checks the abort flag between lines so
 /// an operator can cut a runaway generation short.
-fn handle_ollama_stream(state: &mut AgentState, body: Value, response: reqwest::blocking::Response) -> Value {
+fn handle_ollama_stream(state: &mut AgentState, body: Value, response: reqwest::blocking::Response, source: &Value) -> Value {
     let think_path = thinking_path(&state.agent_home);
     let _ = std::fs::create_dir_all(think_path.parent().unwrap());
 
@@ -211,20 +248,21 @@ fn handle_ollama_stream(state: &mut AgentState, body: Value, response: reqwest::
             "message": {"content": text, "thinking": full_thinking},
             "prompt_eval_count": input_tokens, "eval_count": output_tokens, "aborted": aborted,
         }),
+        source,
     );
 
     if aborted {
         return error_json("aborted", "generation cancelled by operator");
     }
 
-    record_usage(state, input_tokens, output_tokens);
+    record_usage(state, input_tokens, output_tokens, source);
     ok_json(serde_json::json!({
         "text": text,
         "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
     }))
 }
 
-fn record_usage(state: &mut AgentState, input_tokens: u64, output_tokens: u64) {
+fn record_usage(state: &mut AgentState, input_tokens: u64, output_tokens: u64, source: &Value) {
     let total_tokens = input_tokens + output_tokens;
     if let Err(e) = state.budget.record(total_tokens) {
         let _ = crate::logs::notify(&state.agent_home, &format!("failed to record budget: {e}"));
@@ -237,6 +275,7 @@ fn record_usage(state: &mut AgentState, input_tokens: u64, output_tokens: u64) {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": total_tokens,
+            "source": source,
         }),
     );
 }
@@ -260,7 +299,7 @@ fn normalize_for_anthropic(body: &mut Value) {
     }
 }
 
-fn write_transcript(state: &AgentState, request: &Value, response: &Value) {
+fn write_transcript(state: &AgentState, request: &Value, response: &Value, source: &Value) {
     let path = state
         .agent_home
         .join(format!("logs/transcripts/{}-llm_call.json", now_unix_nanos()));
@@ -269,7 +308,7 @@ fn write_transcript(state: &AgentState, request: &Value, response: &Value) {
     }
     let _ = std::fs::write(
         &path,
-        serde_json::to_vec_pretty(&serde_json::json!({"request": request, "response": response}))
+        serde_json::to_vec_pretty(&serde_json::json!({"request": request, "response": response, "source": source}))
             .unwrap_or_default(),
     );
 }

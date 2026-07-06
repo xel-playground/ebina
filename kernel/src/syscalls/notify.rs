@@ -8,7 +8,11 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
     let Some(message) = req.get("message").and_then(|m| m.as_str()) else {
         return error_json("bad_request", "notify requires a string `message` field");
     };
-    match crate::logs::notify(&state.agent_home, message) {
+    let result = match req.get("_meta") {
+        Some(source) => crate::logs::notify_with_source(&state.agent_home, message, source),
+        None => crate::logs::notify(&state.agent_home, message),
+    };
+    match result {
         Ok(()) => ok_json(Value::Null),
         Err(e) => error_json("io_error", &e.to_string()),
     }

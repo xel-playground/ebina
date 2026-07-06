@@ -23,6 +23,16 @@ function tokens(entry) {
   if (r.prompt_eval_count != null) return `${r.prompt_eval_count} in / ${r.eval_count ?? '?'} out`
   return '—'
 }
+// `source.session_key` is only set for a "message" trigger (webui or a
+// specific Discord channel/DM — see agent_loop.rs `source_meta`); a
+// cron/daily_maintenance/scheduled_task run just shows its trigger type.
+// `source` itself is missing entirely on transcripts logged before this existed.
+function sourceLabel(entry) {
+  const s = entry.source
+  if (!s) return '(unknown)'
+  if (s.session_key) return `${s.channel} · ${s.session_key}`
+  return s.trigger_type || '(unknown)'
+}
 
 async function refresh() { logs.value = (await api('/llm/logs')).body.logs || [] }
 function toggle(i) { expanded.value = { ...expanded.value, [i]: !expanded.value[i] } }
@@ -37,7 +47,7 @@ defineExpose({ refresh })
     <div class="hint" v-if="logs.length === 0">no llm_call logs yet</div>
     <div class="card" v-for="(entry, i) in logs" :key="entry.ts" style="margin-bottom:0.5rem">
       <div class="row" style="justify-content:space-between; cursor:pointer" @click="toggle(i)">
-        <strong>{{ entry.request?.model || '(unknown model)' }}</strong>
+        <strong>{{ entry.request?.model || '(unknown model)' }} <span class="hint">— {{ sourceLabel(entry) }}</span></strong>
         <span class="hint">{{ tokens(entry) }} · {{ new Date(entry.ts * 1000).toLocaleString() }}</span>
       </div>
       <div v-if="!expanded[i]" style="white-space:pre-wrap">{{ replyText(entry).slice(0, 200) }}</div>

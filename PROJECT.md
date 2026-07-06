@@ -178,16 +178,22 @@ http_per_domain_per_min = 10   # 對外禮貌,防同站連打被 ban IP
 
 已知取捨:`open` 模式下 GET query string 是 exfiltration 通道,url_max_len + 完整 URL log 為緩解;在意時切 `tofu`。
 
-### 4.7 工具自動安裝(agent 自建 toolbox)
-「安裝」= 把 .wasm 放進 `workspace/bin/`。二進位信任問題由 Store 解決:惡意工具最壞搞亂 workspace,無網路、出不了 agent-home。
+### 4.7 工具自動安裝(agent 自建 toolbox)——**已嘗試,已回退**
+「安裝」= 把 .wasm 放進 workspace 外的 `tools/`。二進位信任問題由 Store 解決:惡意工具最壞搞亂 workspace,無網路、出不了 agent-home。
 
-**流程**:agent 判斷需求 → http_fetch 搜尋/下載(GET)→ kernel 輕量驗證(合法 wasm module、wasip1、size cap)→ 落地 `workspace/bin/` + 寫 `lockfile.json`(name/source_url/sha256/installed_at)→ `exec_wasm` 使用。
+**流程(設計,未實作)**:agent 判斷需求 → http_fetch 搜尋/下載(GET)→ kernel 輕量驗證(合法 wasm module、size cap)→ 落地 `tools/` + 寫 `lockfile.json`(name/source_url/sha256/installed_at)→ `exec_wasm` 使用。
 
 - **Lockfile**:gateway 可審計裝了什麼;agent 遷移時 kernel 照 lockfile 還原工具;hash 可比對官方 release
 - **工具輸出視為不可信輸入**(stdout 進 LLM context = injection 通道,agent prompt 中註明)
 - **磁碟配額**:agent-home 總量上限(如 2GB),超過拒寫 + notify
 - 現成生態:uutils(coreutils)、jq、ripgrep、wasm-git 等皆有 WASI build
 - **curl 類無意義**:網路是能力不是程式,exec_wasm 的 Store 無 socket,裝了也發不出封包——網路永遠只能經 kernel 的 http_fetch
+
+**[~] 實際做過又回退的紀錄**:為了讓 agent 能列目錄/刪檔案,一度把 `exec_wasm` syscall 真正接上(`agent_loop.rs` 補 `Some("exec_wasm")` arm)、手刻 `tools/unix`(wasm32-wasip2 component,`ls`/`cat`/`mkdir`/`rm`)、`wasm.toml` manifest 動態組進 system prompt、`tools/` 獨立於 `workspace/` 之外的目錄分離(修掉「工具能刪自己」的洞)——全部真的建好、測過、真跑驗證過。
+
+事後反省砍掉重做:`exec_wasm`/wasmtime component hosting 這整套複雜度存在的唯一理由是「要跑不信任的程式碼」,但「agent 自己上網抓現成工具」這個場景本身已經評估放棄(抓來源不明、且多半是 wasip2 跟舊 wasip1 沙盒不相容)——放棄之後,`tools/unix` 是我們自己寫、自己信任的程式碼,根本不需要沙盒。更進一步發現 `read_file`/`write_file` 本來就不是 host syscall,是 `agent_loop.rs` 直接用 guest 自己的 `std::fs`(agent.wasm 本來就 preopen 整個 agent_home)——照這個先例,`list_dir`/`make_dir`/`delete_path` 一樣直接加 3 個 action arm 用 guest-side `std::fs` 就好,不用多繞 wasmtime-in-wasmtime 這層。
+
+**最終方案**:`exec_wasm` syscall、`kernel/src/syscalls/exec_wasm.rs`、`tools/unix` crate、`agent/src/tools.rs`、`wasm.toml` manifest 全部刪除。`list_dir`/`make_dir`/`delete_path` 三個 action 直接在 `agent_loop.rs` 用 `std::fs`,跟 `read_file`/`write_file` 同款寫法。這條路留著記錄是因為「wasmtime component model host 一個真正的 wasip2 tool 跑得通」這個技術驗證本身是有效資訊——之後如果真的要跑不信任的第三方程式碼,這套做法已經驗證過可行,不用重新摸索;只是現在沒有這個需求,先不留著閒置的複雜度。
 
 ### 4.8 Credential Vault(secret 永不進沙箱)
 不新增 syscall,做在 `http_fetch` 邊界:
@@ -207,7 +213,7 @@ http_per_domain_per_min = 10   # 對外禮貌,防同站連打被 ban IP
 |---|---|---|
 | SQLite 位置 | host 原生 + `db_exec` syscall | WASI 無共享記憶體/完整檔案鎖,WAL 不可用;host 端 FTS5/sqlite-vec 全原生。代價:必須做 authorizer 加固 |
 | 程式碼執行 | 延後 | 先看 agent 純靠檔案 + llm_call 能活成什麼樣;之後要加,走「python.wasm 作為插件」或 rootless container 再議 |
-| wasip1 + JSON | 是 | 避開 Component Model 前期成本 |
+| wasip1 + JSON | 是 | 避開 Component Model 前期成本;曾為 `exec_wasm` 工具沙盒另外加過 wasip2 component 支援,後來連 `exec_wasm` 本身都回退掉了(見 4.7)——目前全專案只有主 agent 這一個 wasmtime Store |
 | fresh instantiate | 是 | crash-safe、零殘留 |
 | 前端 | ~~無 build 系統單頁~~ → 獨立 Vite+Vue 專案(`webui/`),真前後端分離 | 原本圖雜務最小化;使用者後來明確要求前後端分離、元件粒度更細,翻案換取這個 |
 
@@ -284,7 +290,9 @@ http_per_domain_per_min = 10   # 對外禮貌,防同站連打被 ban IP
 - [ ] **Agent 互通(A2A,actor model)**:設計已定——新 syscall `send_agent(target, msg)`,kernel **複製**訊息至對方 `inbox/from-<sender>/` 並喚醒;不共享任何目錄,Store 間零接觸;通訊拓撲在 kernel config 逐條宣告(capability),未宣告組合拒絕;訊息全經 kernel = 全量 A2A log,gateway 可視化對話圖。支援監督者模式、互相 review 等玩法;新 agent = 新資料夾 + 一行拓撲
 - [ ] 多 agent 基礎(每 agent 一個 Store + 資料夾,scheduler 泛化)
 - [ ] wasip2 / Component Model 遷移
-- [ ] Telegram adapter(接在 gateway 上,不動 kernel)
+- [x] **Discord adapter**(接在 gateway 上,不動 kernel——`kernel/src/discord.rs`,serenity crate 跑 Gateway websocket):只回 DM 或 @mention(避免頻道裡隨便講話都觸發);每個 DM/頻道各自一份 session(`discord-dm-<user>`/`discord-channel-<channel>`,存在 `logs/chat_sessions/<key>/`),不跟 webui 的 `webui` session 混;RAG/SOUL/skills/scheduled tasks 全域共用,只有原始對話串分開。沒設 `discord_bot_token` secret 就整個不連,gateway 照常運作。連帶把 session 儲存從單一寫死路徑改成 keyed(`session_dir(agent_home, key)`),為多 channel 鋪路
+  - [x] session compact/reset 泛化成 keyed(`gateway.rs` `compact_session_key`/`reset_session_key`,原本寫死 `"webui"`),webui 兩顆按鈕跟 Discord `!compact`/`!reset` 指令共用同一套;Discord 沒有前端按鈕可按,另外加一個 auto-compact:單一 session 的 `context_tokens` 超過 `config.toml` `[chat] auto_compact_tokens`(預設 50000)門檻,下次那個 session 一有新訊息就在背景自動 compact,不擋當次回覆。`session_watch_loop` 原本 `turns.len() <= last` 沒處理 session 被 compact/reset 縮短的情況,下次成長超過舊 `last` 會 slice 越界 panic——已修成偵測到變短就重新 baseline
+- [ ] Telegram adapter(接在 gateway 上,不動 kernel)——跟上面 Discord 同一套改法,概念已驗證過
 - [ ] python.wasm 作為標準工具(module precompile cache)——層次一自主開發:agent 寫 Python、exec_wasm 跑、迭代
 
 ### 里程碑

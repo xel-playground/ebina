@@ -6,11 +6,6 @@ fn agent_wasm_path() -> String {
     format!("{manifest_dir}/../target/wasm32-wasip1/debug/agent.wasm")
 }
 
-fn tool_wasm_path() -> String {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    format!("{manifest_dir}/../target/wasm32-wasip1/debug/examples/tool.wasm")
-}
-
 fn scratch_agent_home(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("ebina-network-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
@@ -87,25 +82,5 @@ fn http_fetch_daily_request_cap_is_enforced() {
     assert!(
         second.contains("\"code\":\"daily_cap_exceeded\""),
         "second request should be rejected once daily_request_cap=1 is exhausted, got: {second}"
-    );
-}
-
-#[test]
-fn exec_wasm_tool_cannot_see_memory_dir() {
-    let home = scratch_agent_home("execwasm");
-    let bin_dir = home.join("workspace/bin");
-    fs::create_dir_all(&bin_dir).unwrap();
-    fs::create_dir_all(home.join("memory/notes")).unwrap();
-    fs::write(home.join("memory/notes/pet.md"), "secret pet fact").unwrap();
-    fs::copy(tool_wasm_path(), bin_dir.join("tool.wasm")).expect("copy tool.wasm fixture");
-
-    let out = kernel::run_agent(home.to_str().unwrap(), &agent_wasm_path(), &["exec_wasm_demo"])
-        .expect("run_agent should not error")
-        .stdout;
-
-    assert!(out.contains("\"exit_code\":0"), "tool should exit cleanly, got: {out}");
-    assert!(
-        out.contains("blocked") && !out.contains("secret pet fact"),
-        "tool should not be able to read memory/ from inside exec_wasm's workspace-only Store, got: {out}"
     );
 }

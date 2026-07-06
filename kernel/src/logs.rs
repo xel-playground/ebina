@@ -55,3 +55,16 @@ pub fn notify(agent_home: &Path, message: &str) -> anyhow::Result<()> {
         &serde_json::json!({"ts": now_unix_secs(), "message": message}),
     )
 }
+
+/// Same as [`notify`] but tags the line with where it came from (webui vs a
+/// Discord channel/DM vs a scheduler-driven run) — used only by the
+/// `notify` *syscall* (agent-triggered), not the ~10 internal
+/// budget/rate-limit call sites elsewhere in the kernel, which have no
+/// trigger/session to attribute to.
+pub fn notify_with_source(agent_home: &Path, message: &str, source: &serde_json::Value) -> anyhow::Result<()> {
+    println!("[notify] {message}");
+    append_jsonl(
+        &agent_home.join("logs/notifications.jsonl"),
+        &serde_json::json!({"ts": now_unix_secs(), "message": message, "source": source}),
+    )
+}

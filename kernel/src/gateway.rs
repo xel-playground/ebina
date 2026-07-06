@@ -27,8 +27,8 @@ pub struct GatewayConfig {
     pub port: u16,
 }
 
-struct AppState {
-    agent_home: PathBuf,
+pub(crate) struct AppState {
+    pub(crate) agent_home: PathBuf,
     wasm_path: PathBuf,
     token: String,
     /// serializes every wasm run — chat (`/api/message`), manual (`/api/wake`),
@@ -72,6 +72,7 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
         .route("/grants/{id}/approve", post(post_grant_approve))
         .route("/grants/{id}/deny", post(post_grant_deny))
         .route("/egress", get(get_egress))
+        .route("/discord/pairing", get(get_discord_pairing))
         .route("/llm/logs", get(get_llm_logs))
         .route("/scheduler/runs", get(get_scheduled_runs))
         .route("/scheduler/tasks", get(get_scheduler_tasks).post(post_scheduler_task))
@@ -82,6 +83,7 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
         .with_state(state.clone());
 
     tokio::spawn(scheduler_loop(state.clone()));
+    tokio::spawn(crate::discord::run(state.clone()));
 
     let app = Router::new().nest("/api", api);
 
@@ -124,7 +126,8 @@ async fn scheduler_loop(state: Arc<AppState>) {
         if let Some(sleep_until) = last_run.and_then(|v| v.get("sleep_until").and_then(Value::as_i64)) {
             if now >= sleep_until && last_handled_sleep_until != Some(sleep_until) {
                 last_handled_sleep_until = Some(sleep_until);
-                run_scheduled(state.clone(), json!({"type": "cron"})).await;
+                let trigger = json!({"type": "cron", "recent_chat": recent_chat_context(&state.agent_home, DEFAULT_SESSION_KEY)});
+                run_scheduled(state.clone(), trigger).await;
             }
         }
 
@@ -263,23 +266,58 @@ struct MessageBody {
     text: String,
 }
 
+const DEFAULT_SESSION_KEY: &str = "webui";
+
 /// Chat turns are host-tracked (not just an in-browser illusion of memory):
-/// each `/api/message` loads the running session, appends the user's turn,
-/// hands the *whole* history to the guest as `trigger.history` so it's real
-/// conversational context (not just RAG over `memory/notes/`), then appends
-/// the agent's reply and saves.
-async fn post_message(State(state): State<Arc<AppState>>, Json(body): Json<MessageBody>) -> Json<Value> {
-    let mut session = load_session(&state.agent_home);
-    session.push(SessionTurn { role: "user".to_string(), content: body.text.clone(), ts: crate::logs::now_unix_secs() });
+/// loads the given session, appends the human's turn, hands the *whole*
+/// history to the guest as `trigger.history` so it's real conversational
+/// context (not just RAG over `memory/notes/`), then appends the agent's
+/// reply and saves. Shared by `/api/message` (webui, session key
+/// `"webui"`) and the Discord adapter (one session key per channel/DM —
+/// see `discord.rs`) so the two don't bleed into each other's history.
+pub(crate) async fn handle_chat_message(state: Arc<AppState>, session_key: &str, text: &str, channel: Option<&str>) -> Value {
+    let mut session = load_session(&state.agent_home, session_key);
+    session.push(SessionTurn { role: "user".to_string(), content: text.to_string(), ts: crate::logs::now_unix_secs() });
     let history: Vec<Value> = session.iter().map(SessionTurn::as_message).collect();
 
-    let outcome = run_trigger(state.clone(), json!({"type": "message", "text": body.text, "history": history})).await;
+    let mut trigger = json!({"type": "message", "text": text, "history": history, "session_key": session_key});
+    if let Some(c) = channel {
+        trigger["channel"] = Value::String(c.to_string());
+    }
+    let outcome = run_trigger(state.clone(), trigger).await;
 
     let reply = outcome.get("result").and_then(|r| r.get("summary")).and_then(|s| s.as_str()).unwrap_or("").to_string();
     session.push(SessionTurn { role: "assistant".to_string(), content: reply, ts: crate::logs::now_unix_secs() });
-    let _ = save_session(&state.agent_home, &session);
+    let _ = save_session(&state.agent_home, session_key, &session);
 
-    Json(outcome)
+    maybe_auto_compact(&state, session_key);
+
+    outcome
+}
+
+/// Fires a background compact once this session's last-measured context
+/// crosses `config.chat.auto_compact_tokens` — mainly for Discord threads,
+/// which (unlike webui) have no manual reset button; left alone they'd grow
+/// the context window forever. Runs after the reply is already sent so it
+/// never adds latency to the turn that tripped it.
+fn maybe_auto_compact(state: &Arc<AppState>, session_key: &str) {
+    let Some(tokens) = last_chat_context_tokens(&state.agent_home, session_key) else { return };
+    let threshold = Config::load(&state.agent_home)
+        .map(|c| c.chat.auto_compact_tokens)
+        .unwrap_or(crate::config::ChatConfig::default().auto_compact_tokens);
+    if tokens < threshold {
+        return;
+    }
+    println!("[chat] {session_key} hit {tokens} context tokens (>= {threshold}) — auto-compacting");
+    let state = state.clone();
+    let key = session_key.to_string();
+    tokio::spawn(async move {
+        compact_session_key(state, &key).await;
+    });
+}
+
+async fn post_message(State(state): State<Arc<AppState>>, Json(body): Json<MessageBody>) -> Json<Value> {
+    Json(handle_chat_message(state, DEFAULT_SESSION_KEY, &body.text, None).await)
 }
 
 /// dev/debug: fire an arbitrary trigger JSON immediately (PROJECT.md 4.4
@@ -448,6 +486,13 @@ async fn post_secret(State(state): State<Arc<AppState>>, Json(body): Json<SetSec
 }
 
 // ---- chat session (compact / reset, archived on both) ----
+//
+// Keyed per conversation source — `"webui"` for the browser UI, one
+// `discord-dm-<user>`/`discord-channel-<channel>` per Discord source (see
+// discord.rs) — so they don't bleed into each other's history/context.
+// Everything *else* (memory/notes/ RAG, SOUL, skills, scheduled tasks) stays
+// global: one agent, one long-term brain, many separate conversation
+// threads with it.
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct SessionTurn {
@@ -462,19 +507,50 @@ impl SessionTurn {
     }
 }
 
-fn session_path(agent_home: &Path) -> PathBuf {
-    agent_home.join("logs/session.json")
+fn session_dir(agent_home: &Path, key: &str) -> PathBuf {
+    agent_home.join("logs/chat_sessions").join(key)
 }
 
-fn load_session(agent_home: &Path) -> Vec<SessionTurn> {
-    std::fs::read_to_string(session_path(agent_home))
+fn session_path(agent_home: &Path, key: &str) -> PathBuf {
+    session_dir(agent_home, key).join("session.json")
+}
+
+fn load_session(agent_home: &Path, key: &str) -> Vec<SessionTurn> {
+    std::fs::read_to_string(session_path(agent_home, key))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
 }
 
-fn save_session(agent_home: &Path, turns: &[SessionTurn]) -> anyhow::Result<()> {
-    let path = session_path(agent_home);
+const RECENT_CHAT_TURNS: usize = 6;
+const RECENT_CHAT_MAX_CHARS: usize = 500;
+
+/// Last `RECENT_CHAT_TURNS` turns from the given session, each capped to
+/// `RECENT_CHAT_MAX_CHARS` — fixed-size regardless of how long the real
+/// conversation grows, unlike full `history` (which only a `message`
+/// trigger gets). Gives a `cron` wake enough "what were we just talking
+/// about" for `chat_send` not to feel completely blind, without the prompt
+/// growing forever as the chat session grows. `cron` is a single global
+/// wake (not per-Discord-channel), so it always reads the `"webui"` one.
+fn recent_chat_context(agent_home: &Path, key: &str) -> Vec<Value> {
+    let turns = load_session(agent_home, key);
+    let start = turns.len().saturating_sub(RECENT_CHAT_TURNS);
+    turns[start..].iter().map(|t| json!({"role": t.role, "content": truncate_chars(&t.content, RECENT_CHAT_MAX_CHARS)})).collect()
+}
+
+/// Truncates by *char* count, not bytes — `String::truncate` panics/
+/// corrupts on a non-char-boundary byte offset, which CJK text (this
+/// project's primary chat language) hits constantly.
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max_chars).collect::<String>())
+    }
+}
+
+fn save_session(agent_home: &Path, key: &str, turns: &[SessionTurn]) -> anyhow::Result<()> {
+    let path = session_path(agent_home, key);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -482,14 +558,14 @@ fn save_session(agent_home: &Path, turns: &[SessionTurn]) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Moves the current session to `logs/sessions/<ts>.json` — "留一個 session
+/// Moves the session to `<session_dir>/archive/<ts>.json` — "留一個 session
 /// 紀錄": reset/compact never just discard history, they archive it first.
-fn archive_session(agent_home: &Path) -> anyhow::Result<Option<PathBuf>> {
-    let turns = load_session(agent_home);
+fn archive_session(agent_home: &Path, key: &str) -> anyhow::Result<Option<PathBuf>> {
+    let turns = load_session(agent_home, key);
     if turns.is_empty() {
         return Ok(None);
     }
-    let dir = agent_home.join("logs/sessions");
+    let dir = session_dir(agent_home, key).join("archive");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.json", crate::logs::now_unix_secs()));
     std::fs::write(&path, serde_json::to_vec_pretty(&turns)?)?;
@@ -497,29 +573,71 @@ fn archive_session(agent_home: &Path) -> anyhow::Result<Option<PathBuf>> {
 }
 
 async fn get_session(State(state): State<Arc<AppState>>) -> Json<Value> {
-    Json(json!({"turns": load_session(&state.agent_home)}))
+    Json(json!({
+        "turns": load_session(&state.agent_home, DEFAULT_SESSION_KEY),
+        "context_tokens": last_chat_context_tokens(&state.agent_home, DEFAULT_SESSION_KEY),
+    }))
 }
 
-/// Archives, then clears, the current session — a fresh conversation.
+fn chat_context_tokens_path(agent_home: &Path, key: &str) -> PathBuf {
+    session_dir(agent_home, key).join("context_tokens.json")
+}
+
+/// The exact size of the context window on the most recent *chat* turn's
+/// last `llm_call` (system prompt + full history + that turn's running
+/// action-loop messages so far) — written by `agent_loop.rs` itself only
+/// when `trigger.type == "message"`, specifically so a `daily_maintenance`/
+/// `cron`/scheduled-task run elsewhere (or a session compact's own
+/// summarization call) never clobbers what the *chat* panel shows; those
+/// aren't the chat session's context at all.
+fn last_chat_context_tokens(agent_home: &Path, key: &str) -> Option<u64> {
+    let text = std::fs::read_to_string(chat_context_tokens_path(agent_home, key)).ok()?;
+    serde_json::from_str::<Value>(&text).ok()?.get("tokens")?.as_u64()
+}
+
+/// Reset/compact invalidate whatever number was showing — the old figure
+/// described a session that no longer exists, and the true post-reset/
+/// compact size isn't known until the next real chat message actually
+/// measures it (so display "—" in the meantime rather than a stale number).
+fn clear_chat_context_tokens(agent_home: &Path, key: &str) {
+    let _ = std::fs::remove_file(chat_context_tokens_path(agent_home, key));
+}
+
 async fn post_session_reset(State(state): State<Arc<AppState>>) -> Json<Value> {
-    match archive_session(&state.agent_home) {
+    Json(reset_session_key(&state.agent_home, DEFAULT_SESSION_KEY))
+}
+
+/// Archives, then clears, the given session — a fresh conversation. Shared
+/// by the webui `/api/session/reset` endpoint and Discord's `!reset` DM/
+/// mention command (discord.rs) — same mechanism, keyed by whichever
+/// session it's asked for.
+pub(crate) fn reset_session_key(agent_home: &Path, key: &str) -> Value {
+    match archive_session(agent_home, key) {
         Ok(archived) => {
-            let _ = save_session(&state.agent_home, &[]);
-            Json(json!({"ok": true, "archived": archived.map(|p| p.display().to_string())}))
+            let _ = save_session(agent_home, key, &[]);
+            clear_chat_context_tokens(agent_home, key);
+            json!({"ok": true, "archived": archived.map(|p| p.display().to_string())})
         }
-        Err(e) => Json(json!({"ok": false, "error": e.to_string()})),
+        Err(e) => json!({"ok": false, "error": e.to_string()}),
     }
+}
+
+async fn post_session_compact(State(state): State<Arc<AppState>>) -> Json<Value> {
+    Json(compact_session_key(state.clone(), DEFAULT_SESSION_KEY).await)
 }
 
 /// Archives the full session, then asks the agent to collapse it into one
 /// short summary turn — same idea as Claude Code's `/compact`: keep context
-/// going without the message list growing forever.
-async fn post_session_compact(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let session = load_session(&state.agent_home);
+/// going without the message list growing forever. Shared by the webui
+/// `/api/session/compact` endpoint, Discord's `!compact` command, and the
+/// auto-compact check in `handle_chat_message` once a session crosses
+/// `config.chat.auto_compact_tokens`.
+pub(crate) async fn compact_session_key(state: Arc<AppState>, key: &str) -> Value {
+    let session = load_session(&state.agent_home, key);
     if session.is_empty() {
-        return Json(json!({"ok": true, "message": "nothing to compact"}));
+        return json!({"ok": true, "message": "nothing to compact"});
     }
-    let _ = archive_session(&state.agent_home);
+    let _ = archive_session(&state.agent_home, key);
 
     let history: Vec<Value> = session.iter().map(SessionTurn::as_message).collect();
     let outcome = run_trigger(state.clone(), json!({"type": "compact_session", "history": history})).await;
@@ -530,8 +648,9 @@ async fn post_session_compact(State(state): State<Arc<AppState>>) -> Json<Value>
         content: format!("(earlier conversation, compacted) {summary}"),
         ts: crate::logs::now_unix_secs(),
     }];
-    let _ = save_session(&state.agent_home, &compacted);
-    Json(json!({"ok": true, "summary": summary}))
+    let _ = save_session(&state.agent_home, key, &compacted);
+    clear_chat_context_tokens(&state.agent_home, key);
+    json!({"ok": true, "summary": summary})
 }
 
 // ---- grants (tofu new-domain / http_fetch writes queued for approval) ----
@@ -564,6 +683,17 @@ async fn get_egress(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({"entries": entries}))
 }
 
+/// Whether a Discord user has paired as "owner" yet (`chat_send`'s
+/// `target: "discord"` default destination) — and if not, the pairing code
+/// valid *right now* to DM the bot (rotates every 60s, see
+/// `discord::current_pairing_code`).
+async fn get_discord_pairing(State(state): State<Arc<AppState>>) -> Json<Value> {
+    match crate::discord::load_owner(&state.agent_home) {
+        Some(user_id) => Json(json!({"paired": true, "user_id": user_id})),
+        None => Json(json!({"paired": false, "code": crate::discord::current_pairing_code(&state.agent_home)})),
+    }
+}
+
 // ---- llm call log viewer (browses logs/transcripts/, written by
 // kernel/src/syscalls/llm_call.rs's write_transcript for every single
 // llm_call — one file per call, filename is the nanosecond timestamp) ----
@@ -584,7 +714,10 @@ async fn get_llm_logs(State(state): State<Arc<AppState>>) -> Json<Value> {
             let Ok(ts_nanos) = stem.parse::<u128>() else { continue };
             let Ok(text) = std::fs::read_to_string(&path) else { continue };
             let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
-            logs.push(json!({"ts": (ts_nanos / 1_000_000_000) as i64, "request": v["request"], "response": v["response"]}));
+            logs.push(json!({
+                "ts": (ts_nanos / 1_000_000_000) as i64,
+                "request": v["request"], "response": v["response"], "source": v["source"],
+            }));
         }
     }
     logs.sort_by(|a, b| b["ts"].as_i64().cmp(&a["ts"].as_i64())); // newest first

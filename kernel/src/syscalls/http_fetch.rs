@@ -19,6 +19,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 /// 3. GET is gated by `network.get_mode` (open/tofu/allowlist); anything
 ///    that writes (POST et al) always queues for human approval
 pub fn call(state: &mut AgentState, req: Value) -> Value {
+    let source = req.get("_meta").cloned().unwrap_or(Value::Null);
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("GET").to_uppercase();
     let url_str = req.get("url").and_then(|u| u.as_str()).unwrap_or("");
 
@@ -78,7 +79,7 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
     let ip = match resolve_and_check(&host) {
         Ok(ip) => ip,
         Err(e) => {
-            log_egress(state, &method, url_str, &host, None, Some(&e));
+            log_egress(state, &method, url_str, &host, None, Some(&e), &source);
             return error_json("denied_ip", &e);
         }
     };
@@ -97,7 +98,7 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
     let response = match result {
         Ok(r) => r,
         Err(e) => {
-            log_egress(state, &method, url_str, &host, None, Some(&e.to_string()));
+            log_egress(state, &method, url_str, &host, None, Some(&e.to_string()), &source);
             return error_json("network_error", &e.to_string());
         }
     };
@@ -105,7 +106,7 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
     let body_text = response.text().unwrap_or_default();
     let redacted = redact_secrets(&state.secrets, &body_text);
 
-    log_egress(state, &method, url_str, &host, Some(redacted.len()), None);
+    log_egress(state, &method, url_str, &host, Some(redacted.len()), None, &source);
     let _ = state.http_daily.record(1);
 
     ok_json(serde_json::json!({"status": status, "body": redacted}))
@@ -160,12 +161,12 @@ fn is_denied(ip: &IpAddr) -> bool {
     }
 }
 
-fn log_egress(state: &AgentState, method: &str, url: &str, domain: &str, bytes: Option<usize>, error: Option<&str>) {
+fn log_egress(state: &AgentState, method: &str, url: &str, domain: &str, bytes: Option<usize>, error: Option<&str>, source: &Value) {
     let _ = append_jsonl(
         &state.agent_home.join("logs/egress.jsonl"),
         &serde_json::json!({
             "ts": now_unix_secs(), "method": method, "url": url, "domain": domain,
-            "bytes": bytes, "error": error,
+            "bytes": bytes, "error": error, "source": source,
         }),
     );
 }

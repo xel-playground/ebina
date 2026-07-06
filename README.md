@@ -158,6 +158,23 @@ Would avoid the local-install step, but not worth it:
 Host-side inference (local Ollama or a cloud API) through the existing
 `embed` syscall is the intended design, not a workaround.
 
+## Directory/file management (`list_dir`/`make_dir`/`delete_path` actions)
+
+`read_file`/`write_file` only handle one already-known file each — these
+three cover "what's actually in this directory" and basic file/directory
+management. Same as `read_file`/`write_file`, these run guest-side against
+the agent's own already-preopened `/` (`agent_loop.rs`, plain `std::fs`) —
+no separate sandbox, no host syscall, since it's the agent's own trusted
+code operating on its own already-fully-accessible agent-home, not
+untrusted code that needs isolating:
+
+- `{"action":"list_dir","path":"..."}` — lists a directory's entries
+  (directories get a trailing `/`)
+- `{"action":"make_dir","path":"..."}` — creates a directory, parent
+  directories included
+- `{"action":"delete_path","path":"...","recursive":false}` — removes a
+  file; a directory needs `"recursive":true` or it's refused
+
 ## Web search (`search_web` syscall)
 
 Same pattern as `llm_call`/`embed`: config-driven endpoint, key (if any)
@@ -211,3 +228,49 @@ entry in `tmp/secrets.toml`.
 its own — anything that can reach the port can query (and, on some
 deployments, configure) it. Loopback-only keeps it reachable from this host
 alone, same reasoning as the local Ollama embed server.
+
+## Discord adapter
+
+Optional — attaches to the gateway (`kernel/src/discord.rs`), doesn't touch
+kernel core (same idea as PROJECT.md's not-yet-built Telegram adapter). No
+`discord_bot_token` secret configured → Discord is simply not connected,
+gateway runs exactly as without it.
+
+**Setup**:
+
+1. [Discord Developer Portal](https://discord.com/developers/applications) →
+   New Application → Bot tab → Reset Token, copy it.
+2. Same Bot tab → enable **Message Content Intent** (a privileged intent —
+   without it, `message.content` arrives empty for guild channel messages;
+   DMs still work either way, but @mentions in a server won't).
+3. OAuth2 → URL Generator → scope `bot`, permissions at least "Send
+   Messages" + "Read Message History" → open the generated URL, invite the
+   bot to your server.
+4. Add the token to the vault:
+
+```toml
+# tmp/secrets.toml
+discord_bot_token = "the-real-bot-token"
+```
+
+5. Restart the gateway (it reads secrets once at startup) — `[discord]
+   connected as <bot name>` in the log means it's live.
+
+**Behavior**: only replies to a **DM** or an **@mention** in a server
+channel — not every message in every channel it can see (too noisy/costly
+otherwise). Each DM/channel gets its own chat session
+(`discord-dm-<user>`/`discord-channel-<channel>`, under
+`agent-home/logs/chat_sessions/<key>/`) — separate history from the webui's
+`webui` session and from each other, so conversations don't bleed together.
+Everything else (memory/notes/ RAG, `SOUL.md`, skills, scheduled tasks) is
+shared — one agent, one long-term brain, multiple separate conversation
+threads with it. Long replies get split across multiple Discord messages
+(2000-char API limit per message), not truncated.
+
+**Compact/reset**: send `!reset` (archive + start fresh) or `!compact`
+(archive + collapse into one short summary turn) as a DM or @mention — same
+mechanism as the two buttons on the webui Chat panel, just scoped to that
+one Discord session. A session also auto-compacts on its own once its
+context grows past `[chat] auto_compact_tokens` in `config.toml` (default
+50000) — mainly for Discord, since unlike webui there's no one watching a
+context-window indicator to know when to hit the button.

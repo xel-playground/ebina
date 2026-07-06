@@ -17,6 +17,7 @@ const items = [
   ['logs', '📡', 'Live log'],
   ['egress', '🌐', 'Egress log'],
   ['llm-logs', '🧾', 'LLM logs'],
+  ['apps', '👾', 'Apps'],
 ]
 </script>
 

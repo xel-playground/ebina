@@ -17,6 +17,7 @@ import SecretsPanel from './components/SecretsPanel.vue'
 import LogsPanel from './components/LogsPanel.vue'
 import EgressPanel from './components/EgressPanel.vue'
 import LlmLogsPanel from './components/LlmLogsPanel.vue'
+import AppsPanel from './components/AppsPanel.vue'
 
 const loggedIn = ref(false)
 const section = ref('chat')
@@ -52,6 +53,7 @@ if (token()) {
       <LogsPanel v-if="section === 'logs'" />
       <EgressPanel v-if="section === 'egress'" />
       <LlmLogsPanel v-if="section === 'llm-logs'" />
+      <AppsPanel v-if="section === 'apps'" />
     </div>
   </div>
 </template>
