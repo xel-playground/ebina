@@ -105,6 +105,13 @@ pre {
 .md pre { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 0.6em 0.8em; overflow-x: auto; }
 .md pre code { background: none; padding: 0; }
 .md blockquote { margin: 0.4em 0; padding-left: 0.8em; border-left: 3px solid var(--border); color: var(--muted); }
+
+.attachment-thumb { max-width: 10rem; max-height: 10rem; border-radius: 8px; border: 1px solid var(--border); object-fit: cover; }
+.attachment-thumb-sm { width: 1.4rem; height: 1.4rem; border-radius: 4px; object-fit: cover; vertical-align: middle; margin-right: 0.3em; }
+.attachment-chip {
+  display: inline-flex; align-items: center; gap: 0.3em; background: var(--bg); border: 1px solid var(--border);
+  border-radius: 6px; padding: 0.2em 0.55em; font-size: 0.78rem; color: inherit; text-decoration: none;
+}
 .md h1, .md h2, .md h3, .md h4 { margin: 0.5em 0 0.3em; font-size: 1em; }
 .md table { border-collapse: collapse; margin: 0.4em 0; }
 .md th, .md td { border: 1px solid var(--border); padding: 0.25em 0.5em; }

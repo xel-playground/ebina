@@ -9,7 +9,7 @@ use std::path::Path;
 ///
 /// This is the minimal slice of the eventual Credential Vault (4.8) needed
 /// now: naming a secret for `llm_call`/`embed` to use instead of a host env
-/// var. Domain-bound secrets for `http_fetch` are Phase 5.
+/// var. Domain-bound secrets for `http_get` are Phase 5.
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct Secrets(HashMap<String, String>);
 

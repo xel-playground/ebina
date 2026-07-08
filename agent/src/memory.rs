@@ -125,7 +125,12 @@ pub fn content_hash(text: &str) -> String {
 /// Re-chunks and re-embeds `source_path` only if its content hash (or the
 /// configured embed model) changed since last time — PROJECT.md 4.3's
 /// "content hash 增量" / "embed_model 不符 → 自動全庫重嵌".
-pub fn reindex_file(source_path: &str, embed_model: &str) -> Result<(), String> {
+/// `Ok(true)` if it actually re-embedded the file, `Ok(false)` if the
+/// content hash + embed model both matched what's already indexed and it
+/// skipped — `agent_loop.rs::reindex_all_notes` sums this to report a
+/// meaningful "reindexed N notes" trace line instead of silently doing
+/// (or not doing) work every single run with nothing visible to show it.
+pub fn reindex_file(source_path: &str, embed_model: &str) -> Result<bool, String> {
     let text = std::fs::read_to_string(source_path).map_err(|e| format!("read {source_path}: {e}"))?;
     let hash = content_hash(&text);
 
@@ -137,7 +142,7 @@ pub fn reindex_file(source_path: &str, embed_model: &str) -> Result<(), String> 
         let same_hash = row.get("content_hash").and_then(|v| v.as_str()) == Some(hash.as_str());
         let same_model = row.get("embed_model").and_then(|v| v.as_str()) == Some(embed_model);
         if same_hash && same_model {
-            return Ok(());
+            return Ok(false);
         }
     }
 
@@ -152,7 +157,7 @@ pub fn reindex_file(source_path: &str, embed_model: &str) -> Result<(), String> 
 
     let pieces = chunk_markdown(&text);
     if pieces.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
     let embed_resp = syscall::call("embed", &serde_json::json!({"texts": pieces}));
@@ -174,7 +179,7 @@ pub fn reindex_file(source_path: &str, embed_model: &str) -> Result<(), String> 
             &serde_json::json!([new_id, piece]),
         )?;
     }
-    Ok(())
+    Ok(true)
 }
 
 /// FTS5 MATCH syntax breaks on punctuation/quotes in free-form user text —

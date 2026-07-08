@@ -58,6 +58,9 @@ defineExpose({ refresh })
              :class="{ active: selectedSkill && selectedSkill.name === s.name }"
              @click="selectSkill(s)">
           🧠 {{ s.name }}
+          <div class="hint" style="font-size:0.7rem">
+            used {{ s.used_count || 0 }}x<template v-if="s.last_used"> · last {{ new Date(s.last_used * 1000).toLocaleDateString() }}</template>
+          </div>
         </div>
       </div>
       <div class="split-content">
@@ -65,6 +68,9 @@ defineExpose({ refresh })
           <div class="row">
             <input type="text" v-model="selectedSkill.name" placeholder="name" :disabled="!isNewSkill">
             <input type="text" v-model="selectedSkill.description" placeholder="one-line description">
+          </div>
+          <div class="hint" v-if="!isNewSkill && selectedSkill.created_at">
+            learned {{ new Date(selectedSkill.created_at * 1000).toLocaleString() }} · used {{ selectedSkill.used_count || 0 }}x<template v-if="selectedSkill.last_used"> · last used {{ new Date(selectedSkill.last_used * 1000).toLocaleString() }}</template>
           </div>
           <textarea v-model="selectedSkill.body" style="min-height:16rem" placeholder="full step-by-step procedure"></textarea>
           <div class="row">

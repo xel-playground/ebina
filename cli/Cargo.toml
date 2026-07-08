@@ -1,0 +1,18 @@
+[package]
+name = "ebinactl"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "ebinactl"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.103"
+axum = "0.8.9"
+clap = { version = "4", features = ["derive"] }
+include_dir = "0.7"
+kernel = { path = "../kernel" }
+reqwest = { version = "0.13.4", default-features = false, features = ["stream"] }
+tokio = { version = "1.52.3", features = ["full"] }
+tower-http = { version = "0.6.11", features = ["fs"] }

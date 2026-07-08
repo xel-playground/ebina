@@ -12,6 +12,8 @@ pub struct Config {
     pub db: DbConfig,
     pub network: NetworkConfig,
     pub chat: ChatConfig,
+    pub disk: DiskConfig,
+    pub ssh: SshConfig,
 }
 
 impl Default for Config {
@@ -25,6 +27,8 @@ impl Default for Config {
             db: DbConfig::default(),
             network: NetworkConfig::default(),
             chat: ChatConfig::default(),
+            disk: DiskConfig::default(),
+            ssh: SshConfig::default(),
         }
     }
 }
@@ -46,6 +50,14 @@ pub struct LlmConfig {
     /// `usage.prompt_tokens/completion_tokens`, non-streaming; covers any
     /// OpenAI-compatible API such as Kimi/Moonshot, DeepSeek, etc.)
     pub provider: String,
+    /// no reliable way to auto-detect vision support on an arbitrary
+    /// OpenAI-compatible endpoint, so this is a manual toggle — when true,
+    /// an image attachment on a chat turn gets embedded as an `image_url`
+    /// content block (gateway.rs `SessionTurn::as_message`); when false,
+    /// attachments are always left as a plain text reference the agent can
+    /// `read_file` itself instead, so a non-vision model never receives a
+    /// content shape it can't handle.
+    pub supports_vision: bool,
 }
 
 impl Default for LlmConfig {
@@ -55,6 +67,7 @@ impl Default for LlmConfig {
             api_key: "{secrets.anthropic}".to_string(),
             model: "claude-sonnet-5".to_string(),
             provider: "anthropic".to_string(),
+            supports_vision: false,
         }
     }
 }
@@ -115,14 +128,22 @@ impl Default for SearchConfig {
 #[derive(Debug, Deserialize, Clone, Copy)]
 #[serde(default)]
 pub struct BudgetConfig {
-    /// hard daily cap on total tokens across llm_call + embed
+    /// hard daily cap on `llm_call` tokens — separate counter and cap from
+    /// `embed_daily_token_cap` below (originally one shared cap across both;
+    /// split so a RAG reindex burst can't starve the actual chat budget, or
+    /// vice versa)
     pub daily_token_cap: u64,
+    /// hard daily cap on `embed` tokens (RAG indexing/search) — its own
+    /// counter, `logs/embed-budget-state.json` (see `state.rs`
+    /// `AgentState::new`), same daily-rollover semantics as `daily_token_cap`
+    pub embed_daily_token_cap: u64,
 }
 
 impl Default for BudgetConfig {
     fn default() -> Self {
         BudgetConfig {
             daily_token_cap: 1_000_000,
+            embed_daily_token_cap: 1_000_000,
         }
     }
 }
@@ -195,6 +216,56 @@ pub struct ChatConfig {
 impl Default for ChatConfig {
     fn default() -> Self {
         ChatConfig { auto_compact_tokens: 50_000 }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct SshConfig {
+    /// empty disables `ssh_exec` entirely (same "optional, no config, no
+    /// connection" pattern as `discord_bot_token`) — the agent can never
+    /// pick its own target, only the human editing this file can, so a
+    /// prompt-injected command has nowhere else to reach
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    /// hard wall-clock cap on one `ssh_exec` call, independent of how much
+    /// output the remote command produces — a `docker logs -f`-style
+    /// command that never exits gets killed at this deadline rather than
+    /// hanging the syscall (and, transitively, `run_lock` — see
+    /// `ssh_exec.rs` module docs) forever
+    pub timeout_secs: u64,
+    /// caps combined stdout+stderr kept from one call — same reasoning as
+    /// every other syscall's output cap, so a chatty/looping remote command
+    /// can't blow up the LLM context or the log file
+    pub max_output_bytes: usize,
+}
+
+impl Default for SshConfig {
+    fn default() -> Self {
+        SshConfig { host: String::new(), port: 22, user: "root".to_string(), timeout_secs: 30, max_output_bytes: 65_536 }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(default)]
+pub struct DiskConfig {
+    /// hard cap on agent-home's total on-disk size. Guest writes are
+    /// checked in `agent_loop.rs`'s `write_file` action (sums the whole
+    /// tree, refuses + `notify`s rather than growing past this — the kernel
+    /// never intercepts individual guest writes, the preopened WASI dir has
+    /// no hook for that short of a much deeper wasmtime-wasi change). Host
+    /// writes (`gateway.rs`'s `POST /api/upload`, for chat attachments)
+    /// check the same cap on the kernel side instead, since that path never
+    /// goes through the guest at all. This struct exists so the value
+    /// round-trips through the same `config.toml` the human already edits
+    /// via `GET/POST /api/config`, same as every other cap in this file.
+    pub quota_bytes: u64,
+}
+
+impl Default for DiskConfig {
+    fn default() -> Self {
+        DiskConfig { quota_bytes: 2 * 1024 * 1024 * 1024 }
     }
 }
 

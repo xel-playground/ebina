@@ -18,7 +18,19 @@ const FATAL: i32 = i32::MIN;
 /// buffer and retrying if the host reports it was too small. Always returns
 /// a JSON value: on protocol failure, a synthesized `{"ok":false,...}`
 /// envelope in the same shape the host would produce.
+///
+/// Every host call funnels through this one function regardless of which
+/// action triggered it, so it's the single choke point to time every node
+/// (`llm_call`, `http_get`, `ssh_exec`, `embed`, ...) without instrumenting
+/// each of `agent_loop.rs`'s ~15 action arms individually — see `perf::record`.
 pub fn call(name: &str, req: &Value) -> Value {
+    let started = std::time::Instant::now();
+    let result = call_inner(name, req);
+    crate::perf::record(&format!("syscall:{name}"), started);
+    result
+}
+
+fn call_inner(name: &str, req: &Value) -> Value {
     let req_bytes = serde_json::to_vec(req).expect("request must serialize");
     let mut cap: usize = 4096;
     loop {

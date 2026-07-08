@@ -175,6 +175,56 @@ untrusted code that needs isolating:
 - `{"action":"delete_path","path":"...","recursive":false}` — removes a
   file; a directory needs `"recursive":true` or it's refused
 
+## SSH (`ssh_exec` syscall)
+
+Runs one command on a single, human-fixed SSH target — e.g. a Docker Linux
+container reachable over the network — for things like driving `git` or
+other dev work the sandboxed agent-home can't do on its own. Deliberately
+the one syscall here that hands the agent something close to a real shell:
+there's no bounded operation set like `db_exec`'s SQL authorizer, so treat
+it as real remote code execution and scope the target accordingly (a
+disposable dev container, not anything holding data you care about).
+
+**Setup**:
+
+```toml
+# agent-home/config.toml
+[ssh]
+host = "192.168.1.50"
+port = 22
+user = "dev"
+timeout_secs = 30        # hard wall-clock cap per command, see below
+max_output_bytes = 65536 # combined stdout+stderr cap
+```
+
+```toml
+# tmp/secrets.toml — private key file lives on disk outside agent-home;
+# only its *path* is a secret here, never the key bytes themselves
+ssh_key_path = "/home/you/.ssh/id_ed25519"
+ssh_key_passphrase = "only if the key needs one"
+```
+
+No `[ssh]` host or no `ssh_key_path` secret → `ssh_exec` returns
+`not_configured`, same graceful-disable pattern as the Discord adapter.
+
+**Containment is about blast radius, not capability** — the command itself
+can do anything that SSH user can do on that host. What's actually bounded:
+the target is fixed by the human in `config.toml` (the agent can't be
+tricked via prompt injection into connecting somewhere else), there's no
+interactive shell/pty (one command in, one result out), and every call is
+logged in full to `agent-home/logs/ssh.jsonl` (command, exit code, byte
+counts, timed-out flag).
+
+**The timeout is not optional**: a command that never exits on its own
+(`docker logs -f`, `tail -f`, an interactive prompt waiting on input) would
+otherwise hang forever — and since `run_lock` (kernel/src/gateway.rs) holds
+one global mutex for the agent's entire run, one hung `ssh_exec` call
+freezes *every* surface (webui, Discord, cron, everything), not just
+itself. `timeout_secs` is a hard wall-clock deadline checked on every read,
+independent of whether the command is still actively producing output — it
+returns `{"timed_out": true}` with whatever partial output was captured
+rather than hanging.
+
 ## Web search (`search_web` syscall)
 
 Same pattern as `llm_call`/`embed`: config-driven endpoint, key (if any)

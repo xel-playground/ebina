@@ -117,7 +117,7 @@ impl EventHandler for Handler {
         }
 
         let text = strip_mention(&msg.content, bot_id);
-        if text.is_empty() {
+        if text.is_empty() && msg.attachments.is_empty() {
             return;
         }
 
@@ -148,17 +148,40 @@ impl EventHandler for Handler {
             return;
         }
 
+        // download each Discord attachment and stash it in agent_home the
+        // same way a webui upload does (`gateway::save_attachment`) — one
+        // consistent quota-counted, guest-visible storage path regardless
+        // of which surface a file came in from
+        let mut attachments = Vec::new();
+        for att in &msg.attachments {
+            match download_attachment(&att.url).await {
+                Ok(bytes) => match crate::gateway::save_attachment(&self.state.agent_home, &att.filename, &bytes) {
+                    Ok(path) => attachments.push(path),
+                    Err(e) => eprintln!("[discord] attachment save failed ({}): {e}", att.filename),
+                },
+                Err(e) => eprintln!("[discord] attachment download failed ({}): {e}", att.filename),
+            }
+        }
+
         // Discord's native "Bot is typing…" indicator — `Typing` re-sends
         // it in the background on its own until `.stop()`/dropped, so one
         // call covers the whole (possibly many-second, multi-turn) run
         // rather than needing a manual repeat loop
         let typing = msg.channel_id.start_typing(&ctx.http);
-        crate::gateway::handle_chat_message(self.state.clone(), &session_key, &text, Some("discord")).await;
+        crate::gateway::handle_chat_message(self.state.clone(), session_key.clone(), text.clone(), attachments, Some("discord".to_string())).await;
         typing.stop();
         // reply itself: handle_chat_message already appended it to
         // chat_sessions/<session_key>/session.json — session_watch_loop
         // picks it up from there and actually sends it, same as chat_send
     }
+}
+
+/// Fetched straight from Discord's CDN rather than downloaded once and
+/// stored as-is at attachment-URL granularity — simplest correct thing, and
+/// the result gets persisted into agent_home right after via
+/// `save_attachment` anyway so this URL never needs to be reachable again.
+async fn download_attachment(url: &str) -> Result<Vec<u8>, reqwest::Error> {
+    Ok(reqwest::get(url).await?.bytes().await?.to_vec())
 }
 
 /// Strips the bot's own `<@id>`/`<@!id>` mention token out of the message
@@ -179,8 +202,24 @@ fn owner_path(agent_home: &Path) -> PathBuf {
     agent_home.join("logs/discord_owner.json")
 }
 
+/// Lives under `crate::autocommit::PRIVATE_DIR`, not plain `logs/` — this
+/// value lets anyone who reads it compute every future pairing code, so
+/// unlike everything else in `logs/` it must never enter git history (see
+/// `autocommit.rs`). `migrate_legacy_seed_path` moves an existing
+/// pre-convention file over the first time this runs on an older agent-home.
 fn pairing_seed_path(agent_home: &Path) -> PathBuf {
-    agent_home.join("logs/discord_pairing_seed.json")
+    agent_home.join(crate::autocommit::PRIVATE_DIR).join("discord_pairing_seed.json")
+}
+
+pub(crate) fn migrate_legacy_seed_path(agent_home: &Path) {
+    let legacy = agent_home.join("logs/discord_pairing_seed.json");
+    let current = pairing_seed_path(agent_home);
+    if legacy.exists() && !current.exists() {
+        if let Some(parent) = current.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::rename(&legacy, &current);
+    }
 }
 
 pub(crate) fn load_owner(agent_home: &Path) -> Option<String> {
@@ -202,6 +241,7 @@ fn save_owner(agent_home: &Path, user_id: UserId) -> std::io::Result<()> {
 /// unguessable to anyone who hasn't seen the gateway's own log/API (wall
 /// clock alone isn't enough without this seed).
 fn pairing_seed(agent_home: &Path) -> u64 {
+    migrate_legacy_seed_path(agent_home);
     if let Ok(text) = std::fs::read_to_string(pairing_seed_path(agent_home)) {
         if let Some(seed) = serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| v.get("seed")?.as_u64()) {
             return seed;

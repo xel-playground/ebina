@@ -1,39 +1,125 @@
 use crate::abi::{error_json, ok_json};
 use crate::logs::{append_jsonl, now_unix_nanos, now_unix_secs};
 use crate::state::AgentState;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const MAX_SEND_ATTEMPTS: u32 = 3;
-const RETRY_DELAY: Duration = Duration::from_millis(500);
+const MAX_SEND_ATTEMPTS: u32 = 5;
+const RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
 
-/// Retries only a transient failure to even establish the connection
-/// (DNS/connect/timeout) — linear backoff (500ms, 1s). A response that came
-/// back but with an HTTP error status (4xx/5xx) is `Ok(response)` as far as
-/// reqwest is concerned and reaches the normal status-check path below
-/// unaffected; retrying *that* here would risk resending a non-idempotent
-/// request the provider may have already partially processed.
-fn send_with_retries(request: reqwest::blocking::RequestBuilder) -> Result<reqwest::blocking::Response, reqwest::Error> {
-    let mut last_err = None;
+/// After a request comes back with a status code at all (as opposed to
+/// failing to connect), the underlying TCP/TLS work is done — parsing a
+/// bad-status body costs nothing extra, so it's read here regardless of
+/// whether this turns out to be the final attempt.
+enum SendResult {
+    /// `provider = "ollama"` *and* a successful status — handed back
+    /// unread so the caller can stream it (`handle_ollama_stream`); this is
+    /// the only outcome that isn't already read to a `Value`.
+    Stream(reqwest::blocking::Response),
+    /// every other success, or the last attempt's failure — retried
+    /// attempts don't reach here, only the one that finally succeeded or
+    /// the one that ran out of attempts.
+    Body { status: reqwest::StatusCode, json: Value },
+    /// every attempt failed before a status code ever came back (DNS/
+    /// connect/timeout) — nothing to parse.
+    ConnectFailed(String),
+}
+
+/// Retries *any* failure now — a connect/timeout error, and also an HTTP
+/// error status (4xx/5xx). Retrying a bad status risks resending a request
+/// the provider may have partially processed/billed; accepted deliberately
+/// (a stuck agent run is worse than an occasional duplicate generation) —
+/// see PROJECT.md's `llm_call` retry note.
+///
+/// Exponential backoff (500ms, 1s, 2s, 4s between the 5 attempts, ~7.5s
+/// worst-case added latency) — long enough to ride out more than a single
+/// blip, short enough that one call doesn't hang the whole `run_lock`-
+/// serialized agent for minutes over a dead API.
+fn send_with_retries(request: reqwest::blocking::RequestBuilder, is_ollama: bool) -> SendResult {
+    let mut last_connect_err: Option<String> = None;
     for attempt in 0..MAX_SEND_ATTEMPTS {
         if attempt > 0 {
-            std::thread::sleep(RETRY_DELAY * attempt);
+            std::thread::sleep(RETRY_BASE_DELAY * 2u32.pow(attempt - 1));
         }
         let cloned = request.try_clone().expect("llm_call bodies are always in-memory JSON, always clonable");
-        match cloned.send() {
-            Ok(resp) => return Ok(resp),
+        let response = match cloned.send() {
+            Ok(r) => r,
             Err(e) => {
-                let transient = e.is_connect() || e.is_timeout();
-                last_err = Some(e);
-                if !transient {
-                    break;
-                }
+                last_connect_err = Some(e.to_string());
+                continue;
             }
+        };
+        let status = response.status();
+        if is_ollama && status.is_success() {
+            return SendResult::Stream(response);
         }
+        let json: Value = response.json().unwrap_or(Value::Null);
+        if status.is_success() || attempt + 1 == MAX_SEND_ATTEMPTS {
+            return SendResult::Body { status, json };
+        }
+        // bad status, attempts remain — loop again
     }
-    Err(last_err.unwrap())
+    SendResult::ConnectFailed(last_connect_err.unwrap_or_else(|| "connection failed".to_string()))
+}
+
+const CIRCUIT_FAILURE_THRESHOLD: u32 = 3;
+const CIRCUIT_COOLDOWN_SECS: i64 = 60;
+
+/// Persisted (not in `AgentState` — a fresh one of those exists per run, see
+/// PROJECT.md's "fresh instantiate" design, but a dead API spans many runs)
+/// count of *fully-exhausted* `llm_call`s in a row — each one already
+/// retried up to `MAX_SEND_ATTEMPTS` times internally, so this is a second,
+/// slower-moving tier: once several whole calls in a row have burned all
+/// their retries, the API is very likely actually down, not just glitchy,
+/// so stop spending attempts/latency on it for a cooldown window instead of
+/// retrying full-strength on every single subsequent call too.
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct CircuitState {
+    consecutive_failures: u32,
+    /// 0 means not tripped
+    tripped_until: i64,
+}
+
+fn circuit_path(agent_home: &Path) -> PathBuf {
+    agent_home.join("logs/llm_circuit_breaker.json")
+}
+
+fn load_circuit(agent_home: &Path) -> CircuitState {
+    std::fs::read_to_string(circuit_path(agent_home)).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+}
+
+fn save_circuit(agent_home: &Path, state: &CircuitState) {
+    let path = circuit_path(agent_home);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, serde_json::to_string(state).unwrap_or_default());
+}
+
+/// Records one fully-failed call (all `MAX_SEND_ATTEMPTS` exhausted) and
+/// trips the breaker once `CIRCUIT_FAILURE_THRESHOLD` such calls happen in a
+/// row.
+fn record_circuit_failure(agent_home: &Path) {
+    let mut circuit = load_circuit(agent_home);
+    circuit.consecutive_failures += 1;
+    if circuit.consecutive_failures >= CIRCUIT_FAILURE_THRESHOLD {
+        circuit.tripped_until = now_unix_secs() + CIRCUIT_COOLDOWN_SECS;
+        let _ = crate::logs::notify(
+            agent_home,
+            &format!("llm_call circuit breaker tripped after {} consecutive failures — refusing new calls for {CIRCUIT_COOLDOWN_SECS}s", circuit.consecutive_failures),
+        );
+    }
+    save_circuit(agent_home, &circuit);
+}
+
+fn record_circuit_success(agent_home: &Path) {
+    let circuit = load_circuit(agent_home);
+    if circuit.consecutive_failures > 0 || circuit.tripped_until != 0 {
+        save_circuit(agent_home, &CircuitState::default());
+    }
 }
 
 /// `llm_call({messages: [{role, content}], ...}) -> {text, usage}` — host
@@ -77,6 +163,14 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
         });
     }
 
+    let circuit = load_circuit(&state.agent_home);
+    if circuit.tripped_until > now_unix_secs() {
+        return error_json(
+            "circuit_open",
+            &format!("llm_call circuit breaker is open (retry after unix ts {}) — the API has been failing repeatedly", circuit.tripped_until),
+        );
+    }
+
     let api_key = match crate::secrets::resolve_placeholder(&state.secrets, &state.config.llm.api_key) {
         Ok(k) => k,
         Err(e) => return error_json("no_api_key", &e),
@@ -104,26 +198,24 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
         "ollama" | "openai" => request.bearer_auth(&api_key),
         _ => request.header("x-api-key", &api_key).header("anthropic-version", "2023-06-01"),
     };
-    let http_result = send_with_retries(request.json(&body));
-
-    let response = match http_result {
-        Ok(resp) => resp,
-        Err(e) => return error_json("network_error", &e.to_string()),
+    let (status, response_json) = match send_with_retries(request.json(&body), provider == "ollama") {
+        SendResult::Stream(response) => {
+            record_circuit_success(&state.agent_home);
+            return handle_ollama_stream(state, body, response, &source);
+        }
+        SendResult::Body { status, json } => (status, json),
+        SendResult::ConnectFailed(e) => {
+            record_circuit_failure(&state.agent_home);
+            return error_json("network_error", &e);
+        }
     };
-    let status = response.status();
 
-    if provider == "ollama" && status.is_success() {
-        return handle_ollama_stream(state, body, response, &source);
-    }
-
-    let response_json: Value = match response.json() {
-        Ok(v) => v,
-        Err(e) => return error_json("bad_response", &e.to_string()),
-    };
     write_transcript(state, &body, &response_json, &source);
     if !status.is_success() {
+        record_circuit_failure(&state.agent_home);
         return error_json("llm_error", &format!("HTTP {status}: {response_json}"));
     }
+    record_circuit_success(&state.agent_home);
 
     // only Anthropic/OpenAI-shaped (or an ollama error body) reaches here — ollama success is streamed above
     let (text, input_tokens, output_tokens) = if provider == "openai" {
@@ -160,8 +252,17 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
     }))
 }
 
-fn thinking_path(agent_home: &Path) -> PathBuf {
-    agent_home.join("logs/thinking-live.txt")
+/// Keyed by session, same as `chat_sessions/` itself — otherwise a
+/// Discord/cron/daily_maintenance run in the background would overwrite
+/// whatever a human is live-watching in the webui Chat panel (and vice
+/// versa), since `/api/thinking`'s SSE just tails whatever's at this path.
+/// `source.session_key` is only present for a `message` trigger
+/// (`agent_loop.rs` `source_meta`); anything else (cron/daily_maintenance/
+/// scheduled_task/compact_session) has no live audience anyway, so those
+/// all share one `_system` bucket rather than each needing their own.
+fn thinking_path(agent_home: &Path, source: &Value) -> PathBuf {
+    let key = source.get("session_key").and_then(|s| s.as_str()).unwrap_or("_system");
+    agent_home.join("logs/chat_sessions").join(key).join("thinking-live.txt")
 }
 
 fn abort_flag_path(agent_home: &Path) -> PathBuf {
@@ -178,7 +279,7 @@ fn abort_flag_path(agent_home: &Path) -> PathBuf {
 /// earlier turns' trace lines), and checks the abort flag between lines so
 /// an operator can cut a runaway generation short.
 fn handle_ollama_stream(state: &mut AgentState, body: Value, response: reqwest::blocking::Response, source: &Value) -> Value {
-    let think_path = thinking_path(&state.agent_home);
+    let think_path = thinking_path(&state.agent_home, source);
     let _ = std::fs::create_dir_all(think_path.parent().unwrap());
 
     let abort_path = abort_flag_path(&state.agent_home);

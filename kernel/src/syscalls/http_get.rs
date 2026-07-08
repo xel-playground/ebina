@@ -7,20 +7,33 @@ use reqwest::Url;
 use serde_json::Value;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 
-/// `http_fetch(method, url, body?) -> {status, body}` — the only way an
-/// agent ever reaches the network. Threat model per PROJECT.md 4.6 isn't
-/// "the agent is malicious", it's "the agent got tricked by page content it
-/// read" (prompt injection → exfiltration) plus plain SSRF, so the guard
-/// rails apply uniformly regardless of what the agent *meant* to do:
+/// `http_get(url) -> {status, body}` — the only way an agent ever reaches
+/// the network for a plain read. No `method` field exists in this
+/// request/action shape at all — not just rejected, structurally absent —
+/// so there's nothing here to even try making a write with. Threat model
+/// per PROJECT.md 4.6 isn't "the agent is malicious", it's "the agent got
+/// tricked by page content it read" (prompt injection → exfiltration) plus
+/// plain SSRF, so the guard rails apply uniformly regardless of what the
+/// agent *meant* to do:
 ///
 /// 1. denylist private/loopback/link-local/metadata IPs, checked *after* DNS
 ///    resolution and pinned for the actual request (blocks rebinding)
 /// 2. full URL + byte count logged for every single request, allowed or not
-/// 3. GET is gated by `network.get_mode` (open/tofu/allowlist); anything
-///    that writes (POST et al) always queues for human approval
+/// 3. gated by `network.get_mode` (open/tofu/allowlist)
+///
+/// Writes (POST/PUT/etc) used to be supported here (as `http_fetch`)
+/// behind a human-approval grant queue (`grants.rs` `http_write`) —
+/// removed, and the syscall renamed `http_get` to make the removal
+/// structural rather than just enforced-at-runtime, once `ssh_exec` existed
+/// as an *ungated* way to do the exact same thing (`curl -X POST` on the
+/// configured SSH target). Keeping a pre-approval gate on writes through
+/// this syscall specifically stopped meaning anything once an equivalent
+/// capability existed elsewhere with no gate at all — it was friction, not
+/// containment, since anything that would route around the gate here could
+/// just use `ssh_exec` instead. `tofu_domain` (unrelated to writes) is
+/// unaffected.
 pub fn call(state: &mut AgentState, req: Value) -> Value {
     let source = req.get("_meta").cloned().unwrap_or(Value::Null);
-    let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("GET").to_uppercase();
     let url_str = req.get("url").and_then(|u| u.as_str()).unwrap_or("");
 
     if url_str.len() > state.config.network.url_max_len {
@@ -38,12 +51,12 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
     }
 
     if !state.http_daily.has_headroom() {
-        let _ = crate::logs::notify(&state.agent_home, "http_fetch rejected: daily request cap exhausted");
+        let _ = crate::logs::notify(&state.agent_home, "http_get rejected: daily request cap exhausted");
         return error_json("daily_cap_exceeded", "daily_request_cap exhausted");
     }
     if let Err(limited) = state.http_bucket.acquire() {
         if limited.sustained {
-            let _ = crate::logs::notify(&state.agent_home, "http_fetch sustained rate-limit hits — possible runaway loop");
+            let _ = crate::logs::notify(&state.agent_home, "http_get sustained rate-limit hits — possible runaway loop");
         }
         return rate_limited_json(&limited);
     }
@@ -53,33 +66,24 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
         return rate_limited_json(&limited);
     }
 
-    // writes always queue for approval; GET is gated by get_mode
-    if method != "GET" {
-        if grants::take_approved_write(&state.agent_home, &method, url_str).unwrap_or(false) {
-            // fall through to actually perform the request below
-        } else {
-            return queue(state, "http_write", &method, url_str, &host);
-        }
-    } else {
-        match state.config.network.get_mode.as_str() {
-            "allowlist" => {
-                if !state.config.network.allowlist.iter().any(|d| d == &host) {
-                    return error_json("domain_not_allowed", &format!("{host} is not in [network].allowlist"));
-                }
+    match state.config.network.get_mode.as_str() {
+        "allowlist" => {
+            if !state.config.network.allowlist.iter().any(|d| d == &host) {
+                return error_json("domain_not_allowed", &format!("{host} is not in [network].allowlist"));
             }
-            "tofu" => {
-                if !grants::is_domain_approved(&state.agent_home, &host) {
-                    return queue(state, "tofu_domain", &method, url_str, &host);
-                }
-            }
-            _ => {} // open
         }
+        "tofu" => {
+            if !grants::is_domain_approved(&state.agent_home, &host) {
+                return queue(state, url_str, &host);
+            }
+        }
+        _ => {} // open
     }
 
     let ip = match resolve_and_check(&host) {
         Ok(ip) => ip,
         Err(e) => {
-            log_egress(state, &method, url_str, &host, None, Some(&e), &source);
+            log_egress(state, url_str, &host, None, Some(&e), &source);
             return error_json("denied_ip", &e);
         }
     };
@@ -89,16 +93,11 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
         Ok(c) => c,
         Err(e) => return error_json("network_error", &e.to_string()),
     };
-    let mut builder = client.request(reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET), url.clone());
-    if let Some(body) = req.get("body").and_then(|b| b.as_str()) {
-        builder = builder.body(body.to_string());
-    }
-
-    let result = builder.send();
+    let result = client.get(url.clone()).send();
     let response = match result {
         Ok(r) => r,
         Err(e) => {
-            log_egress(state, &method, url_str, &host, None, Some(&e.to_string()), &source);
+            log_egress(state, url_str, &host, None, Some(&e.to_string()), &source);
             return error_json("network_error", &e.to_string());
         }
     };
@@ -106,7 +105,7 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
     let body_text = response.text().unwrap_or_default();
     let redacted = redact_secrets(&state.secrets, &body_text);
 
-    log_egress(state, &method, url_str, &host, Some(redacted.len()), None, &source);
+    log_egress(state, url_str, &host, Some(redacted.len()), None, &source);
     let _ = state.http_daily.record(1);
 
     ok_json(serde_json::json!({"status": status, "body": redacted}))
@@ -115,12 +114,14 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
 fn rate_limited_json(limited: &crate::ratelimit::RateLimited) -> Value {
     serde_json::json!({
         "ok": false,
-        "error": {"code": "rate_limited", "message": "http_fetch rate limit exceeded", "retry_after": limited.retry_after_secs}
+        "error": {"code": "rate_limited", "message": "http_get rate limit exceeded", "retry_after": limited.retry_after_secs}
     })
 }
 
-fn queue(state: &AgentState, kind: &str, method: &str, url: &str, host: &str) -> Value {
-    match grants::request_grant(&state.agent_home, kind, method, url, host) {
+/// The only grant kind `http_get` ever queues is `"tofu_domain"` — writes
+/// (and their `"http_write"` grant kind) are gone, see module docs.
+fn queue(state: &AgentState, url: &str, host: &str) -> Value {
+    match grants::request_grant(&state.agent_home, "tofu_domain", "GET", url, host) {
         Ok(id) => serde_json::json!({
             "ok": false,
             "error": {"code": "pending_approval", "message": "waiting on gateway approval", "id": id}
@@ -161,11 +162,11 @@ fn is_denied(ip: &IpAddr) -> bool {
     }
 }
 
-fn log_egress(state: &AgentState, method: &str, url: &str, domain: &str, bytes: Option<usize>, error: Option<&str>, source: &Value) {
+fn log_egress(state: &AgentState, url: &str, domain: &str, bytes: Option<usize>, error: Option<&str>, source: &Value) {
     let _ = append_jsonl(
         &state.agent_home.join("logs/egress.jsonl"),
         &serde_json::json!({
-            "ts": now_unix_secs(), "method": method, "url": url, "domain": domain,
+            "ts": now_unix_secs(), "method": "GET", "url": url, "domain": domain,
             "bytes": bytes, "error": error, "source": source,
         }),
     );

@@ -20,7 +20,7 @@ impl BudgetTracker {
     }
 
     /// Same daily-cap-with-rollover tracker, under a different state file —
-    /// used for `http_fetch`'s `daily_request_cap` (counting requests, not
+    /// used for `http_get`'s `daily_request_cap` (counting requests, not
     /// tokens) so it doesn't share a counter with the LLM token budget.
     pub fn load_named(agent_home: &Path, cap: u64, filename: &str) -> Self {
         let path = agent_home.join(filename);

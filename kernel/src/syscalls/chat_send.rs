@@ -23,6 +23,14 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
     let Some(message) = req.get("message").and_then(|m| m.as_str()) else {
         return error_json("bad_request", "chat_send requires a string `message` field");
     };
+    // an empty assistant turn saved to session.json poisons the session
+    // forever, not just this one call — see gateway.rs `handle_chat_message`
+    // for the full reasoning (Anthropic/OpenAI-style APIs 400 on *any*
+    // empty-content message in `messages`, and this session's full history
+    // gets resent every future turn).
+    if message.trim().is_empty() {
+        return error_json("bad_request", "chat_send's `message` must not be empty");
+    }
     let session_key = match req.get("target").and_then(|t| t.as_str()).unwrap_or("webui") {
         "discord" => {
             let owner_path = state.agent_home.join("logs/discord_owner.json");

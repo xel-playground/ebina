@@ -39,7 +39,12 @@ if (token()) {
   <div v-else class="shell">
     <Sidebar :section="section" @go="go" @logout="logout" />
     <div class="main">
-      <ChatPanel v-if="section === 'chat'" />
+      <!-- v-show, not v-if: switching sidebar tabs must not unmount this —
+           unmounting would wipe `sending`/`thinkingText`/`lastTrace` mid-run
+           (the in-flight `/api/message` promise keeps running in the
+           background regardless, but a fresh mount on navigating back has
+           no idea a reply is still pending) -->
+      <ChatPanel v-show="section === 'chat'" />
       <StatusPanel v-if="section === 'status'" />
       <SchedulerPanel v-if="section === 'scheduler'" />
       <ScheduleHistoryPanel v-if="section === 'schedule-history'" />

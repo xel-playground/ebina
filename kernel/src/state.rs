@@ -17,6 +17,7 @@ pub struct AgentState {
     pub config: Config,
     pub secrets: Secrets,
     pub budget: BudgetTracker,
+    pub embed_budget: BudgetTracker,
     pub llm_bucket: TokenBucket,
     pub embed_bucket: TokenBucket,
     pub http_bucket: TokenBucket,
@@ -33,6 +34,8 @@ pub struct AgentState {
 impl AgentState {
     pub fn new(agent_home: PathBuf, config: Config, secrets: Secrets, wasi: WasiP1Ctx, limits: StoreLimits) -> Self {
         let budget = BudgetTracker::load(&agent_home, config.budget.daily_token_cap);
+        let embed_budget =
+            BudgetTracker::load_named(&agent_home, config.budget.embed_daily_token_cap, "logs/embed-budget-state.json");
         let llm_bucket = TokenBucket::new(config.ratelimit.llm_per_min);
         let embed_bucket = TokenBucket::new(config.ratelimit.llm_per_min);
         let http_bucket = TokenBucket::new(config.ratelimit.http_per_min);
@@ -44,6 +47,7 @@ impl AgentState {
             config,
             secrets,
             budget,
+            embed_budget,
             llm_bucket,
             embed_bucket,
             http_bucket,

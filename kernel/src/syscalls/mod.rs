@@ -1,13 +1,14 @@
 pub mod chat_send;
 pub mod db_exec;
 pub mod embed;
-pub mod http_fetch;
+pub mod http_get;
 pub mod llm_call;
 pub mod memory_kv;
 pub mod notify;
 pub mod schedule_task;
 pub mod search_web;
 pub mod sleep_until;
+pub mod ssh_exec;
 
 use crate::abi::error_json;
 use crate::state::AgentState;
@@ -23,8 +24,9 @@ pub fn dispatch(state: &mut AgentState, name: &str, req: Value) -> Value {
         "memory_set" => memory_kv::set(state, req),
         "llm_call" => llm_call::call(state, req),
         "embed" => embed::call(state, req),
-        "http_fetch" => http_fetch::call(state, req),
+        "http_get" => http_get::call(state, req),
         "search_web" => search_web::call(state, req),
+        "ssh_exec" => ssh_exec::call(state, req),
         "schedule_task" => schedule_task::call(state, req),
         "update_task" => schedule_task::update(state, req),
         "delete_task" => schedule_task::delete(state, req),

@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::secrets::Secrets;
-use axum::extract::{Path as AxumPath, Request, State};
+use axum::extract::{Path as AxumPath, Query, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
@@ -46,6 +46,12 @@ pub(crate) struct AppState {
 /// exists as a directory on disk and that a wasm binary needs running — the
 /// agent itself never sees the gateway (PROJECT.md 4.4).
 pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
+    // once-at-startup, not lazily inside `pairing_seed()` — an
+    // already-paired instance never calls that again (the pairing-code path
+    // only runs while `load_owner` is still `None`), so a lazy migration
+    // would silently never fire for exactly the installs that most need it
+    crate::discord::migrate_legacy_seed_path(&cfg.agent_home);
+
     let state = Arc::new(AppState {
         agent_home: cfg.agent_home,
         wasm_path: cfg.wasm_path,
@@ -55,6 +61,8 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
 
     let api = Router::new()
         .route("/message", post(post_message))
+        .route("/upload", post(post_upload))
+        .route("/attachment", get(get_attachment))
         .route("/wake", post(post_wake))
         .route("/status", get(get_status))
         .route("/memory/notes", get(get_notes))
@@ -64,6 +72,7 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
         .route("/secrets", post(post_secret))
         .route("/logs", get(get_logs_sse))
         .route("/thinking", get(get_thinking_sse))
+        .route("/thinking/snapshot", get(get_thinking_snapshot))
         .route("/abort", post(post_abort))
         .route("/session", get(get_session))
         .route("/session/reset", post(post_session_reset))
@@ -247,8 +256,10 @@ async fn auth(State(state): State<Arc<AppState>>, req: Request, next: Next) -> R
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v == format!("Bearer {}", state.token));
-    // browsers' native EventSource can't set headers, so /api/logs also
-    // accepts the token as a query param — the only endpoint that does
+    // applied to every route (not just this one): browsers' native
+    // EventSource can't set headers (used by /api/logs, /api/thinking), and
+    // neither can a plain `<img src>` (used by /api/attachment) — both need
+    // the token in the URL instead
     let query_ok = req
         .uri()
         .query()
@@ -264,6 +275,11 @@ async fn auth(State(state): State<Arc<AppState>>, req: Request, next: Next) -> R
 #[derive(Deserialize)]
 struct MessageBody {
     text: String,
+    /// agent_home-relative paths from `/api/upload` (e.g.
+    /// `workspace/uploads/172-cat.png`) — attached to this turn, see
+    /// `turn_to_message`
+    #[serde(default)]
+    attachments: Vec<String>,
 }
 
 const DEFAULT_SESSION_KEY: &str = "webui";
@@ -275,22 +291,46 @@ const DEFAULT_SESSION_KEY: &str = "webui";
 /// reply and saves. Shared by `/api/message` (webui, session key
 /// `"webui"`) and the Discord adapter (one session key per channel/DM —
 /// see `discord.rs`) so the two don't bleed into each other's history.
-pub(crate) async fn handle_chat_message(state: Arc<AppState>, session_key: &str, text: &str, channel: Option<&str>) -> Value {
-    let mut session = load_session(&state.agent_home, session_key);
-    session.push(SessionTurn { role: "user".to_string(), content: text.to_string(), ts: crate::logs::now_unix_secs() });
-    let history: Vec<Value> = session.iter().map(SessionTurn::as_message).collect();
+// owned `String`/`Option<String>` params (not `&str`) so `post_message` can
+// `tokio::spawn` this whole function body — a spawned task keeps running to
+// completion independent of whether its caller's future is still alive, so
+// a client disconnecting mid-run (tab closed/reloaded) no longer cancels
+// this before it reaches `save_session` below and silently drops the turn.
+// Borrowed params would tie the spawned future's lifetime to the (dropped)
+// caller's stack frame, so ownership has to move in.
+pub(crate) async fn handle_chat_message(state: Arc<AppState>, session_key: String, text: String, attachments: Vec<String>, channel: Option<String>) -> Value {
+    let mut session = load_session(&state.agent_home, &session_key);
+    // an empty text block inside a multimodal content array (attachments
+    // with no caption) trips the same "must not be empty" rejection the
+    // all-empty-reply guard further down exists for — give it a placeholder
+    // instead of ever sending "" as a block's text
+    let display_text = if text.trim().is_empty() && !attachments.is_empty() { "(附件)".to_string() } else { text.clone() };
+    session.push(SessionTurn { role: "user".to_string(), content: display_text, attachments, ts: crate::logs::now_unix_secs() });
+    let supports_vision = Config::load(&state.agent_home).map(|c| c.llm.supports_vision).unwrap_or(false);
+    let history: Vec<Value> = session.iter().map(|t| turn_to_message(&state.agent_home, supports_vision, t)).collect();
 
     let mut trigger = json!({"type": "message", "text": text, "history": history, "session_key": session_key});
     if let Some(c) = channel {
-        trigger["channel"] = Value::String(c.to_string());
+        trigger["channel"] = Value::String(c);
     }
     let outcome = run_trigger(state.clone(), trigger).await;
 
-    let reply = outcome.get("result").and_then(|r| r.get("summary")).and_then(|s| s.as_str()).unwrap_or("").to_string();
-    session.push(SessionTurn { role: "assistant".to_string(), content: reply, ts: crate::logs::now_unix_secs() });
-    let _ = save_session(&state.agent_home, session_key, &session);
+    let mut reply = outcome.get("result").and_then(|r| r.get("summary")).and_then(|s| s.as_str()).unwrap_or("").to_string();
+    // an empty `content` here isn't just a bad UX moment — it gets baked
+    // into `session.json` permanently, and every future turn resends the
+    // *entire* history back to the provider as `messages`. Anthropic/OpenAI-
+    // style APIs reject a request outright if any message in it has empty
+    // content ("message ... with role 'assistant' must not be empty"), so
+    // one empty reply here doesn't just look bad once — it 400s literally
+    // every subsequent message in this session, forever, until the bad turn
+    // is manually found and removed. Never let that turn exist at all.
+    if reply.trim().is_empty() {
+        reply = "(no reply — the run ended without producing one; check Live Log / LLM logs for what happened)".to_string();
+    }
+    session.push(SessionTurn { role: "assistant".to_string(), content: reply, attachments: Vec::new(), ts: crate::logs::now_unix_secs() });
+    let _ = save_session(&state.agent_home, &session_key, &session);
 
-    maybe_auto_compact(&state, session_key);
+    maybe_auto_compact(&state, &session_key);
 
     outcome
 }
@@ -317,7 +357,111 @@ fn maybe_auto_compact(state: &Arc<AppState>, session_key: &str) {
 }
 
 async fn post_message(State(state): State<Arc<AppState>>, Json(body): Json<MessageBody>) -> Json<Value> {
-    Json(handle_chat_message(state, DEFAULT_SESSION_KEY, &body.text, None).await)
+    // spawned rather than awaited inline: if the client disconnects mid-run
+    // (tab closed/reloaded, network drop) axum drops this handler's future,
+    // but a `tokio::spawn`ed task keeps running on its own regardless of
+    // whether anything is still awaiting it — so the turn still reaches
+    // `save_session` at the end of `handle_chat_message` instead of being
+    // silently lost (the run itself always completed; only the session.json
+    // write was getting cancelled along with the dropped HTTP response)
+    let handle = tokio::spawn(handle_chat_message(state, DEFAULT_SESSION_KEY.to_string(), body.text, body.attachments, None));
+    match handle.await {
+        Ok(outcome) => Json(outcome),
+        Err(e) => Json(json!({"ok": false, "error": format!("run task panicked: {e}")})),
+    }
+}
+
+#[derive(Deserialize)]
+struct UploadBody {
+    filename: String,
+    /// raw base64 (no `data:...;base64,` prefix — the frontend strips that
+    /// before sending)
+    data_base64: String,
+}
+
+/// `POST /api/upload {filename, data_base64} -> {ok, path}` — webui's side
+/// of `save_attachment` (Discord goes straight to that function itself
+/// after downloading its own attachment bytes, see `discord.rs`).
+async fn post_upload(State(state): State<Arc<AppState>>, Json(body): Json<UploadBody>) -> Json<Value> {
+    use base64::Engine;
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(&body.data_base64) {
+        Ok(b) => b,
+        Err(e) => return Json(json!({"ok": false, "error": format!("invalid base64: {e}")})),
+    };
+    match save_attachment(&state.agent_home, &body.filename, &bytes) {
+        Ok(path) => Json(json!({"ok": true, "path": path})),
+        Err(e) => Json(json!({"ok": false, "error": e})),
+    }
+}
+
+/// Saves a chat attachment (webui upload or downloaded Discord attachment)
+/// into `agent_home/workspace/uploads/` — a normal quota-counted,
+/// guest-visible file like anything else `write_file` creates. The returned
+/// agent_home-relative path gets passed back in `MessageBody::attachments`
+/// / `handle_chat_message`'s `attachments` param. Same quota enforcement as
+/// the guest's own `write_file` (agent_loop.rs) — uploads count against the
+/// same cap, not a separate unbounded channel.
+pub(crate) fn save_attachment(agent_home: &Path, filename: &str, bytes: &[u8]) -> Result<String, String> {
+    let quota = Config::load(agent_home).map(|c| c.disk.quota_bytes).unwrap_or_else(|_| crate::config::DiskConfig::default().quota_bytes);
+    let projected = agent_home_disk_usage(agent_home) + bytes.len() as u64;
+    if projected > quota {
+        return Err(format!("disk quota exceeded: uploading would bring agent-home to {projected} bytes, over the {quota}-byte cap"));
+    }
+
+    // basename only — strips any directory components the client sent, so
+    // this can't be steered outside workspace/uploads/
+    let safe_name = Path::new(filename).file_name().and_then(|n| n.to_str()).unwrap_or("upload").to_string();
+    let rel_path = format!("workspace/uploads/{}-{safe_name}", crate::logs::now_unix_secs());
+    let full_path = agent_home.join(&rel_path);
+    if let Some(parent) = full_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&full_path, bytes).map_err(|e| e.to_string())?;
+    Ok(rel_path)
+}
+
+#[derive(Deserialize)]
+struct AttachmentQuery {
+    path: String,
+}
+
+/// `GET /api/attachment?path=workspace/uploads/...` — the webui's own
+/// `<img>` tags need *something* to point at to show a user their attached
+/// image back (kernel otherwise serves API only, no static file serving —
+/// see `GatewayConfig` doc comment); deliberately scoped to
+/// `workspace/uploads/` only so this can't become a general
+/// read-any-file-in-agent-home endpoint.
+async fn get_attachment(State(state): State<Arc<AppState>>, Query(q): Query<AttachmentQuery>) -> Response {
+    let rel = Path::new(&q.path);
+    let in_uploads = rel.starts_with("workspace/uploads") && !rel.components().any(|c| matches!(c, std::path::Component::ParentDir));
+    if !in_uploads {
+        return (StatusCode::FORBIDDEN, "attachment path must be under workspace/uploads/").into_response();
+    }
+    match std::fs::read(state.agent_home.join(rel)) {
+        Ok(bytes) => ([(axum::http::header::CONTENT_TYPE, mime_for_path(&q.path))], bytes).into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
+}
+
+/// Host-side equivalent of agent_loop.rs's `agent_home_size` (that one runs
+/// *inside* the guest against its own preopened `/`; this runs on the real
+/// path from the kernel process) — same best-effort walk, same
+/// skip-unreadable-entries behavior.
+fn agent_home_disk_usage(agent_home: &Path) -> u64 {
+    fn walk(dir: &Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+        let mut total = 0u64;
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                total += walk(&entry.path());
+            } else {
+                total += meta.len();
+            }
+        }
+        total
+    }
+    walk(agent_home)
 }
 
 /// dev/debug: fire an arbitrary trigger JSON immediately (PROJECT.md 4.4
@@ -376,9 +520,18 @@ fn persist_last_run(agent_home: &Path, sleep_until: Option<i64>, result: &Value)
 
 async fn get_status(State(state): State<Arc<AppState>>) -> Json<Value> {
     let read_json = |p: PathBuf| std::fs::read_to_string(p).ok().and_then(|s| serde_json::from_str::<Value>(&s).ok());
+    // non-blocking: `try_lock` fails immediately if `run_trigger` currently
+    // holds `run_lock` for the whole duration of a run, rather than
+    // (dropping in) waiting for it to finish — this is a status *check*,
+    // it must never itself queue behind a long-running turn. Lets a
+    // freshly loaded/reloaded webui tab find out a run is already in
+    // progress (e.g. a long `ssh_exec` chain) instead of having no idea
+    // one exists just because *this* page load didn't start it itself.
+    let busy = state.run_lock.try_lock().is_err();
     Json(json!({
         "budget": read_json(state.agent_home.join("logs/budget-state.json")),
         "last_run": read_json(state.agent_home.join("logs/last_run.json")),
+        "busy": busy,
     }))
 }
 
@@ -498,12 +651,66 @@ async fn post_secret(State(state): State<Arc<AppState>>, Json(body): Json<SetSec
 struct SessionTurn {
     role: String,
     content: String,
+    /// agent_home-relative paths (see `MessageBody::attachments`) — old
+    /// sessions predate this field, hence the default for back-compat
+    #[serde(default)]
+    attachments: Vec<String>,
     ts: i64,
 }
 
-impl SessionTurn {
-    fn as_message(&self) -> Value {
-        json!({"role": self.role, "content": self.content})
+/// Builds the OpenAI/Ollama-style `{role, content}` message `agent_loop.rs`
+/// clones straight into its `messages` array (PROJECT.md: the guest treats
+/// `content` as an opaque JSON value, string or block-array alike, so
+/// nothing on the guest side needs to know attachments exist).
+///
+/// No attachments → plain string content, unchanged from before. With
+/// attachments: an image gets embedded as a base64 `image_url` block only
+/// if `supports_vision` is on (config.toml `[llm] supports_vision` — no
+/// reliable way to detect this automatically for an arbitrary
+/// OpenAI-compatible endpoint) *and* the file's extension maps to a known
+/// image type; anything else (vision off, non-image file, unreadable file)
+/// just gets named in the text so the agent can `read_file`/`list_dir` it
+/// itself instead of the model silently never learning it exists.
+fn turn_to_message(agent_home: &Path, supports_vision: bool, turn: &SessionTurn) -> Value {
+    if turn.attachments.is_empty() {
+        return json!({"role": turn.role, "content": turn.content});
+    }
+
+    let mut blocks = vec![json!({"type": "text", "text": turn.content})];
+    let mut notes = Vec::new();
+    for rel_path in &turn.attachments {
+        let mime = mime_for_path(rel_path);
+        let embedded = supports_vision
+            && mime.starts_with("image/")
+            && std::fs::read(agent_home.join(rel_path)).ok().map(|bytes| {
+                use base64::Engine;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                blocks.push(json!({"type": "image_url", "image_url": {"url": format!("data:{mime};base64,{b64}")}}));
+            }).is_some();
+        if !embedded {
+            notes.push(format!("[附件: {rel_path}]"));
+        }
+    }
+    if !notes.is_empty() {
+        if let Some(Value::String(t)) = blocks[0].get_mut("text") {
+            if !t.is_empty() {
+                t.push_str("\n\n");
+            }
+            t.push_str(&notes.join("\n"));
+        }
+    }
+    json!({"role": turn.role, "content": blocks})
+}
+
+/// Extension-based, not content-sniffed — good enough to gate "is this
+/// worth trying to embed as a vision block", not a security boundary.
+fn mime_for_path(path: &str) -> &'static str {
+    match Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => "application/octet-stream",
     }
 }
 
@@ -639,13 +846,16 @@ pub(crate) async fn compact_session_key(state: Arc<AppState>, key: &str) -> Valu
     }
     let _ = archive_session(&state.agent_home, key);
 
-    let history: Vec<Value> = session.iter().map(SessionTurn::as_message).collect();
+    // compaction only needs the text to summarize, not attachment images —
+    // no `turn_to_message`/vision-embedding here, plain content is enough
+    let history: Vec<Value> = session.iter().map(|t| json!({"role": t.role, "content": t.content})).collect();
     let outcome = run_trigger(state.clone(), json!({"type": "compact_session", "history": history})).await;
     let summary = outcome.get("result").and_then(|r| r.get("summary")).and_then(|s| s.as_str()).unwrap_or("").to_string();
 
     let compacted = vec![SessionTurn {
         role: "system".to_string(),
         content: format!("(earlier conversation, compacted) {summary}"),
+        attachments: Vec::new(),
         ts: crate::logs::now_unix_secs(),
     }];
     let _ = save_session(&state.agent_home, key, &compacted);
@@ -653,7 +863,8 @@ pub(crate) async fn compact_session_key(state: Arc<AppState>, key: &str) -> Valu
     json!({"ok": true, "summary": summary})
 }
 
-// ---- grants (tofu new-domain / http_fetch writes queued for approval) ----
+// ---- grants (tofu new-domain queued for approval — writes used to queue
+// here too until http_get's write path was removed, see grants.rs docs) ----
 
 async fn get_grants(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({"grants": crate::grants::load_grants(&state.agent_home)}))
@@ -765,8 +976,27 @@ async fn post_skill(State(state): State<Arc<AppState>>, Json(skill): Json<SkillB
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
-    let content = format!("---\nname: {}\ndescription: {}\n---\n{}\n", skill.name, skill.description, skill.body);
-    match std::fs::write(dir.join(format!("{}.md", skill.name)), content) {
+    // preserve usage stats across a webui edit — editing description/body
+    // isn't "learning it" again, `created_at`/`used_count`/`last_used`
+    // shouldn't reset just because a human tweaked the content (mirrors
+    // agent/src/skills.rs `save`'s same reasoning exactly)
+    let path = dir.join(format!("{}.md", skill.name));
+    let existing = std::fs::read_to_string(&path).ok().and_then(|t| parse_skill(&t));
+    let created_at = existing.as_ref().and_then(|s| s["created_at"].as_u64()).unwrap_or_else(|| crate::logs::now_unix_secs() as u64);
+    let used_count = existing.as_ref().and_then(|s| s["used_count"].as_u64()).unwrap_or(0);
+    let last_used_line = existing
+        .as_ref()
+        .and_then(|s| s["last_used"].as_u64())
+        .map(|t| format!("last_used: {t}\n"))
+        .unwrap_or_default();
+    // same trim as agent/src/skills.rs `render` — otherwise saving the same
+    // skill repeatedly grows a longer run of trailing blank lines each time
+    let body = skill.body.trim_end_matches('\n');
+    let content = format!(
+        "---\nname: {}\ndescription: {}\ncreated_at: {created_at}\nused_count: {used_count}\n{last_used_line}---\n{body}\n",
+        skill.name, skill.description
+    );
+    match std::fs::write(path, content) {
         Ok(()) => (StatusCode::OK, "saved".to_string()),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -788,16 +1018,26 @@ fn parse_skill(text: &str) -> Option<Value> {
 
     let mut name = None;
     let mut description = String::new();
+    let mut created_at = 0u64;
+    let mut used_count = 0u64;
+    let mut last_used: Option<u64> = None;
     for line in front.lines() {
         if let Some((key, value)) = line.split_once(':') {
+            let value = value.trim();
             match key.trim() {
-                "name" => name = Some(value.trim().to_string()),
-                "description" => description = value.trim().to_string(),
+                "name" => name = Some(value.to_string()),
+                "description" => description = value.to_string(),
+                "created_at" => created_at = value.parse().unwrap_or(0),
+                "used_count" => used_count = value.parse().unwrap_or(0),
+                "last_used" => last_used = value.parse().ok(),
                 _ => {}
             }
         }
     }
-    Some(json!({"name": name?, "description": description, "body": body}))
+    Some(json!({
+        "name": name?, "description": description, "body": body,
+        "created_at": created_at, "used_count": used_count, "last_used": last_used,
+    }))
 }
 
 // ---- live "thinking" stream + abort ----
@@ -813,11 +1053,28 @@ async fn post_abort(State(state): State<Arc<AppState>>) -> Json<Value> {
     }
 }
 
+#[derive(Deserialize)]
+struct ThinkingQuery {
+    session: Option<String>,
+}
+
 /// Unlike `/api/logs` (which tails *new lines*), this re-sends the *whole*
 /// current file each time it changes — `thinking-live.txt` is one growing
 /// blob per call, not a line-oriented log.
-async fn get_thinking_sse(State(state): State<Arc<AppState>>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    Sse::new(thinking_stream(state.agent_home.join("logs/thinking-live.txt")))
+///
+/// `?session=<key>` picks which session's live trace to tail — same
+/// `chat_sessions/<key>/thinking-live.txt` a running turn writes to
+/// (`agent_loop.rs` `thinking_live_path`, `llm_call.rs` `thinking_path`);
+/// defaults to `"webui"` since that's the only session the webui Chat
+/// panel itself ever watches. Without this, a Discord/cron run in the
+/// background would blast its own trace over whatever the webui viewer was
+/// just watching, and vice versa.
+async fn get_thinking_sse(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ThinkingQuery>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let key = q.session.unwrap_or_else(|| DEFAULT_SESSION_KEY.to_string());
+    Sse::new(thinking_stream(session_dir(&state.agent_home, &key).join("thinking-live.txt")))
         .keep_alive(axum::response::sse::KeepAlive::default())
 }
 
@@ -825,13 +1082,28 @@ fn thinking_stream(path: PathBuf) -> impl Stream<Item = Result<Event, Infallible
     let last = std::fs::read_to_string(&path).unwrap_or_default();
     stream::unfold((path, last), |(path, last)| async move {
         loop {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
             let Ok(text) = std::fs::read_to_string(&path) else { continue };
             if text != last {
                 return Some((Ok(Event::default().data(text.clone())), (path, text)));
             }
         }
     })
+}
+
+/// One-shot, non-SSE read of the exact same file `/api/thinking` tails —
+/// for grabbing the *final* trace right after a run completes. The SSE
+/// stream only emits on a poll tick that *happens* to land after the file
+/// changed; a fast run (a plain reply with no actions) can write its whole
+/// trace and finish before the next 200ms tick ever fires, and the webui's
+/// "thinking" bubble unmounts the instant `/api/message` resolves — so the
+/// live view can go the entire run showing nothing at all. Calling this
+/// once right after that same request resolves guarantees the full trace,
+/// no race against a poll interval.
+async fn get_thinking_snapshot(State(state): State<Arc<AppState>>, Query(q): Query<ThinkingQuery>) -> Json<Value> {
+    let key = q.session.unwrap_or_else(|| DEFAULT_SESSION_KEY.to_string());
+    let text = std::fs::read_to_string(session_dir(&state.agent_home, &key).join("thinking-live.txt")).unwrap_or_default();
+    Json(json!({"text": text}))
 }
 
 // ---- live log stream ----

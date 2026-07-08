@@ -1,5 +1,6 @@
 mod agent_loop;
 mod memory;
+mod perf;
 mod scheduler;
 mod skills;
 mod syscall;
@@ -25,12 +26,12 @@ fn main() {
         "spin_forever" => spin_forever(),
         "llm_call_demo" => llm_call_demo(),
         "embed_demo" => embed_demo(),
-        "http_fetch_demo" => http_fetch_demo(),
-        "http_fetch_ssrf_localhost" => http_fetch_url("http://127.0.0.1:1/"),
-        "http_fetch_ssrf_private" => http_fetch_url("http://192.168.1.1/"),
-        "http_fetch_ssrf_metadata" => http_fetch_url("http://169.254.169.254/"),
-        "http_fetch_post" => http_fetch_post_demo(),
-        "http_fetch_long_url" => http_fetch_url(&format!("https://example.com/?q={}", "a".repeat(3000))),
+        "http_get_demo" => http_get_demo(),
+        "http_get_ssrf_localhost" => http_get_url("http://127.0.0.1:1/"),
+        "http_get_ssrf_private" => http_get_url("http://192.168.1.1/"),
+        "http_get_ssrf_metadata" => http_get_url("http://169.254.169.254/"),
+        "http_get_post" => http_get_post_demo(),
+        "http_get_long_url" => http_get_url(&format!("https://example.com/?q={}", "a".repeat(3000))),
         "search_web_demo" => search_web_demo(),
         "read_path" => read_path_mode(),
         "run" => run_mode(),
@@ -130,18 +131,18 @@ fn embed_demo() {
     println!("RESULT:{resp}");
 }
 
-fn http_fetch_demo() {
-    http_fetch_url("https://example.com/");
+fn http_get_demo() {
+    http_get_url("https://example.com/");
 }
 
-fn http_fetch_url(url: &str) {
-    let resp = syscall::call("http_fetch", &serde_json::json!({"method": "GET", "url": url}));
+fn http_get_url(url: &str) {
+    let resp = syscall::call("http_get", &serde_json::json!({"method": "GET", "url": url}));
     println!("RESULT:{resp}");
 }
 
-fn http_fetch_post_demo() {
+fn http_get_post_demo() {
     let resp = syscall::call(
-        "http_fetch",
+        "http_get",
         &serde_json::json!({"method": "POST", "url": "https://example.com/submit", "body": "hi"}),
     );
     println!("RESULT:{resp}");

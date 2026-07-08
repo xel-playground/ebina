@@ -21,7 +21,7 @@ defineExpose({ refresh })
 <template>
   <div>
     <h2>Egress log <button class="secondary" @click="refresh">Refresh</button></h2>
-    <p class="hint">Every outbound `http_fetch` attempt, allowed or denied — full URL + byte count,
+    <p class="hint">Every outbound `http_get` attempt, allowed or denied — full URL + byte count,
       nothing redacted here except vault secret values.</p>
     <div class="hint" v-if="rows.length === 0">no requests logged yet</div>
     <div class="card" v-for="(e, i) in rows" :key="i" :class="{ denied: e.error }" style="margin-bottom:0.5rem">

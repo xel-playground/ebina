@@ -1,15 +1,18 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// PROJECT.md 4.6/4.7: anything that isn't a plain `open`-mode GET — a new
-/// domain under `tofu`, or any write (`http_fetch` POST/PUT/etc) — hangs
-/// here until a human approves it via the gateway, instead of the guest
-/// ever getting to make that call itself.
+/// PROJECT.md 4.6/4.7: a new domain under `tofu` mode hangs here until a
+/// human approves it via the gateway, instead of the guest ever getting to
+/// make that call itself. `http_fetch` writes (POST/PUT/etc) used to queue
+/// here too (`kind: "http_write"`) — removed once `ssh_exec` existed as an
+/// ungated way to do the same thing, since the gate had stopped being real
+/// containment once an equivalent ungated path existed (see `http_fetch.rs`
+/// module docs). Old `"http_write"` entries may still exist in
+/// `logs/grants.json` from before that; nothing creates new ones.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PendingGrant {
     pub id: String,
-    /// "tofu_domain" (approving unlocks the whole domain permanently) or
-    /// "http_write" (approving allows only this one call to proceed)
+    /// `"tofu_domain"` — approving unlocks the whole domain permanently
     pub kind: String,
     pub method: String,
     pub url: String,
@@ -110,20 +113,4 @@ pub fn load_approved_domains(agent_home: &Path) -> Vec<String> {
 
 pub fn is_domain_approved(agent_home: &Path, domain: &str) -> bool {
     load_approved_domains(agent_home).iter().any(|d| d == domain)
-}
-
-/// Consumes a still-pending `http_write` grant for this exact method+url if
-/// one has been approved — write approvals are one-shot, not a standing
-/// permission (unlike `tofu_domain`, which is permanent once granted).
-pub fn take_approved_write(agent_home: &Path, method: &str, url: &str) -> anyhow::Result<bool> {
-    let mut grants = load_grants(agent_home);
-    let Some(pos) = grants
-        .iter()
-        .position(|g| g.kind == "http_write" && g.method == method && g.url == url && g.status == "approved")
-    else {
-        return Ok(false);
-    };
-    grants.remove(pos);
-    save_grants(agent_home, &grants)?;
-    Ok(true)
 }

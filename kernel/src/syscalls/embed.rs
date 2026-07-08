@@ -3,14 +3,18 @@ use crate::logs::{append_jsonl, now_unix_secs};
 use crate::state::AgentState;
 use serde_json::Value;
 
-/// `embed(texts[]) -> {vectors[], model}` — same budget/rate-limit/logging
-/// treatment as `llm_call`; counts against the same daily token cap.
+/// `embed(texts[]) -> {vectors[], model}` — same rate-limit/logging
+/// treatment as `llm_call`, but its own separate daily token budget
+/// (`config.budget.embed_daily_token_cap`, `logs/embed-budget-state.json`)
+/// rather than sharing `llm_call`'s — a RAG reindex burst (every note file
+/// gets re-embedded on hash change) shouldn't be able to starve the actual
+/// chat budget, or vice versa.
 pub fn call(state: &mut AgentState, req: Value) -> Value {
     let Some(texts) = req.get("texts").and_then(|t| t.as_array()) else {
         return error_json("bad_request", "embed requires a `texts` array field");
     };
 
-    if !state.budget.has_headroom() {
+    if !state.embed_budget.has_headroom() {
         let _ = crate::logs::notify(&state.agent_home, "embed rejected: daily token budget exhausted");
         return error_json("budget_exceeded", "daily token budget exhausted");
     }
@@ -80,7 +84,7 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
         ),
     };
 
-    if let Err(e) = state.budget.record(total_tokens) {
+    if let Err(e) = state.embed_budget.record(total_tokens) {
         let _ = crate::logs::notify(&state.agent_home, &format!("failed to record budget: {e}"));
     }
     let _ = append_jsonl(
