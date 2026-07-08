@@ -538,12 +538,17 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String]) -> String {
     let trigger_type = trigger.get("type").and_then(|t| t.as_str());
     let trigger_note = match trigger_type {
         Some("daily_maintenance") => {
+            let since_ts = trigger.get("since_ts").and_then(Value::as_u64).unwrap_or(0);
+            let delta = recent_log_entries(since_ts);
             format!(
-                "\nThis is a daily_maintenance run (PROJECT.md 4.3). Review what happened today (check logs/ \
-                 if useful), distill it into memory/notes/ (write_file — merge duplicates, prune what's stale), \
-                 then write_file a report to /memory/maintenance_reports/{}.md (one file per day) summarizing \
-                 what you did before calling done.\n",
-                today_utc()
+                "\nThis is a daily_maintenance run (PROJECT.md 4.3), on a 6-hour cycle — only what's new since \
+                 the last run, not the whole day. You don't need to read_file the day's log.md yourself; below \
+                 is everything logged since {}:\n\n{delta}\n\n\
+                 Distill anything worth keeping into memory/notes/ (write_file — merge duplicates, prune what's \
+                 stale), then write_file a report to /memory/maintenance_reports/{}.md summarizing what you did \
+                 before calling done.\n",
+                if since_ts == 0 { "the beginning".to_string() } else { human_timestamp(since_ts) },
+                crate::time::maintenance_run_id(now_unix())
             )
         }
         Some("message") => {
@@ -692,10 +697,60 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String]) -> String {
     )
 }
 
+/// Collects every day-log entry with `ts` after `since_ts`, across however
+/// many day-dirs that spans (a 6h maintenance cycle can straddle UTC
+/// midnight) — this is what actually caps `daily_maintenance`'s input size
+/// now: it's handed only the delta instead of being told to `read_file` the
+/// whole day (or, before that, the whole running history — see
+/// `write_memory_note`'s doc comment for how that blew one run to 160k
+/// input tokens).
+fn recent_log_entries(since_ts: u64) -> String {
+    let today_day = (now_unix() / 86_400) as i64;
+    // `since_ts == 0` means "no checkpoint yet" (the very first maintenance
+    // run ever, before `.last_run` exists) — without this, it'd iterate
+    // every day since the Unix epoch trying to open nonexistent log.md files.
+    let since_day = if since_ts == 0 { today_day } else { (since_ts / 86_400) as i64 };
+
+    let mut entries: Vec<(u64, String)> = Vec::new();
+    for day in since_day..=today_day {
+        let path = format!("{NOTES_DIR}/{}/log.md", crate::time::civil_from_days(day));
+        let Ok(text) = fs::read_to_string(&path) else { continue };
+        for block in text.split("\n## run at ").filter(|b| !b.trim().is_empty()) {
+            if let Some(ts) = parse_block_ts(block) {
+                if ts > since_ts {
+                    entries.push((ts, format!("## run at {}", block.trim())));
+                }
+            }
+        }
+    }
+    entries.sort_by_key(|(ts, _)| *ts);
+
+    if entries.is_empty() {
+        "(nothing new since the last maintenance run)".to_string()
+    } else {
+        entries.into_iter().map(|(_, b)| b).collect::<Vec<_>>().join("\n\n")
+    }
+}
+
+/// Pulls the `(ts=N)` machine-readable timestamp `write_memory_note` puts
+/// next to the human-readable one back out of a log block.
+fn parse_block_ts(block: &str) -> Option<u64> {
+    let start = block.find("(ts=")? + 4;
+    let end = start + block[start..].find(')')?;
+    block[start..end].parse().ok()
+}
+
 /// `memory/notes/` holds both timeless topic notes (`color.md`, `pet.md`, ...
 /// written directly by the agent) and per-day run logs under a dated
-/// subfolder (`memory/notes/2026-07-05/log.md`) — so walk one level deep,
-/// not just the top of `NOTES_DIR`.
+/// subfolder (`memory/notes/2026-07-05/log.md`). Only the top-level notes
+/// are curated facts meant for retrieval — day logs are a raw append-only
+/// journal (verbatim trigger/summary per run, read whole by
+/// `daily_maintenance`) and deliberately NOT indexed here: embedding them
+/// pollutes `hybrid_search` with stale, unreviewed quotes (e.g. a user
+/// message quoting old wrong data while correcting it stays retrievable
+/// forever, contradicting the corrected fact note) and with a small note
+/// corpus, log chunks tend to dominate every query's top-k regardless of
+/// relevance.
 /// Returns how many notes were actually re-embedded (vs skipped — unchanged
 /// hash) — `run()` traces this count so "reindexing" isn't silent work with
 /// nothing to show for it in `/logs/chat_sessions/*/thinking-live.txt`.
@@ -708,13 +763,9 @@ fn reindex_all_notes(embed_model: &str) -> u32 {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            let Ok(day_entries) = fs::read_dir(&path) else { continue };
-            for day_entry in day_entries.flatten() {
-                if reindex_if_markdown(&day_entry.path(), embed_model) {
-                    reindexed += 1;
-                }
-            }
-        } else if reindex_if_markdown(&path, embed_model) {
+            continue;
+        }
+        if reindex_if_markdown(&path, embed_model) {
             reindexed += 1;
         }
     }
@@ -760,7 +811,13 @@ fn write_memory_note(trigger: &Value, summary: &str) {
     };
     let summary = truncate_chars(summary, MEMORY_NOTE_SUMMARY_MAX_CHARS);
 
-    let entry = format!("\n## run at {}\ntrigger: {trigger_line}\nsummary: {summary}\n", human_timestamp(now_unix()));
+    // `(ts=N)` alongside the human-readable timestamp — `recent_log_entries`
+    // parses this back out to filter entries by time (daily_maintenance's
+    // since-last-run scan); re-deriving a unix timestamp from
+    // `human_timestamp`'s `YYYY-MM-DD HH:MM:SS UTC` would need a date
+    // parser, this just needs one `find`+`parse`
+    let now = now_unix();
+    let entry = format!("\n## run at {} (ts={now})\ntrigger: {trigger_line}\nsummary: {summary}\n", human_timestamp(now));
     let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(format!("{day_dir}/log.md")) else {
         return;
     };

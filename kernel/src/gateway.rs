@@ -109,13 +109,36 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
 /// structurally a fresh session — `agent_loop.rs` only continues a
 /// conversation when `trigger.history` is present):
 ///
-/// - `daily_maintenance`, once `memory/maintenance_reports/<today>.md` is
-///   missing (retried at most every 15 min if a run doesn't produce it)
+/// - `daily_maintenance`, every `MAINTENANCE_INTERVAL_SECS` (6h) since the
+///   last one, tracked by `last_maintenance_marker_path` rather than "does
+///   today's report exist" — running 4x/day needs its own persisted
+///   checkpoint since a bare day-existence check would only ever fire once
+///   per calendar day. `since_ts` (the checkpoint being advanced) rides
+///   along in the trigger so the agent only reviews what's new since then
+///   (`agent_loop.rs`'s `recent_log_entries`), not the whole day.
 /// - `cron`, once the agent's own last-requested `sleep_until` has passed
 /// - one `scheduled_task` wake per enabled, cron-matching entry under
 ///   `crate::scheduler_tasks` — user/agent-defined jobs (`data_path` points
 ///   the woken session at its own instructions), independent of the two
 ///   built-in wakes above
+const MAINTENANCE_INTERVAL_SECS: i64 = 6 * 3600;
+
+fn last_maintenance_marker_path(agent_home: &Path) -> PathBuf {
+    agent_home.join("memory/maintenance_reports/.last_run")
+}
+
+fn read_last_maintenance(agent_home: &Path) -> i64 {
+    std::fs::read_to_string(last_maintenance_marker_path(agent_home)).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
+}
+
+fn write_last_maintenance(agent_home: &Path, now: i64) {
+    let path = last_maintenance_marker_path(agent_home);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, now.to_string());
+}
+
 async fn scheduler_loop(state: Arc<AppState>) {
     let mut last_daily_maintenance_attempt: Option<i64> = None;
     let mut last_handled_sleep_until: Option<i64> = None;
@@ -123,10 +146,11 @@ async fn scheduler_loop(state: Arc<AppState>) {
         tokio::time::sleep(Duration::from_secs(30)).await;
         let now = crate::logs::now_unix_secs();
 
-        let report_path = state.agent_home.join(format!("memory/maintenance_reports/{}.md", crate::logs::today_utc()));
-        if !report_path.exists() && last_daily_maintenance_attempt.is_none_or(|last| now - last >= 900) {
+        let last_maintenance = read_last_maintenance(&state.agent_home);
+        if now - last_maintenance >= MAINTENANCE_INTERVAL_SECS && last_daily_maintenance_attempt.is_none_or(|last| now - last >= 900) {
             last_daily_maintenance_attempt = Some(now);
-            run_scheduled(state.clone(), json!({"type": "daily_maintenance"})).await;
+            run_scheduled(state.clone(), json!({"type": "daily_maintenance", "since_ts": last_maintenance})).await;
+            write_last_maintenance(&state.agent_home, now);
         }
 
         let last_run: Option<Value> = std::fs::read_to_string(state.agent_home.join("logs/last_run.json"))
@@ -564,8 +588,10 @@ fn collect_notes(dir: &Path, base: &Path) -> Vec<Value> {
     out
 }
 
-/// one report per day, like `memory/notes/<date>/log.md` — `date` is the
-/// filename stem, e.g. `"2026-07-05"`
+/// one report per maintenance run (every 6h, not once/day — see
+/// `scheduler_loop`) — `date` is the filename stem, e.g. `"2026-07-05_1830"`.
+/// `.last_run` (the checkpoint marker, no `.md` extension) is filtered out
+/// by the extension check below, same directory or not.
 async fn get_reports(State(state): State<Arc<AppState>>) -> Json<Value> {
     let dir = state.agent_home.join("memory/maintenance_reports");
     let mut reports = Vec::new();
