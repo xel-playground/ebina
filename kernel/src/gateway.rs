@@ -27,6 +27,39 @@ pub struct GatewayConfig {
     pub port: u16,
 }
 
+/// A table of on-demand per-key locks (session keys, scheduled-task ids)
+/// that would otherwise grow one entry per distinct key forever — a
+/// long-running gateway that's seen thousands of Discord channels or
+/// scheduled tasks over its life would hold that many stale `Arc<Mutex<()>>`
+/// entries hostage in memory even though almost all of them are idle.
+/// `sweep` drops any entry that's both unheld right now (`strong_count ==
+/// 1`, i.e. only this table's own clone exists) and hasn't been touched
+/// recently — called once per `scheduler_loop` tick (every 30s), cheap
+/// since it's just a `HashMap::retain` over two small maps.
+struct KeyedLocks {
+    map: tokio::sync::Mutex<std::collections::HashMap<String, (Arc<tokio::sync::Mutex<()>>, std::time::Instant)>>,
+}
+
+impl KeyedLocks {
+    fn new() -> Self {
+        KeyedLocks { map: tokio::sync::Mutex::new(std::collections::HashMap::new()) }
+    }
+
+    async fn get(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.map.lock().await;
+        let now = std::time::Instant::now();
+        let entry = map.entry(key.to_string()).or_insert_with(|| (Arc::new(tokio::sync::Mutex::new(())), now));
+        entry.1 = now;
+        entry.0.clone()
+    }
+
+    async fn sweep(&self, idle_after: Duration) {
+        let mut map = self.map.lock().await;
+        let now = std::time::Instant::now();
+        map.retain(|_, (lock, last_used)| Arc::strong_count(lock) > 1 || now.duration_since(*last_used) < idle_after);
+    }
+}
+
 pub(crate) struct AppState {
     pub(crate) agent_home: PathBuf,
     wasm_path: PathBuf,
@@ -44,13 +77,22 @@ pub(crate) struct AppState {
     /// touch `/workspace/`, curated `memory/notes/` is `daily_maintenance`-
     /// only, and only one `daily_maintenance` is ever in flight at a time
     /// (the scheduler's own 6h-cycle gating). The residual risk this
-    /// doesn't close — two *background* runs (e.g. two `scheduled_task`s)
-    /// racing on `memory/index.db` reindexing the same note, or both
-    /// hitting `.git/index.lock` on autocommit at once — is accepted rather
-    /// than solved with finer-grained locking; both fail soft (a duplicated
-    /// index row, a skipped commit that a later run's autocommit picks up)
-    /// rather than corrupting anything.
-    session_locks: tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// doesn't close — two *background* runs (e.g. two different
+    /// `scheduled_task`s, or a `scheduled_task` racing `daily_maintenance`)
+    /// hitting `.git/index.lock` on autocommit at once, or both touching
+    /// some workspace file the human configured them to share — is accepted
+    /// rather than solved with finer-grained locking; both fail soft (a
+    /// skipped commit that a later run's autocommit picks up, a last-write-
+    /// wins on the shared file) rather than corrupting anything.
+    session_locks: KeyedLocks,
+    /// Same shape as `session_locks`, but keyed by `scheduled_task` id — two
+    /// runs of *the same task* (a cron tick and a manual `/api/wake
+    /// type=scheduled_task task_id=X` landing at once, say) used to be able
+    /// to genuinely execute concurrently with zero coordination, each
+    /// reading/writing that task's `data_path` independently. `mark_run`
+    /// already had its own file lock, but that only protected the
+    /// checkpoint write, not the run itself.
+    task_run_locks: KeyedLocks,
     /// how many `run_trigger` calls are currently in flight, of any trigger
     /// type — `GET /api/status`'s `busy` field used to be "is the one
     /// global lock held", which stopped meaning anything once locking went
@@ -61,12 +103,25 @@ pub(crate) struct AppState {
 
 impl AppState {
     /// Returns (creating if needed) the dedicated lock for one session key.
-    /// Never removed once created — session keys are bounded (webui + one
-    /// per Discord DM/channel), not something that grows unbounded over the
-    /// life of a long-running gateway.
     async fn session_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut locks = self.session_locks.lock().await;
-        locks.entry(key.to_string()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+        self.session_locks.get(key).await
+    }
+
+    /// Returns (creating if needed) the dedicated lock for one scheduled
+    /// task id.
+    async fn task_run_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.task_run_locks.get(id).await
+    }
+
+    /// Drops idle entries from both keyed-lock tables — see `KeyedLocks`'s
+    /// doc comment. An hour of idleness is arbitrary but generous: even a
+    /// gateway with hundreds of Discord channels/scheduled tasks re-touches
+    /// each active one far more often than that, so this only ever prunes
+    /// keys that are genuinely gone (a deleted task, a channel nobody's
+    /// posted in for a while).
+    async fn sweep_idle_locks(&self) {
+        self.session_locks.sweep(Duration::from_secs(3600)).await;
+        self.task_run_locks.sweep(Duration::from_secs(3600)).await;
     }
 }
 
@@ -84,7 +139,8 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
         agent_home: cfg.agent_home,
         wasm_path: cfg.wasm_path,
         token: cfg.token,
-        session_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        session_locks: KeyedLocks::new(),
+        task_run_locks: KeyedLocks::new(),
         active_runs: std::sync::atomic::AtomicUsize::new(0),
     });
 
@@ -175,6 +231,7 @@ async fn scheduler_loop(state: Arc<AppState>) {
     loop {
         tokio::time::sleep(Duration::from_secs(30)).await;
         let now = crate::logs::now_unix_secs();
+        state.sweep_idle_locks().await;
 
         let last_maintenance = read_last_maintenance(&state.agent_home);
         if now - last_maintenance >= MAINTENANCE_INTERVAL_SECS && last_daily_maintenance_attempt.is_none_or(|last| now - last >= 900) {
@@ -619,13 +676,21 @@ async fn post_wake(State(state): State<Arc<AppState>>, Json(trigger): Json<Value
 /// session — `message` (a live turn) and `compact_session` (reads +
 /// rewrites the same `session.json`, see `compact_session_key`) — see
 /// `AppState::session_locks`'s doc comment for why everything else runs
-/// fully concurrently with no lock at all.
+/// fully concurrently with no lock at all. `scheduled_task` additionally
+/// locks per task id (`AppState::task_run_locks`), separately from the
+/// session lock above, since a `scheduled_task` run has no `session_key` of
+/// its own to begin with.
 async fn run_trigger(state: Arc<AppState>, trigger: Value) -> Value {
     let trigger_type = trigger.get("type").and_then(|t| t.as_str());
     let touches_session = matches!(trigger_type, Some("message") | Some("compact_session"));
     let session_key = trigger.get("session_key").and_then(|s| s.as_str()).unwrap_or(DEFAULT_SESSION_KEY).to_string();
+    let task_id = (trigger_type == Some("scheduled_task")).then(|| trigger.get("task_id").and_then(|t| t.as_str()).map(str::to_string)).flatten();
 
     let _session_guard = if touches_session { Some(state.session_lock(&session_key).await.lock_owned().await) } else { None };
+    let _task_guard = match &task_id {
+        Some(id) => Some(state.task_run_lock(id).await.lock_owned().await),
+        None => None,
+    };
     state.active_runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let outcome = run_trigger_inner(&state, trigger).await;
     state.active_runs.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
