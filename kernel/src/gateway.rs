@@ -1267,6 +1267,15 @@ struct SkillBody {
     body: String,
 }
 
+/// Locked (`<name>.md.lock`, same physical path `agent/src/skills.rs`'s
+/// `SkillLock` locks from the guest side) — this load-mutate-save used to
+/// have no coordination at all with the guest's own `record_use` (fires on
+/// every `use_skill`, now genuinely concurrent across sessions/background
+/// triggers), so a human editing a skill's description/body via webui at
+/// the same moment a run was using that skill could have either side's
+/// write silently discard the other's — worse when it's the human's
+/// content edit that gets reverted by a concurrent usage-stat bump than
+/// the reverse, but both are real data loss either way.
 async fn post_skill(State(state): State<Arc<AppState>>, Json(skill): Json<SkillBody>) -> impl IntoResponse {
     if skill.name.is_empty() || skill.name.contains(['/', '\\', '.']) {
         return (StatusCode::BAD_REQUEST, "skill name must be non-empty and contain no path separators".to_string());
@@ -1280,6 +1289,7 @@ async fn post_skill(State(state): State<Arc<AppState>>, Json(skill): Json<SkillB
     // shouldn't reset just because a human tweaked the content (mirrors
     // agent/src/skills.rs `save`'s same reasoning exactly)
     let path = dir.join(format!("{}.md", skill.name));
+    let _lock = FileLock::acquire(path.with_extension("md.lock"), Duration::from_secs(5));
     let existing = std::fs::read_to_string(&path).ok().and_then(|t| parse_skill(&t));
     let created_at = existing.as_ref().and_then(|s| s["created_at"].as_u64()).unwrap_or_else(|| crate::logs::now_unix_secs() as u64);
     let used_count = existing.as_ref().and_then(|s| s["used_count"].as_u64()).unwrap_or(0);

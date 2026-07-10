@@ -25,15 +25,18 @@ use std::time::{Duration, Instant};
 /// command itself can do once it's running on that target.
 ///
 /// The wall-clock deadline matters more here than anywhere else in this
-/// file: `run_trigger` (kernel/src/gateway.rs) holds `AppState.run_lock` —
-/// a single global mutex — for the *entire* run, and every other run
-/// (webui, Discord, cron, daily_maintenance) queues behind it. A command
-/// like `docker logs -f` never exits on its own; without a deadline that's
+/// file: locking is per-session/per-scheduled-task now, not one global
+/// mutex (`AppState::session_locks`/`task_run_locks`, kernel/src/gateway.rs)
+/// — but a stuck `ssh_exec` still freezes whatever *did* queue behind it
+/// (that session's next message, or the next tick of that same scheduled
+/// task), and `/api/abort`'s cooperative flag never reaches a run blocked
+/// here (only `llm_call`'s stream loop checks it). A command like
+/// `docker logs -f` never exits on its own; without a deadline that's
 /// independent of how much output is still trickling in, one `ssh_exec`
-/// call would freeze every surface this agent has, forever, not just
-/// itself. `session.set_timeout` alone doesn't cover this (it's an *idle*
-/// timeout — a command still actively producing output keeps resetting it)
-/// so there's a separate `Instant`-based deadline checked every read.
+/// call would hang its session/task forever. `session.set_timeout` alone
+/// doesn't cover this (it's an *idle* timeout — a command still actively
+/// producing output keeps resetting it) so there's a separate
+/// `Instant`-based deadline checked every read.
 pub fn call(state: &mut AgentState, req: Value) -> Value {
     let Some(command) = req.get("command").and_then(|c| c.as_str()) else {
         return error_json("bad_request", "ssh_exec requires a string `command` field");

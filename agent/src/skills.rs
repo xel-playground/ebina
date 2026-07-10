@@ -45,6 +45,45 @@ pub fn path_for(name: &str) -> String {
     format!("{SKILLS_DIR}/{name}.md")
 }
 
+/// Per-skill advisory lock — same `create_new`-busy-retry technique as
+/// `agent_loop.rs`'s `DiskQuotaLock`, keyed by skill name rather than one
+/// fixed path since unrelated skills shouldn't contend with each other.
+/// Needed because this file gets written from two independent, uncoordinated
+/// places: `record_use` below (guest-side, fires on every `use_skill`, and
+/// now genuinely concurrent across sessions/background triggers since
+/// per-session locking replaced the old single global run lock) and
+/// `kernel/src/gateway.rs`'s `post_skill` (host-side, a webui edit) — both
+/// load-mutate-save the same file with no shared state otherwise. A lock
+/// file created here with `create_new` is a real file under this skill's
+/// WASI-preopened directory, the same physical path the host's `FileLock`
+/// can also open — that's already proven interoperable by `DiskQuotaLock`
+/// coexisting with host-side quota accounting, just applied here to a
+/// guest/host pair racing the exact same file instead.
+struct SkillLock {
+    path: String,
+}
+
+impl SkillLock {
+    fn acquire(name: &str) -> Self {
+        let path = format!("{SKILLS_DIR}/{name}.md.lock");
+        for _ in 0..2000 {
+            if fs::OpenOptions::new().create_new(true).write(true).open(&path).is_ok() {
+                return SkillLock { path };
+            }
+        }
+        // stale lock from a run that crashed/got killed mid-write — force
+        // through rather than deadlocking every future save/use forever
+        let _ = fs::remove_file(&path);
+        SkillLock { path }
+    }
+}
+
+impl Drop for SkillLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 /// Writes `---\nname: ..\ndescription: ..\ncreated_at: ..\nused_count: ..\n
 /// [last_used: ..]\n---\n<body>` — a dedicated action instead of leaving
 /// frontmatter formatting to `write_file` freehand, so a self-authored skill
@@ -55,6 +94,7 @@ pub fn path_for(name: &str) -> String {
 /// `created_at` is only ever set once, the first time a given name is saved.
 pub fn save(name: &str, description: &str, body: &str) -> std::io::Result<()> {
     fs::create_dir_all(SKILLS_DIR)?;
+    let _lock = SkillLock::acquire(name);
     let existing = list().into_iter().find(|s| s.name == name);
     let created_at = existing.as_ref().map(|s| s.created_at).unwrap_or_else(now_unix);
     let used_count = existing.as_ref().map(|s| s.used_count).unwrap_or(0);
@@ -66,6 +106,7 @@ pub fn save(name: &str, description: &str, body: &str) -> std::io::Result<()> {
 /// `agent_loop.rs`'s `use_skill` action handler each time a skill's body is
 /// actually loaded into context, not just listed.
 pub fn record_use(name: &str) {
+    let _lock = SkillLock::acquire(name);
     let Some(skill) = list().into_iter().find(|s| s.name == name) else { return };
     let _ = fs::write(
         path_for(name),
