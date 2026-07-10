@@ -199,13 +199,15 @@ response_max_bytes = 100000       # http_get 回傳 body 上限(≈25-30k tokens
 http_cache_ttl_secs = 86400        # 完整頁面快取存活時間(workspace/.http_cache/),lazy sweep,每次 http_get 開頭順便清
 http_cache_max_bytes = 20971520    # 快取總量上限(20MB),超過依 mtime LRU 驅逐——TTL 只擋「隨時間增長」,擋不住同個 TTL 視窗內連抓很多不同頁面
 
-[ratelimit]               # token bucket,host 端
+[ratelimit]               # token bucket,host 端——**每個 run 自己一份,不是真的全域**(見下)
 llm_per_min = 10
 http_per_min = 30
 http_per_domain_per_min = 10   # 對外禮貌,防同站連打被 ban IP
 ```
 
 **撞限語義(簡單版)**:block 等待最多 **3s**,bucket 補上就過;仍無配額回 `rate_limited` + retry_after。3s 相對 5 min epoch 配額可忽略,**不需 epoch 補償**。速率持續打頂 → notify(失控迴圈的早期警報)。
+
+**現況更新(per-session 並行後)**:`[ratelimit]` 這幾個數字名字叫「全域」,實際上是**每個 run 各自一份**——`TokenBucket` 在 `AgentState::new` 現造,只活在記憶體,run 結束就消失,不落地、不跨 run 共享。以前只有一個 `run_lock` 全域排隊時這樣做沒差(同時只有一個 run,自然就是全域),現在 run 是 per-session 並行(見 §4.5),N 個 session 同時跑就等於 N 份各自滿額度的 bucket——這不是漏測到的 bug,是刻意接受的取捨:真正的硬上限是 `[budget]` 那組每日 token/request cap(檔案落地、有鎖,並行下正確累加,見 §5 budget race 那段),`[ratelimit]` 純粹是「別對單一 API 一次打太猛」的禮貌節流,鬆一點不影響安全,不值得為了這個把 session 之間也串起來。
 - `open`:GET 自由(預設,好用優先)
 - `tofu`:新 domain 首次使用需 gateway 核准,之後永久放行——想收資料必用新 domain,必撞審核
 - `allowlist`:僅名單內 domain(最嚴)

@@ -150,6 +150,16 @@ impl Default for BudgetConfig {
     }
 }
 
+/// Every field here is a **per-run** budget, not a true global one, despite
+/// the name — each `TokenBucket` (`state.rs`) is built fresh in
+/// `AgentState::new` and lives only in memory for that one run, with
+/// nothing persisted or shared across runs (unlike `BudgetConfig`'s daily
+/// caps, which are file-backed and correctly enforced across concurrent
+/// runs — see `budget.rs`). Runs are per-session now (`gateway.rs`'s
+/// `AppState::session_locks`), so N sessions/background triggers active at
+/// once effectively get N independent copies of this budget. Accepted as
+/// "politeness, not a hard limit" — the actual hard ceiling on cost/abuse is
+/// `BudgetConfig`'s daily token/request caps, which this doesn't replace.
 #[derive(Debug, Deserialize, Clone, Copy)]
 #[serde(default)]
 pub struct RateLimitConfig {
