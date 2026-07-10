@@ -1,5 +1,7 @@
+use crate::filelock::FileLock;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// PROJECT.md 4.6/4.7: a new domain under `tofu` mode hangs here until a
 /// human approves it via the gateway, instead of the guest ever getting to
@@ -50,7 +52,19 @@ fn save_grants(agent_home: &Path, grants: &[PendingGrant]) -> anyhow::Result<()>
 /// syscalls are synchronous; a human isn't going to click "approve" within
 /// an epoch-interruption window, so the guest just gets told to try again
 /// on a later wake).
+///
+/// Locked (`request_grant`/`approve`/`deny`, the three public entry
+/// points): each used to be a bare load-mutate-save against `grants.json`
+/// with no locking — runs are per-session now, not serialized by one
+/// global lock, so two different sessions' `http_get` calls hitting new
+/// unapproved domains at the same time could each load the same snapshot,
+/// each save their own version back, and the second save *replaces the
+/// whole file* — not just duplicating the first request, silently losing
+/// it outright. `add_approved_domain` stays unlocked since it's only ever
+/// called from inside `approve`, which already holds the lock — a second
+/// `acquire` here would deadlock against itself.
 pub fn request_grant(agent_home: &Path, kind: &str, method: &str, url: &str, domain: &str) -> anyhow::Result<String> {
+    let _lock = FileLock::acquire(grants_path(agent_home).with_extension("json.lock"), Duration::from_secs(5));
     let mut grants = load_grants(agent_home);
     let id = format!("{}-{}", crate::logs::now_unix_secs(), grants.len());
     grants.push(PendingGrant {
@@ -67,6 +81,7 @@ pub fn request_grant(agent_home: &Path, kind: &str, method: &str, url: &str, dom
 }
 
 pub fn approve(agent_home: &Path, id: &str) -> anyhow::Result<Option<PendingGrant>> {
+    let _lock = FileLock::acquire(grants_path(agent_home).with_extension("json.lock"), Duration::from_secs(5));
     let mut grants = load_grants(agent_home);
     let Some(grant) = grants.iter_mut().find(|g| g.id == id) else {
         return Ok(None);
@@ -81,6 +96,7 @@ pub fn approve(agent_home: &Path, id: &str) -> anyhow::Result<Option<PendingGran
 }
 
 pub fn deny(agent_home: &Path, id: &str) -> anyhow::Result<Option<PendingGrant>> {
+    let _lock = FileLock::acquire(grants_path(agent_home).with_extension("json.lock"), Duration::from_secs(5));
     let mut grants = load_grants(agent_home);
     let Some(grant) = grants.iter_mut().find(|g| g.id == id) else {
         return Ok(None);

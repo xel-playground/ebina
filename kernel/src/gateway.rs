@@ -237,7 +237,15 @@ async fn run_scheduled(state: Arc<AppState>, trigger: Value) -> Value {
     let dir = state.agent_home.join("logs/scheduled_runs");
     if std::fs::create_dir_all(&dir).is_ok() {
         let record = json!({"ts": ts, "trigger": trigger, "outcome": outcome});
-        let _ = std::fs::write(dir.join(format!("{ts}-{trigger_type}.json")), serde_json::to_vec_pretty(&record).unwrap_or_default());
+        // filename keyed by nanos, not `ts` (whole seconds) — background
+        // triggers aren't serialized by any lock (only message/
+        // compact_session are, see `AppState::session_locks`), so two of
+        // them starting in the same scheduler_loop tick can share the same
+        // *second*; `get_scheduled_runs` sorts by the `ts` field inside the
+        // file content, not the filename, so nanosecond precision here only
+        // has to be unique, not human-readable
+        let file_name = format!("{}-{trigger_type}.json", crate::logs::now_unix_nanos());
+        let _ = std::fs::write(dir.join(file_name), serde_json::to_vec_pretty(&record).unwrap_or_default());
     }
     outcome
 }
