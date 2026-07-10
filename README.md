@@ -61,7 +61,7 @@ physically cannot call anything except what's wired up as a syscall."
 │         ┌─────────────────────────────────────────────────┐          │
 │         │ wasmtime Store — fresh instantiate every single   │          │
 │         │ run, zero state carried over in-process            │          │
-│         │ fuel/epoch limit · memory cap · empty env ·         │          │
+│         │ fuel/epoch limit · memory cap · empty env ·         │        │
 │         │ stdio → log                                          │        │
 │         │  ┌──────────────────────────────────────────────┐   │        │
 │         │  │ agent.wasm — the *only* code that can ever      │   │        │
@@ -84,7 +84,7 @@ physically cannot call anything except what's wired up as a syscall."
                                                    pre-approval gate at all
 ```
 
-**Every run is stateless in-process, persistent on disk.** Each trigger
+**Every run is stateless, persistent on disk.** Each trigger
 (`message`/`cron`/`daily_maintenance`/`scheduled_task`/`manual`) gets a
 brand-new wasmtime instantiation — nothing survives in memory between runs.
 What *does* persist is entirely on the filesystem, under `agent-home/`:
@@ -95,6 +95,17 @@ webui and each Discord DM/channel get their own key), `scheduler/` (cron
 jobs the agent set up for itself), and `logs/*.jsonl` (egress, SSH,
 notifications, LLM transcripts — full audit trail, nothing silently
 dropped).
+
+**Each run is also a real child process, not just a fresh in-process
+`Store`.** The gateway spawns `kernel worker <wasm> run <trigger-json>` as
+its own OS process per trigger, tracks its PID, and `POST /api/abort`
+(the webui's Stop button) sends it `SIGKILL` directly. This is the only way
+to guarantee an *instant*, unconditional stop no matter what the run is
+blocked on — wasmtime's epoch-interruption timeout can't interrupt guest
+code that's blocked inside a host function (a slow `http_get`/`ssh_exec`/
+`llm_call` connect), and a purely cooperative abort flag only ever gets
+checked inside `llm_call`'s own streaming loop. A killed run's chat reply
+reads `"run aborted: ..."` rather than silently going empty.
 
 **Syscalls are the entire capability surface** — 12 of them
 (`llm_call`, `embed`, `db_exec`, `http_get`, `search_web`, `ssh_exec`,
@@ -220,9 +231,15 @@ It's fine for the file not to exist yet.
 Two layers, deliberately kept separate:
 
 - **Curated notes** — `memory/notes/*.md` (one topic per file, e.g.
-  `pet.md`), written by the agent via `write_file`/`append_file`. These are
-  the only thing embedded and searched (`hybrid_search` — BM25 + cosine
-  similarity, reciprocal rank fusion) every turn.
+  `pet.md`). These are the only thing embedded and searched (`hybrid_search`
+  — BM25 + cosine similarity, reciprocal rank fusion) every turn.
+  `write_file`/`append_file` can only touch these on a `daily_maintenance`
+  run — a live chat turn's `write_file`/`append_file` is scoped to
+  `/workspace/` only (see below), so an ad-hoc mid-conversation edit can't
+  silently re-clobber an already-corrected fact the way an unrestricted
+  write once did. Background-triggered runs (`cron`/`scheduled_task`/
+  `manual`) keep full access, since a scheduled task can legitimately
+  maintain its own state file under `memory/notes/`.
 - **The raw daily log** — `memory/notes/<date>/log.md`, one entry per
   *every* run (any trigger type, success or abort), written automatically —
   never embedded/searched. Embedding it once meant an old, since-corrected
@@ -238,6 +255,21 @@ advance this, so a transient failure can't silently skip a whole window)
 and distilling anything worth keeping into the curated notes above. One
 report per run lands in `memory/maintenance_reports/<date>_<HHMM>.md`.
 
+### Mid-run compaction (`runtime.in_run_compact_tokens`)
+
+Separate from `daily_maintenance` and from `[chat] auto_compact_tokens`
+(which only ever compacts a saved chat *session* between runs) — this one
+watches a single *run's own* `messages` array as it grows turn over turn
+(tool results piling up: a long `ssh_exec` exploration, several `http_get`s
+in one run). Once the last `llm_call`'s `input_tokens` crosses
+`runtime.in_run_compact_tokens` (default 150,000), everything except the
+system prompt, the very first task message (so the original ask survives —
+summarizing a summary of a summary drifts, but the root intent never
+should), and the 2 most recent messages gets summarized via one extra
+`llm_call` and spliced back in. Without this, a single long-running turn
+loop had no backstop of its own and could blow its own context before ever
+reaching `done`.
+
 ## LLM / embed providers
 
 `[llm]`/`[embed]` each have a `provider` field (`"anthropic"`, `"ollama"`, or
@@ -246,10 +278,17 @@ style, `messages` vs Anthropic's top-level `system`, token-usage field
 names, etc.) — the guest never needs to know which provider is behind
 `llm_call`/`embed`.
 
+`llm_call` always streams now, regardless of provider — each has its own
+SSE/NDJSON parser (`kernel/src/syscalls/llm_call.rs`) that appends live
+reasoning/thinking deltas to the session's `thinking-live.txt`
+(tailed by the webui's Live Log panel via `GET /api/thinking`) and checks
+the abort flag between chunks, so a Stop click can cut a response short
+mid-stream rather than only ever being able to kill the whole process.
+
 `provider = "openai"` is the generic OpenAI-compatible chat completions
 shape (Bearer auth, `choices[].message.content`,
-`usage.prompt_tokens`/`completion_tokens`, non-streaming) — covers any
-OpenAI-style API, e.g. [Kimi/Moonshot](https://platform.kimi.ai):
+`usage.prompt_tokens`/`completion_tokens`) — covers any OpenAI-style API,
+e.g. [Kimi/Moonshot](https://platform.kimi.ai):
 
 ```toml
 [llm]
@@ -321,7 +360,34 @@ untrusted code that needs isolating:
 - `{"action":"append_file","path":"...","content":"..."}` — appends instead
   of overwriting (creating the file if missing); for a growing log/report
   file so the agent isn't forced to `read_file` the whole thing back just to
-  add one entry
+  add one entry. On a live chat turn, `write_file`/`append_file` are scoped
+  to `/workspace/` only (see [Memory](#memory-memorynotes-rag--daily_maintenance)
+  above) — background-triggered runs keep full access
+
+### Reading large files (`read_file` paging, `grep_file`)
+
+`read_file` had no size limit at all until `logs/transcripts/*.json` (a full
+LLM request/response dump per call) was found to hit 900KB+ — reading one
+whole in a single tool result is 200k+ tokens, enough to blow a whole
+`llm_call` past its own context limit on its own. Every response now
+includes `total_bytes`/`total_lines` regardless of how much content
+actually came back, and a file over 100,000 bytes with none of the
+following auto-windows to its first 200 lines instead of refusing outright:
+
+- `{"action":"read_file","path":"...","start_line":N,"head_lines":N}` —
+  page through a file in windows rather than only ever seeing its start
+- `{"action":"read_file","path":"...","tail_lines":N}` — jump to the end;
+  almost always what you want for `logs/*.jsonl`-style append-only files,
+  where the newest entries are at the end, not the start
+- `{"action":"read_file","path":"...","byte_offset":N,"byte_count":N}` —
+  raw byte-position slicing, ignoring line breaks entirely. Line-based
+  paging can't help when a single line is itself huge (a pretty-printed
+  transcript keeps a whole escaped multi-KB string on one line) — this is
+  the only way to page through that
+- `{"action":"grep_file","path":"...","pattern":"...","max_matches":N}` —
+  plain substring search, returns `{"line":N,"text":"..."}` per match (each
+  capped at 2,000 bytes); find where something is before deciding how to
+  `read_file` it, rather than guessing a `start_line`
 
 ## SSH (`ssh_exec` syscall)
 
@@ -388,9 +454,23 @@ An HTML response (by `Content-Type`, or sniffed if that header's missing)
 comes back as **extracted text**, not raw markup — `<script>`/`<style>`
 blocks and all tags stripped, common entities decoded. Raw HTML is mostly
 markup/JS/CSS noise; a plain blog page came back at 400KB+ of it once and
-alone blew a single `llm_call` past its model's token limit. The body is
-also hard-capped at `[network] response_max_bytes` (default 3MB) regardless
-of content type — a marker at the end says so if it got cut.
+alone blew a single `llm_call` past its model's token limit. The `body`
+handed back directly is capped at `[network] response_max_bytes` (default
+100,000 bytes ≈ 25-30k tokens) regardless of content type — a marker at the
+end says so if it got cut.
+
+The *full* stripped page still gets cached under
+`workspace/.http_cache/<hash-of-url>.txt` either way — the response
+includes `total_bytes` (the real, untruncated size) and `cache_path`, so
+the model can `read_file` past the truncation point (via its own
+`start_line`/`byte_offset`/`tail_lines` paging, see
+[Reading large files](#reading-large-files-read_file-paging-grep_file)
+above) instead of losing the rest of a long page outright. Cache entries
+are bounded two ways: a lazy TTL sweep (`[network] http_cache_ttl_secs`,
+default 24h, run at the start of every `http_get` call) and an LRU eviction
+pass keyed on file mtime once the cache exceeds `[network]
+http_cache_max_bytes` (default 20MB) — a burst of many unique pages inside
+one TTL window doesn't grow the cache unbounded either.
 
 ## Web search (`search_web` syscall)
 
