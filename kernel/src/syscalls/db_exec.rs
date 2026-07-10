@@ -16,6 +16,16 @@ const PRAGMA_ALLOWLIST: &[&str] = &[
     "index_info",
     "foreign_key_list",
     "database_list",
+    // FTS5 issues this internally on every write to a virtual table (schema
+    // change detection for its own caching) — not something the guest ever
+    // calls directly. Missing from this list meant *every* INSERT into
+    // `chunks_fts` past the first row for a given source_path silently
+    // failed authorization: `agent/src/memory.rs`'s `reindex_file` inserts
+    // `chunks` then `chunks_fts` per chunk in a loop, `?`-propagates the
+    // first error straight out, so multi-chunk notes only ever kept their
+    // very first chunk indexed — a real incident, found via a note that
+    // hybrid_search could never surface past its own title.
+    "data_version",
 ];
 
 /// Applied once per connection at open time. ATTACH/DETACH always denied so
