@@ -1,7 +1,6 @@
 use crate::abi::{error_json, ok_json};
 use crate::grants;
 use crate::logs::{append_jsonl, now_unix_secs};
-use crate::ratelimit::TokenBucket;
 use crate::state::AgentState;
 use reqwest::Url;
 use serde_json::Value;
@@ -54,15 +53,14 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
         let _ = crate::logs::notify(&state.agent_home, "http_get rejected: daily request cap exhausted");
         return error_json("daily_cap_exceeded", "daily_request_cap exhausted");
     }
-    if let Err(limited) = state.http_bucket.acquire() {
+    let limiters = crate::ratelimit::global(&state.config.ratelimit);
+    if let Err(limited) = limiters.acquire_http() {
         if limited.sustained {
             let _ = crate::logs::notify(&state.agent_home, "http_get sustained rate-limit hits — possible runaway loop");
         }
         return rate_limited_json(&limited);
     }
-    let domain_cap = state.config.ratelimit.http_per_domain_per_min;
-    let bucket = state.http_domain_buckets.entry(host.clone()).or_insert_with(|| TokenBucket::new(domain_cap));
-    if let Err(limited) = bucket.acquire() {
+    if let Err(limited) = limiters.acquire_http_domain(&host) {
         return rate_limited_json(&limited);
     }
 
@@ -133,6 +131,15 @@ const HTTP_CACHE_DIR: &str = "workspace/.http_cache";
 /// Sweeps expired entries first (lazy — no separate scheduled job needed,
 /// a fetch is exactly when it's cheap to also do this) so a page nobody
 /// re-reads doesn't sit on disk forever.
+///
+/// Written via a per-call temp file + rename rather than a direct
+/// `std::fs::write` — runs are per-session now, not serialized by one
+/// global lock, so two different sessions fetching the *same* URL at once
+/// could both target this exact path; `std::fs::write` is open-truncate-
+/// write, not atomic, so a concurrent `read_file` on this cache path could
+/// briefly see a half-written file. `rename` within the same directory is
+/// atomic on POSIX, so any reader always sees either the old complete
+/// content or the new complete content, never a partial write.
 fn cache_full_response(state: &AgentState, url: &str, content: &str) -> Option<String> {
     let dir = state.agent_home.join(HTTP_CACHE_DIR);
     std::fs::create_dir_all(&dir).ok()?;
@@ -140,7 +147,10 @@ fn cache_full_response(state: &AgentState, url: &str, content: &str) -> Option<S
 
     let hash = fnv1a_hex(url);
     let file_name = format!("{hash}.txt");
-    std::fs::write(dir.join(&file_name), content).ok()?;
+    let final_path = dir.join(&file_name);
+    let tmp_path = dir.join(format!("{hash}.{}.tmp", crate::logs::now_unix_nanos()));
+    std::fs::write(&tmp_path, content).ok()?;
+    std::fs::rename(&tmp_path, &final_path).ok()?;
     evict_lru_over_budget(&dir, state.config.network.http_cache_max_bytes);
     Some(format!("/{HTTP_CACHE_DIR}/{file_name}"))
 }

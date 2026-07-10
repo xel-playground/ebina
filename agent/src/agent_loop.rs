@@ -317,23 +317,26 @@ pub fn run(trigger: &Value) {
             Some("write_file") => {
                 let path = absolute_path(action.get("path").and_then(|p| p.as_str()).unwrap_or(""));
                 let content = action.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                let quota = disk_quota_bytes();
-                let projected = agent_home_size() + content.len() as u64;
                 let result = if let Some(msg) = write_action_denial(&path, trigger) {
                     serde_json::json!({"ok": false, "error": msg})
-                } else if projected > quota {
-                    let msg = format!(
-                        "disk quota exceeded: writing {path} would bring agent-home to {projected} bytes, over the {quota}-byte cap — refused"
-                    );
-                    let _ = syscall::call("notify", &serde_json::json!({"message": msg}));
-                    serde_json::json!({"ok": false, "error": msg})
                 } else {
-                    if let Some(parent) = std::path::Path::new(&path).parent() {
-                        let _ = fs::create_dir_all(parent);
-                    }
-                    match fs::write(&path, content) {
-                        Ok(()) => serde_json::json!({"ok": true}),
-                        Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}),
+                    let _lock = DiskQuotaLock::acquire();
+                    let quota = disk_quota_bytes();
+                    let projected = agent_home_size() + content.len() as u64;
+                    if projected > quota {
+                        let msg = format!(
+                            "disk quota exceeded: writing {path} would bring agent-home to {projected} bytes, over the {quota}-byte cap — refused"
+                        );
+                        let _ = syscall::call("notify", &serde_json::json!({"message": msg}));
+                        serde_json::json!({"ok": false, "error": msg})
+                    } else {
+                        if let Some(parent) = std::path::Path::new(&path).parent() {
+                            let _ = fs::create_dir_all(parent);
+                        }
+                        match fs::write(&path, content) {
+                            Ok(()) => serde_json::json!({"ok": true}),
+                            Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}),
+                        }
                     }
                 };
                 push_tool_result(&mut messages, &result);
@@ -346,23 +349,26 @@ pub fn run(trigger: &Value) {
                 // to tack one more entry onto the end of it
                 let path = absolute_path(action.get("path").and_then(|p| p.as_str()).unwrap_or(""));
                 let content = action.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                let quota = disk_quota_bytes();
-                let projected = agent_home_size() + content.len() as u64;
                 let result = if let Some(msg) = write_action_denial(&path, trigger) {
                     serde_json::json!({"ok": false, "error": msg})
-                } else if projected > quota {
-                    let msg = format!(
-                        "disk quota exceeded: appending to {path} would bring agent-home to {projected} bytes, over the {quota}-byte cap — refused"
-                    );
-                    let _ = syscall::call("notify", &serde_json::json!({"message": msg}));
-                    serde_json::json!({"ok": false, "error": msg})
                 } else {
-                    if let Some(parent) = std::path::Path::new(&path).parent() {
-                        let _ = fs::create_dir_all(parent);
-                    }
-                    match fs::OpenOptions::new().create(true).append(true).open(&path).and_then(|mut f| f.write_all(content.as_bytes())) {
-                        Ok(()) => serde_json::json!({"ok": true}),
-                        Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}),
+                    let _lock = DiskQuotaLock::acquire();
+                    let quota = disk_quota_bytes();
+                    let projected = agent_home_size() + content.len() as u64;
+                    if projected > quota {
+                        let msg = format!(
+                            "disk quota exceeded: appending to {path} would bring agent-home to {projected} bytes, over the {quota}-byte cap — refused"
+                        );
+                        let _ = syscall::call("notify", &serde_json::json!({"message": msg}));
+                        serde_json::json!({"ok": false, "error": msg})
+                    } else {
+                        if let Some(parent) = std::path::Path::new(&path).parent() {
+                            let _ = fs::create_dir_all(parent);
+                        }
+                        match fs::OpenOptions::new().create(true).append(true).open(&path).and_then(|mut f| f.write_all(content.as_bytes())) {
+                            Ok(()) => serde_json::json!({"ok": true}),
+                            Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}),
+                        }
                     }
                 };
                 push_tool_result(&mut messages, &result);
@@ -1213,6 +1219,45 @@ fn write_action_denial(path: &str, trigger: &Value) -> Option<String> {
          {WORKSPACE_DIR}. This turn's activity is already captured in today's log.md automatically; \
          anything worth keeping long-term gets folded into memory/notes/ on the next maintenance cycle."
     ))
+}
+
+/// `write_file`/`append_file`'s quota check used to be check-then-act with
+/// no locking at all: compute `agent_home_size()`, compare to quota, then
+/// write — safe only when one global `run_lock` guaranteed a single run at
+/// a time. Runs are per-session now (`kernel/src/gateway.rs`'s
+/// `AppState::session_locks`), so two different sessions' writes can
+/// genuinely interleave: both read the same size, both pass the check,
+/// both write, and the combined total lands over quota. This wraps the
+/// whole check-then-write in an advisory lock — same `create_new`-based
+/// technique as the host's `kernel::filelock::FileLock`, just implemented
+/// guest-side since `write_file`/`append_file` are plain guest `std::fs`
+/// calls (never host syscalls) with no host state to synchronize through.
+/// No `std::thread::sleep` here (unverified how reliably that maps through
+/// WASI p1 in this setup) — the critical section is just a directory walk
+/// plus one write, no network call inside it, so a bounded busy-retry
+/// resolves contention almost immediately without needing a real sleep.
+struct DiskQuotaLock;
+
+impl DiskQuotaLock {
+    const LOCK_PATH: &'static str = "/logs/.disk_quota.lock";
+
+    fn acquire() -> Self {
+        for _ in 0..2000 {
+            if fs::OpenOptions::new().create_new(true).write(true).open(Self::LOCK_PATH).is_ok() {
+                return DiskQuotaLock;
+            }
+        }
+        // stale lock from a run that crashed/got killed mid-write — force
+        // through rather than deadlocking every future write forever
+        let _ = fs::remove_file(Self::LOCK_PATH);
+        DiskQuotaLock
+    }
+}
+
+impl Drop for DiskQuotaLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(Self::LOCK_PATH);
+    }
 }
 
 const DEFAULT_DISK_QUOTA_BYTES: u64 = 2 * 1024 * 1024 * 1024;
