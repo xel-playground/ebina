@@ -191,6 +191,15 @@ pub struct NetworkConfig {
     /// long page outright — this just bounds how long that costs disk space
     /// for a page nobody asked for a second look at.
     pub http_cache_ttl_secs: u64,
+    /// caps total bytes on disk under `workspace/.http_cache/` — TTL alone
+    /// only bounds growth *over time*, not a burst of many unique pages
+    /// fetched inside one TTL window. Checked after every write; oldest
+    /// entries by mtime (the closest thing to "least recently fetched" this
+    /// tracks — files here are write-once-per-URL, never touched again
+    /// except by a re-fetch, so mtime is as good a recency signal as an
+    /// explicit LRU list would be without the bookkeeping) get evicted
+    /// first until back under budget.
+    pub http_cache_max_bytes: u64,
 }
 
 impl Default for NetworkConfig {
@@ -202,6 +211,7 @@ impl Default for NetworkConfig {
             allowlist: Vec::new(),
             response_max_bytes: 100_000,
             http_cache_ttl_secs: 24 * 3600,
+            http_cache_max_bytes: 20 * 1024 * 1024,
         }
     }
 }

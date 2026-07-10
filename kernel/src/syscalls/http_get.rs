@@ -141,6 +141,7 @@ fn cache_full_response(state: &AgentState, url: &str, content: &str) -> Option<S
     let hash = fnv1a_hex(url);
     let file_name = format!("{hash}.txt");
     std::fs::write(dir.join(&file_name), content).ok()?;
+    evict_lru_over_budget(&dir, state.config.network.http_cache_max_bytes);
     Some(format!("/{HTTP_CACHE_DIR}/{file_name}"))
 }
 
@@ -152,6 +153,37 @@ fn sweep_expired_cache(dir: &std::path::Path, ttl_secs: u64) {
         let expired = std::time::SystemTime::now().duration_since(modified).map(|age| age.as_secs() > ttl_secs).unwrap_or(false);
         if expired {
             let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// TTL alone only bounds growth *over time* — a burst of many unique pages
+/// fetched inside one TTL window still grows unbounded. Called after every
+/// write; entries are write-once-per-URL (only a re-fetch ever touches one
+/// again), so mtime doubles as a recency signal without needing a separate
+/// access-time ledger — oldest mtime evicted first until back under budget.
+fn evict_lru_over_budget(dir: &std::path::Path, max_bytes: u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut files: Vec<(std::path::PathBuf, u64, std::time::SystemTime)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+            let modified = meta.modified().ok()?;
+            Some((e.path(), meta.len(), modified))
+        })
+        .collect();
+    let total: u64 = files.iter().map(|(_, size, _)| size).sum();
+    if total <= max_bytes {
+        return;
+    }
+    files.sort_by_key(|(_, _, modified)| *modified); // oldest first
+    let mut over = total - max_bytes;
+    for (path, size, _) in files {
+        if over == 0 {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            over = over.saturating_sub(size);
         }
     }
 }
