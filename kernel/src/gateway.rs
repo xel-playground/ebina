@@ -1301,8 +1301,20 @@ fn parse_skill(text: &str) -> Option<Value> {
 /// trade-off for staying in-process (see `AppState::session_locks`'s doc
 /// comment for the concurrency side of the same decision); those cases just
 /// run to completion instead of stopping instantly.
-async fn post_abort(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let path = state.agent_home.join("logs/abort_requested");
+///
+/// `?session=<key>` scopes which run gets stopped, same key
+/// `llm_call::abort_flag_path`/`thinking_path` use — used to be one
+/// process-global flag, which stopped being safe once runs went
+/// per-session: a global flag could abort an unrelated concurrent session's
+/// run instead of the intended one. Defaults to `"webui"` (what the Chat
+/// panel's abort button hits); background triggers (cron/daily_maintenance/
+/// scheduled_task) have no session of their own and all share `"_system"`.
+async fn post_abort(State(state): State<Arc<AppState>>, Query(q): Query<ThinkingQuery>) -> Json<Value> {
+    let key = q.session.unwrap_or_else(|| DEFAULT_SESSION_KEY.to_string());
+    let path = session_dir(&state.agent_home, &key).join("abort_requested");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     match std::fs::write(&path, "") {
         Ok(()) => Json(json!({"ok": true})),
         Err(e) => Json(json!({"ok": false, "error": e.to_string()})),

@@ -240,8 +240,19 @@ fn thinking_path(agent_home: &Path, source: &Value) -> PathBuf {
     agent_home.join("logs/chat_sessions").join(key).join("thinking-live.txt")
 }
 
-fn abort_flag_path(agent_home: &Path) -> PathBuf {
-    agent_home.join("logs/abort_requested")
+/// Keyed the same way as `thinking_path` — used to be one process-global
+/// `logs/abort_requested` file, which was correct back when only one run
+/// could ever be in flight at a time. Now that runs are only serialized
+/// per-session (`AppState::session_locks`), a global flag meant `/api/abort`
+/// could stop an unrelated concurrent run instead of the intended one, and
+/// worse: each call here clears the flag at the *start* of its own stream
+/// (to drop a stale flag from a previous, already-finished call on this
+/// same path), so a concurrent unrelated run starting its own `llm_call`
+/// could silently eat another session's still-pending abort request before
+/// that session's stream ever got to check it.
+fn abort_flag_path(agent_home: &Path, source: &Value) -> PathBuf {
+    let key = source.get("session_key").and_then(|s| s.as_str()).unwrap_or("_system");
+    agent_home.join("logs/chat_sessions").join(key).join("abort_requested")
 }
 
 /// Reads Ollama's NDJSON stream (one `{"message":{"content","thinking"},...}`
@@ -257,7 +268,7 @@ fn handle_ollama_stream(state: &mut AgentState, body: Value, response: reqwest::
     let think_path = thinking_path(&state.agent_home, source);
     let _ = std::fs::create_dir_all(think_path.parent().unwrap());
 
-    let abort_path = abort_flag_path(&state.agent_home);
+    let abort_path = abort_flag_path(&state.agent_home, source);
     // clear out anything left over from a previous, already-finished call
     // before it can be mistaken for a request to abort *this* one
     let _ = std::fs::remove_file(&abort_path);
@@ -350,7 +361,7 @@ fn handle_openai_stream(state: &mut AgentState, body: Value, response: reqwest::
     let think_path = thinking_path(&state.agent_home, source);
     let _ = std::fs::create_dir_all(think_path.parent().unwrap());
 
-    let abort_path = abort_flag_path(&state.agent_home);
+    let abort_path = abort_flag_path(&state.agent_home, source);
     let _ = std::fs::remove_file(&abort_path);
 
     let mut full_content = String::new();
@@ -425,7 +436,7 @@ fn handle_anthropic_stream(state: &mut AgentState, body: Value, response: reqwes
     let think_path = thinking_path(&state.agent_home, source);
     let _ = std::fs::create_dir_all(think_path.parent().unwrap());
 
-    let abort_path = abort_flag_path(&state.agent_home);
+    let abort_path = abort_flag_path(&state.agent_home, source);
     let _ = std::fs::remove_file(&abort_path);
 
     let mut full_content = String::new();
