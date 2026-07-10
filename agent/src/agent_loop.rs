@@ -12,6 +12,14 @@ const MAX_TURNS: u32 = 50;
 const NOTES_DIR: &str = "/memory/notes";
 const WORKSPACE_DIR: &str = "/workspace";
 const RETRIEVAL_TOP_K: usize = 5;
+/// `read_file` on a file over this size and no `head_lines`/`tail_lines`
+/// given is refused rather than dumped whole — the same class of incident
+/// `http_get`'s `response_max_bytes` cap exists for (a multi-hundred-KB
+/// `logs/transcripts/*.json` read in one shot is 25k+ tokens, easily enough
+/// to blow a single `llm_call` past its context limit on its own). Same
+/// 100,000-byte figure as `http_get`'s default, chosen there after measuring
+/// real token math (~25-30k tokens, ~10-12% of a 262144-token budget).
+const READ_FILE_MAX_BYTES: usize = 100_000;
 
 /// PROJECT.md 4.2: `run(trigger_json)` — RAG-retrieve, build a prompt, call
 /// the LLM, execute the action it asks for, loop until `done`, write memory,
@@ -201,8 +209,24 @@ pub fn run(trigger: &Value) {
         match action.get("action").and_then(|a| a.as_str()) {
             Some("read_file") => {
                 let path = absolute_path(action.get("path").and_then(|p| p.as_str()).unwrap_or(""));
+                let head_lines = action.get("head_lines").and_then(Value::as_u64).map(|n| n as usize);
+                let tail_lines = action.get("tail_lines").and_then(Value::as_u64).map(|n| n as usize);
                 let result = match fs::read_to_string(&path) {
-                    Ok(contents) => serde_json::json!({"ok": true, "contents": contents}),
+                    Ok(contents) => {
+                        if let Some(n) = head_lines {
+                            serde_json::json!({"ok": true, "contents": take_head_lines(&contents, n)})
+                        } else if let Some(n) = tail_lines {
+                            serde_json::json!({"ok": true, "contents": take_tail_lines(&contents, n)})
+                        } else if contents.len() > READ_FILE_MAX_BYTES {
+                            serde_json::json!({"ok": false, "error": format!(
+                                "{path} is {} bytes, over the {READ_FILE_MAX_BYTES}-byte read cap — retry with \
+                                 \"head_lines\" or \"tail_lines\" to read a portion instead of the whole file",
+                                contents.len()
+                            )})
+                        } else {
+                            serde_json::json!({"ok": true, "contents": contents})
+                        }
+                    }
                     Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}),
                 };
                 push_tool_result(&mut messages, &result);
@@ -722,7 +746,11 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String]) -> String {
          Do NOT use tool calls or function calls — you have none available. Put your single JSON action \
          directly as your plain message text, and nothing else. Respond with EXACTLY ONE JSON object per \
          turn — no other text before or after it. Valid actions:\n\n\
-         - `{{\"action\":\"read_file\",\"path\":\"...\"}}`\n\
+         - `{{\"action\":\"read_file\",\"path\":\"...\",\"head_lines\":N,\"tail_lines\":N}}` — `head_lines`/\
+         `tail_lines` are both optional and mutually exclusive; a file over 100,000 bytes is refused with \
+         an error unless one of them is given (e.g. `logs/transcripts/*.json` can be 900KB+ — reading one \
+         whole would blow your own context on the spot). `tail_lines` is almost always what you want for \
+         `logs/*.jsonl`-style append-only files — the newest entries are at the end, not the start\n\
          - `{{\"action\":\"write_file\",\"path\":\"...\",\"content\":\"...\"}}` — overwrites the whole \
          file; refused with a `disk quota exceeded` error (and a `notify`) if it would push agent-home \
          over its total size cap. Scoped to `/workspace/` — see \"## Paths and files\" below\n\
@@ -942,6 +970,38 @@ fn absolute_path(path: &str) -> String {
     } else {
         format!("/{path}")
     }
+}
+
+/// First `n` lines — for skimming a file from the start (a config, a
+/// scheduler task's instructions) without pulling in whatever huge tail a
+/// growing log/transcript file has accumulated.
+fn take_head_lines(text: &str, n: usize) -> String {
+    truncate_bytes_with_marker(&text.lines().take(n).collect::<Vec<_>>().join("\n"), READ_FILE_MAX_BYTES)
+}
+
+/// Last `n` lines — the actually-useful case for `logs/*.jsonl` and
+/// `logs/transcripts/*.json`-style append-only files, where the newest (most
+/// relevant) entries are always at the end, not the start.
+fn take_tail_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    truncate_bytes_with_marker(&lines[start..].join("\n"), READ_FILE_MAX_BYTES)
+}
+
+/// Defense in depth for `take_head_lines`/`take_tail_lines`: a requested
+/// line count is normally small, but nothing stops a single pathological
+/// line (e.g. a minified JSON blob) from being huge on its own — still cap
+/// the byte count of whatever comes out, same UTF-8-safe truncation +
+/// marker convention `http_get`'s own truncation uses.
+fn truncate_bytes_with_marker(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n...[truncated: kept first {end} of {} bytes]", &s[..end], s.len())
 }
 
 /// `write_file`/`append_file` used to reach anywhere in agent_home on every
