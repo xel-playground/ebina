@@ -53,9 +53,9 @@ physically cannot call anything except what's wired up as a syscall."
 │  │              │   │  scheduled_    │   │  no guest action        │   │
 │  │              │   │  task)         │   │  reaches it directly)   │   │
 │  └──────┬───────┘   └───────┬────────┘   │ http_get (GET-only) ·   │   │
-│         │ one trigger        │            │  search_web · ssh_exec  │   │
-│         │ at a time           │            │ notify · chat_send      │   │
-│         │ (run_lock)          │            │ sleep_until ·           │   │
+│         │ per-session         │            │  search_web · ssh_exec  │   │
+│         │ + per-task_id        │            │ notify · chat_send      │   │
+│         │ (else concurrent)    │            │ sleep_until ·           │   │
 │         └──────────┬──────────┘            │  schedule_task family   │   │
 │                     ▼                       └────────────┬─────────────┘
 │         ┌─────────────────────────────────────────────────┐          │
@@ -96,19 +96,25 @@ jobs the agent set up for itself), and `logs/*.jsonl` (egress, SSH,
 notifications, LLM transcripts — full audit trail, nothing silently
 dropped).
 
-**Locking is per-session, not global.** Only `message`-type runs (a real
-conversation) get serialized, and only against their own session — two
-turns on the *same* session queue behind each other (`session.json` is a
-read-modify-write per turn), but two different sessions, or a background
+**Locking is per-session (and per-scheduled-task), not global.** Only
+`message`/`compact_session` runs get serialized against their own session —
+two turns on the *same* session queue behind each other (`session.json` is
+a read-modify-write per turn), but two different sessions, or a background
 trigger (`cron`/`daily_maintenance`/`scheduled_task`/`manual`) running
-alongside a chat reply, run fully concurrently with no lock at all. Safe
-because `write_file`/`append_file`'s target directories no longer overlap
-between trigger types (a chat turn can only touch `/workspace/`; curated
-`memory/notes/` is `daily_maintenance`-only) — see
-[Memory](#memory-memorynotes-rag--daily_maintenance) below.
-`POST /api/abort` (the webui's Stop button) is cooperative: it sets a flag
-`llm_call` checks between streamed chunks, so it cuts a response short
-mid-stream — but a run blocked inside `http_get`/`ssh_exec`, or still
+alongside a chat reply, run fully concurrently with no lock at all. A
+`scheduled_task` additionally locks per task id, so the same task can't run
+twice at once if a cron tick and a manual `/api/wake` land together. Both
+lock tables prune idle entries automatically so a long-running gateway
+doesn't accumulate one forever per session/task it's ever seen. This model
+took a real audit to get right — a background trigger's `chat_send`
+(proactively messaging a session it doesn't own) used to be able to race a
+live conversation's own end-of-turn save and silently erase either side;
+fixed by having the conversation's own save always reload fresh immediately
+before writing rather than trust a snapshot taken before the run started.
+`POST /api/abort?session=<key>` (the webui's Stop button, defaulting to the
+webui session) is cooperative: it sets a flag `llm_call` checks between
+streamed chunks, scoped per session so aborting one doesn't touch another
+concurrent run — but a run blocked inside `http_get`/`ssh_exec`, or still
 waiting on `llm_call`'s first response byte, just runs to completion
 instead of stopping instantly. An earlier version of this ran every trigger
 as its own killable child process for a true instant stop; reverted — the
@@ -278,6 +284,20 @@ should), and the 2 most recent messages gets summarized via one extra
 loop had no backstop of its own and could blow its own context before ever
 reaching `done`.
 
+### Wasm runtime reuse (`runtime.cache_wasm_module`)
+
+`false` by default: every run compiles `agent.wasm` fresh
+(`Module::from_file`), which costs a recompile per trigger but means a
+hot-swapped wasm binary on disk takes effect on the very next run with no
+gateway restart — handy while iterating on `agent/`. Set `true` and the
+gateway builds the wasmtime `Engine`/`Linker`/`Module` once at startup and
+every run reuses them, skipping the recompile; a hot-swapped `agent.wasm`
+then needs a restart to be picked up. Either way the `Store` — the part
+that actually holds a run's state — is always fresh per run; sharing the
+other three is safe under real concurrency (they're immutable and
+Send+Sync once built, wasmtime's own pattern for many concurrent `Store`s
+off one `Engine`), not a correctness switch.
+
 ## LLM / embed providers
 
 `[llm]`/`[embed]` each have a `provider` field (`"anthropic"`, `"ollama"`, or
@@ -439,13 +459,14 @@ counts, timed-out flag).
 
 **The timeout is not optional**: a command that never exits on its own
 (`docker logs -f`, `tail -f`, an interactive prompt waiting on input) would
-otherwise hang forever — and since `run_lock` (kernel/src/gateway.rs) holds
-one global mutex for the agent's entire run, one hung `ssh_exec` call
-freezes *every* surface (webui, Discord, cron, everything), not just
-itself. `timeout_secs` is a hard wall-clock deadline checked on every read,
-independent of whether the command is still actively producing output — it
-returns `{"timed_out": true}` with whatever partial output was captured
-rather than hanging.
+otherwise hang forever. Locking is per-session/per-scheduled-task now, not
+one global mutex, so a hung `ssh_exec` no longer freezes *every* surface —
+but it still hangs whatever *did* queue behind it (that session's next
+message, or that task's next tick), and `POST /api/abort`'s cooperative
+flag never reaches a run blocked here. `timeout_secs` is a hard wall-clock
+deadline checked on every read, independent of whether the command is
+still actively producing output — it returns `{"timed_out": true}` with
+whatever partial output was captured rather than hanging.
 
 ## Web fetch (`http_get` syscall)
 

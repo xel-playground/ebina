@@ -359,6 +359,41 @@ http_per_domain_per_min = 10   # 對外禮貌,防同站連打被 ban IP
       ——每輪 llm_call 回來的 `input_tokens` 超過門檻(預設 150,000)就在 run 內自己觸發一次 compact,
       system prompt + 最初任務訊息保留,中間摘要掉,跟 `daily_maintenance`/`auto_compact_tokens`
       是三件不同的事,見 §4.2。真跑驗證過:藏一句密語在最初訊息,兩次 compact 後依然完整複誦
+- [x] session lock race 全面稽核(2026-07-11,`run_lock` 全域鎖改 per-session/per-task_id 後連續
+      多輪稽核揪出來的)——每項都真跑併發實測過(見各 commit message 的數字),不是純 code review:
+  - [x] `budget.rs` token 計數 lost update(FileLock)
+  - [x] `memory.rs reindex_file` 重複 chunk row(embed 留在 transaction 外,`BEGIN IMMEDIATE` 前
+        重查 hash,optimistic concurrency)
+  - [x] `autocommit.rs` commit 衝突(FileLock 鎖整個函式)
+  - [x] `http_get` cache 寫入半毀檔(temp file + rename)
+  - [x] guest 端 disk quota TOCTOU(`DiskQuotaLock`,guest-side `create_new` busy-retry)
+  - [x] `logs.rs append_jsonl` 交錯寫入(`writeln!` 改成組 String 後一次 `write_all`)
+  - [x] `ratelimit.rs` 改真正全域共用(每個 run 各自一份 bucket → `OnceLock<GlobalRateLimiters>`)
+  - [x] `grants.rs` request/approve/deny lost update(FileLock)
+  - [x] `scheduler_tasks.rs` add/update/mark_run id 衝突與互蓋(整目錄鎖 + per-task 鎖)
+  - [x] 同一 `scheduled_task` 被 cron tick + 手動 `/api/wake` 同時觸發(`task_run_locks`,
+        per-task_id lock,仿 `session_locks` 同款設計)
+  - [x] `session_locks`/`task_run_locks` 加 idle sweep(防長跑 process 記憶體慢慢漲)
+  - [x] `/api/abort` 從全域 flag 改 per-session(`?session=`,跟 `thinking_path` 同一套 key 慣例,
+        webui `ChatPanel.vue` 不用改)
+  - [x] **最嚴重那個**:`chat_send`(背景 trigger 主動推訊息)vs `handle_chat_message` 蓋寫
+        `session.json`——`session_locks` 只鎖 trigger 自己的 session,鎖不到 `chat_send` 打的目標
+        session,原本會整包蓋掉對方剛寫的一輪對話。修法:`handle_chat_message` 結尾改成重讀最新
+        狀態再 append 這輪的 delta,兩邊都上同一把 `session.json.lock`
+  - [x] `llm_call.rs` circuit breaker(全域檔案,無 session key)lost update(FileLock)
+  - [x] `secrets.rs` `post_secret` lost update(FileLock,跟 grants.rs 同款病)
+  - [x] `persist_last_run` 破損 JSON(temp file + rename)
+  - [x] `skills.rs` `record_use`(guest)vs `post_skill`(host)雙邊 lost update——唯一一個橫跨
+        guest/host 邊界的修法:guest 端 `SkillLock`(`create_new` busy-retry)+ host 端 `FileLock`,
+        鎖同一個實體路徑(`<name>.md.lock`),兩邊互通
+  - [x] `index.db` 補 `busy_timeout`(原本 0)——不是資料損毀問題,WAL 模式本身已保證正確,但併發
+        寫入者現在會立刻 `SQLITE_BUSY` 失敗,是 pivot 後才會出現的新失敗模式,設 5s
+  - [ ] backlog(低風險,記錄但沒修):`save_attachment`/`put_task_file` 檔名或 quota 的 TOCTOU
+        (last-write-wins,非損毀,人為操作機率低);`compact_session_key`/`reset_session_key` vs
+        `chat_send` 的模糊地帶(語意上本來就是清掉舊歷史,重疊到算可接受);`discord.rs`
+        `pairing_seed()` 全新 agent-home 第一次呼叫的 TOCTOU(配對碼本來就不是安全邊界)
+  - [x] 順便:`WasmRuntime`(Engine/Linker/Module 只建一次,只有 Store 需要每次 fresh)——跟這輪
+        稽核同期但不是 race fix,是效能選項,`[runtime] cache_wasm_module`(預設 `false`),見 §4.2
 
 ### 未來糖果罐(延後)
 - [ ] **Agent 互通(A2A,actor model)**:設計已定——新 syscall `send_agent(target, msg)`,kernel **複製**訊息至對方 `inbox/from-<sender>/` 並喚醒;不共享任何目錄,Store 間零接觸;通訊拓撲在 kernel config 逐條宣告(capability),未宣告組合拒絕;訊息全經 kernel = 全量 A2A log,gateway 可視化對話圖。支援監督者模式、互相 review 等玩法;新 agent = 新資料夾 + 一行拓撲
