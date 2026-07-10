@@ -4,6 +4,7 @@ pub mod budget;
 pub mod config;
 pub mod cron;
 pub mod discord;
+pub mod filelock;
 pub mod gateway;
 pub mod grants;
 pub mod logs;

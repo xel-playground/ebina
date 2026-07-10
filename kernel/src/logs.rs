@@ -39,12 +39,24 @@ fn civil_from_days(z: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// Formats the whole line to a `String` *first*, then a single `write_all`
+/// call — not `writeln!(f, "{line}")` directly, which can turn into several
+/// separate `write()` syscalls as `Value`'s `Display` impl emits the object
+/// piece by piece (braces, each field). `O_APPEND` only guarantees one
+/// `write()` call is atomic against other appenders; multiple calls for one
+/// logical line can interleave with a concurrent writer's own calls,
+/// corrupting the file with a malformed merged line. Runs are per-session
+/// now (not serialized by one global lock — see `gateway.rs`'s
+/// `AppState::session_locks`), so two different sessions genuinely can
+/// append to the same `.jsonl` (`usage.jsonl`, `egress.jsonl`, ...) at once.
 pub fn append_jsonl(path: &Path, line: &serde_json::Value) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         create_dir_all(parent)?;
     }
+    let mut s = serde_json::to_string(line)?;
+    s.push('\n');
     let mut f = OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(f, "{line}")?;
+    f.write_all(s.as_bytes())?;
     Ok(())
 }
 

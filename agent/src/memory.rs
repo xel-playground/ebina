@@ -130,30 +130,26 @@ pub fn content_hash(text: &str) -> String {
 /// skipped — `agent_loop.rs::reindex_all_notes` sums this to report a
 /// meaningful "reindexed N notes" trace line instead of silently doing
 /// (or not doing) work every single run with nothing visible to show it.
+/// Runs are per-session now, not serialized by one global lock (see
+/// `kernel/src/gateway.rs`'s `AppState::session_locks`), so two concurrent
+/// runs can genuinely both decide to reindex the *same* note at once. The
+/// hash check + delete + insert used to be several independent `db_exec`
+/// round-trips with no transaction around them — both runs could each
+/// delete-then-insert their own copy, leaving duplicate rows for one
+/// `source_path`. Fixed with optimistic concurrency: the (slow, network)
+/// `embed` call happens *outside* any transaction so a concurrent run's own
+/// reindex is never blocked waiting on it, then a `BEGIN IMMEDIATE`
+/// transaction re-checks the hash right before writing — if another run
+/// already reindexed this exact file to the same content while this one was
+/// embedding, this one's now-redundant result is discarded instead of
+/// inserted as a duplicate.
 pub fn reindex_file(source_path: &str, embed_model: &str) -> Result<bool, String> {
     let text = std::fs::read_to_string(source_path).map_err(|e| format!("read {source_path}: {e}"))?;
     let hash = content_hash(&text);
 
-    let existing = db_exec(
-        "SELECT content_hash, embed_model FROM chunks WHERE source_path = ?1 LIMIT 1",
-        &serde_json::json!([source_path]),
-    )?;
-    if let Some(row) = existing.first() {
-        let same_hash = row.get("content_hash").and_then(|v| v.as_str()) == Some(hash.as_str());
-        let same_model = row.get("embed_model").and_then(|v| v.as_str()) == Some(embed_model);
-        if same_hash && same_model {
-            return Ok(false);
-        }
+    if same_as_indexed(source_path, &hash, embed_model)? {
+        return Ok(false);
     }
-
-    let old_ids: Vec<i64> = db_exec("SELECT id FROM chunks WHERE source_path = ?1", &serde_json::json!([source_path]))?
-        .iter()
-        .filter_map(|r| r.get("id").and_then(|v| v.as_i64()))
-        .collect();
-    for id in &old_ids {
-        let _ = db_exec("DELETE FROM chunks_fts WHERE rowid = ?1", &serde_json::json!([id]));
-    }
-    db_exec("DELETE FROM chunks WHERE source_path = ?1", &serde_json::json!([source_path]))?;
 
     let pieces = chunk_markdown(&text);
     if pieces.is_empty() {
@@ -165,6 +161,43 @@ pub fn reindex_file(source_path: &str, embed_model: &str) -> Result<bool, String
         return Err(format!("embed failed while reindexing {source_path}: {embed_resp}"));
     }
     let vectors = embed_resp["result"]["vectors"].as_array().cloned().unwrap_or_default();
+
+    db_exec("BEGIN IMMEDIATE", &Value::Array(vec![]))?;
+    if same_as_indexed(source_path, &hash, embed_model)? {
+        let _ = db_exec("ROLLBACK", &Value::Array(vec![]));
+        return Ok(false);
+    }
+    match write_reindexed_rows(source_path, &hash, embed_model, &pieces, &vectors) {
+        Ok(()) => {
+            db_exec("COMMIT", &Value::Array(vec![]))?;
+            Ok(true)
+        }
+        Err(e) => {
+            let _ = db_exec("ROLLBACK", &Value::Array(vec![]));
+            Err(e)
+        }
+    }
+}
+
+fn same_as_indexed(source_path: &str, hash: &str, embed_model: &str) -> Result<bool, String> {
+    let existing = db_exec(
+        "SELECT content_hash, embed_model FROM chunks WHERE source_path = ?1 LIMIT 1",
+        &serde_json::json!([source_path]),
+    )?;
+    Ok(existing.first().is_some_and(|row| {
+        row.get("content_hash").and_then(|v| v.as_str()) == Some(hash) && row.get("embed_model").and_then(|v| v.as_str()) == Some(embed_model)
+    }))
+}
+
+fn write_reindexed_rows(source_path: &str, hash: &str, embed_model: &str, pieces: &[String], vectors: &[Value]) -> Result<(), String> {
+    let old_ids: Vec<i64> = db_exec("SELECT id FROM chunks WHERE source_path = ?1", &serde_json::json!([source_path]))?
+        .iter()
+        .filter_map(|r| r.get("id").and_then(|v| v.as_i64()))
+        .collect();
+    for id in &old_ids {
+        let _ = db_exec("DELETE FROM chunks_fts WHERE rowid = ?1", &serde_json::json!([id]));
+    }
+    db_exec("DELETE FROM chunks WHERE source_path = ?1", &serde_json::json!([source_path]))?;
 
     for (piece, vector) in pieces.iter().zip(vectors.iter()) {
         let embedding_json = vector.to_string();
@@ -179,7 +212,7 @@ pub fn reindex_file(source_path: &str, embed_model: &str) -> Result<bool, String
             &serde_json::json!([new_id, piece]),
         )?;
     }
-    Ok(true)
+    Ok(())
 }
 
 /// FTS5 MATCH syntax breaks on punctuation/quotes in free-form user text —

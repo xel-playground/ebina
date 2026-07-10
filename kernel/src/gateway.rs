@@ -607,14 +607,17 @@ async fn post_wake(State(state): State<Arc<AppState>>, Json(trigger): Json<Value
 
 /// Runs one trigger in-process (`spawn_blocking`, since wasmtime + reqwest's
 /// blocking client both panic if driven directly on a tokio runtime
-/// thread). Locking is per-session and only for `message`-type triggers —
-/// see `AppState::session_locks`'s doc comment for why everything else runs
+/// thread). Locking is per-session, for any trigger that actually touches a
+/// session — `message` (a live turn) and `compact_session` (reads +
+/// rewrites the same `session.json`, see `compact_session_key`) — see
+/// `AppState::session_locks`'s doc comment for why everything else runs
 /// fully concurrently with no lock at all.
 async fn run_trigger(state: Arc<AppState>, trigger: Value) -> Value {
-    let is_message = trigger.get("type").and_then(|t| t.as_str()) == Some("message");
+    let trigger_type = trigger.get("type").and_then(|t| t.as_str());
+    let touches_session = matches!(trigger_type, Some("message") | Some("compact_session"));
     let session_key = trigger.get("session_key").and_then(|s| s.as_str()).unwrap_or(DEFAULT_SESSION_KEY).to_string();
 
-    let _session_guard = if is_message { Some(state.session_lock(&session_key).await.lock_owned().await) } else { None };
+    let _session_guard = if touches_session { Some(state.session_lock(&session_key).await.lock_owned().await) } else { None };
     state.active_runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let outcome = run_trigger_inner(&state, trigger).await;
     state.active_runs.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -972,14 +975,22 @@ fn clear_chat_context_tokens(agent_home: &Path, key: &str) {
 }
 
 async fn post_session_reset(State(state): State<Arc<AppState>>) -> Json<Value> {
-    Json(reset_session_key(&state.agent_home, DEFAULT_SESSION_KEY))
+    Json(reset_session_key(&state, DEFAULT_SESSION_KEY).await)
 }
 
 /// Archives, then clears, the given session — a fresh conversation. Shared
 /// by the webui `/api/session/reset` endpoint and Discord's `!reset` DM/
 /// mention command (discord.rs) — same mechanism, keyed by whichever
-/// session it's asked for.
-pub(crate) fn reset_session_key(agent_home: &Path, key: &str) -> Value {
+/// session it's asked for. Takes the same per-session lock `run_trigger`
+/// does for `message`/`compact_session` — this doesn't go through
+/// `run_trigger` at all (pure filesystem, no wasmtime run needed), but
+/// without the lock a Reset click landing while that session's own
+/// in-flight `message` run is mid-turn could race: the run's own
+/// end-of-turn `session.json` write could land *after* this clears it,
+/// resurrecting the conversation the human just explicitly reset.
+pub(crate) async fn reset_session_key(state: &Arc<AppState>, key: &str) -> Value {
+    let _guard = state.session_lock(key).await.lock_owned().await;
+    let agent_home = &state.agent_home;
     match archive_session(agent_home, key) {
         Ok(archived) => {
             let _ = save_session(agent_home, key, &[]);
@@ -1010,7 +1021,13 @@ pub(crate) async fn compact_session_key(state: Arc<AppState>, key: &str) -> Valu
     // compaction only needs the text to summarize, not attachment images —
     // no `turn_to_message`/vision-embedding here, plain content is enough
     let history: Vec<Value> = session.iter().map(|t| json!({"role": t.role, "content": t.content})).collect();
-    let outcome = run_trigger(state.clone(), json!({"type": "compact_session", "history": history})).await;
+    // `session_key` here isn't for the guest (compact_session's own prompt
+    // doesn't use it) — it's so `run_trigger`'s locking treats this the same
+    // as a `message` run on the same session: without it, a `message` turn
+    // and this session's own auto-compact could race on the *same*
+    // session.json concurrently, exactly what per-session locking exists to
+    // prevent (see `AppState::session_locks`).
+    let outcome = run_trigger(state.clone(), json!({"type": "compact_session", "history": history, "session_key": key})).await;
     let summary = outcome.get("result").and_then(|r| r.get("summary")).and_then(|s| s.as_str()).unwrap_or("").to_string();
 
     let compacted = vec![SessionTurn {

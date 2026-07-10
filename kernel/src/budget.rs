@@ -1,53 +1,13 @@
+use crate::filelock::FileLock;
 use crate::logs::today_utc;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct BudgetState {
     date: String,
     tokens_used: u64,
-}
-
-/// Plain `create_new`-based advisory lock (atomic file creation, no `libc`/
-/// `flock` dependency needed) — `record()` used to be a bare read-modify-
-/// write with no locking at all, safe only because a single global
-/// `run_lock` guaranteed just one run ever touched a given budget file at
-/// once. Runs are per-session now (see `gateway.rs`'s `AppState::
-/// session_locks`), so two concurrent runs (different sessions, or a
-/// background trigger alongside a chat reply) can genuinely call `record`
-/// on the *same* budget file at the same time — without this, the second
-/// writer's `std::fs::write` clobbers the first's increment outright
-/// (a lost update, not just a stale read), silently undercounting real
-/// usage and letting the daily cap be bypassed under concurrent load.
-struct FileLock {
-    path: PathBuf,
-}
-
-impl FileLock {
-    /// Spin-waits for the lock file to not exist, then atomically creates
-    /// it. A lock file older than 5s is treated as abandoned (a crashed
-    /// holder) and force-removed rather than deadlocking every future
-    /// budget check forever — the critical section here is always just one
-    /// file read + write, never a network call, so 5s is generous, not tight.
-    fn acquire(path: PathBuf) -> Self {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            match std::fs::OpenOptions::new().create_new(true).write(true).open(&path) {
-                Ok(_) => return FileLock { path },
-                Err(_) if Instant::now() >= deadline => {
-                    let _ = std::fs::remove_file(&path); // stale lock from a crashed holder
-                }
-                Err(_) => std::thread::sleep(Duration::from_millis(5)),
-            }
-        }
-    }
-}
-
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
 }
 
 pub struct BudgetTracker {
@@ -103,7 +63,7 @@ impl BudgetTracker {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let _lock = FileLock::acquire(self.path.with_extension("lock"));
+        let _lock = FileLock::acquire(self.path.with_extension("lock"), Duration::from_secs(5));
         let mut state = read_state(&self.path);
         state.tokens_used += tokens;
         std::fs::write(&self.path, serde_json::to_string(&state)?)?;

@@ -130,10 +130,7 @@ impl EventHandler for Handler {
         // there's no reason to burn an `llm_call` deciding whether "!reset"
         // means what it obviously means.
         if text.eq_ignore_ascii_case("!reset") {
-            let ok = crate::gateway::reset_session_key(&self.state.agent_home, &session_key)
-                .get("ok")
-                .and_then(|v| v.as_bool())
-                == Some(true);
+            let ok = crate::gateway::reset_session_key(&self.state, &session_key).await.get("ok").and_then(|v| v.as_bool()) == Some(true);
             let reply = if ok { "已重設對話,重新開始。" } else { "重設失敗。" };
             let _ = msg.channel_id.say(&ctx.http, reply).await;
             return;

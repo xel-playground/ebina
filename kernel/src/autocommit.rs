@@ -1,5 +1,7 @@
+use crate::filelock::FileLock;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 /// PROJECT.md Phase 2: every run ends with a commit of the whole agent-home
 /// tree — the "brain time machine". A fresh instantiate each wake plus this
@@ -14,8 +16,17 @@ use std::process::Command;
 /// destroying the very tamper-evidence trail this function exists to
 /// provide. Keeping the git-dir external makes it structurally unreachable
 /// from the sandbox, same guarantee secrets.toml already has.
+///
+/// Locked for its whole duration: runs are per-session now, not serialized
+/// by one global lock, so two concurrent runs finishing around the same
+/// time both call this against the *same* git-dir — `git add`/`commit`
+/// takes its own `.git/index.lock`, and the second process to touch it
+/// fails outright rather than waiting (git's CLI has no built-in retry).
+/// The lock here is cheap to hold for the whole function: no network calls,
+/// just local git subprocess invocations.
 pub fn commit_run(agent_home: &Path, message: &str) -> anyhow::Result<()> {
     let git_dir = git_dir_path(agent_home);
+    let _lock = FileLock::acquire(git_dir.with_extension("commit-lock"), Duration::from_secs(30));
     migrate_legacy_git_dir(agent_home, &git_dir)?;
 
     if !git_dir.exists() {
