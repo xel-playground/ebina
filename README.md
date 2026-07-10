@@ -96,16 +96,24 @@ jobs the agent set up for itself), and `logs/*.jsonl` (egress, SSH,
 notifications, LLM transcripts — full audit trail, nothing silently
 dropped).
 
-**Each run is also a real child process, not just a fresh in-process
-`Store`.** The gateway spawns `kernel worker <wasm> run <trigger-json>` as
-its own OS process per trigger, tracks its PID, and `POST /api/abort`
-(the webui's Stop button) sends it `SIGKILL` directly. This is the only way
-to guarantee an *instant*, unconditional stop no matter what the run is
-blocked on — wasmtime's epoch-interruption timeout can't interrupt guest
-code that's blocked inside a host function (a slow `http_get`/`ssh_exec`/
-`llm_call` connect), and a purely cooperative abort flag only ever gets
-checked inside `llm_call`'s own streaming loop. A killed run's chat reply
-reads `"run aborted: ..."` rather than silently going empty.
+**Locking is per-session, not global.** Only `message`-type runs (a real
+conversation) get serialized, and only against their own session — two
+turns on the *same* session queue behind each other (`session.json` is a
+read-modify-write per turn), but two different sessions, or a background
+trigger (`cron`/`daily_maintenance`/`scheduled_task`/`manual`) running
+alongside a chat reply, run fully concurrently with no lock at all. Safe
+because `write_file`/`append_file`'s target directories no longer overlap
+between trigger types (a chat turn can only touch `/workspace/`; curated
+`memory/notes/` is `daily_maintenance`-only) — see
+[Memory](#memory-memorynotes-rag--daily_maintenance) below.
+`POST /api/abort` (the webui's Stop button) is cooperative: it sets a flag
+`llm_call` checks between streamed chunks, so it cuts a response short
+mid-stream — but a run blocked inside `http_get`/`ssh_exec`, or still
+waiting on `llm_call`'s first response byte, just runs to completion
+instead of stopping instantly. An earlier version of this ran every trigger
+as its own killable child process for a true instant stop; reverted — the
+guaranteed-stop property wasn't worth carrying a second binary that had to
+ship alongside the first and could drift out of version sync with it.
 
 **Syscalls are the entire capability surface** — 12 of them
 (`llm_call`, `embed`, `db_exec`, `http_get`, `search_web`, `ssh_exec`,
