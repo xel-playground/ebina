@@ -207,7 +207,7 @@ http_per_domain_per_min = 10   # 對外禮貌,防同站連打被 ban IP
 
 **撞限語義(簡單版)**:block 等待最多 **3s**,bucket 補上就過;仍無配額回 `rate_limited` + retry_after。3s 相對 5 min epoch 配額可忽略,**不需 epoch 補償**。速率持續打頂 → notify(失控迴圈的早期警報)。
 
-**現況更新(per-session 並行後)**:`[ratelimit]` 這幾個數字名字叫「全域」,實際上是**每個 run 各自一份**——`TokenBucket` 在 `AgentState::new` 現造,只活在記憶體,run 結束就消失,不落地、不跨 run 共享。以前只有一個 `run_lock` 全域排隊時這樣做沒差(同時只有一個 run,自然就是全域),現在 run 是 per-session 並行(見 §4.5),N 個 session 同時跑就等於 N 份各自滿額度的 bucket——這不是漏測到的 bug,是刻意接受的取捨:真正的硬上限是 `[budget]` 那組每日 token/request cap(檔案落地、有鎖,並行下正確累加,見 §5 budget race 那段),`[ratelimit]` 純粹是「別對單一 API 一次打太猛」的禮貌節流,鬆一點不影響安全,不值得為了這個把 session 之間也串起來。
+**現況更新(per-session 並行後)**:`[ratelimit]` 這幾個數字曾經一度變成「名字叫全域,實際每個 run 各自一份」——`TokenBucket` 在 `AgentState::new` 現造,只活在記憶體,不落地、不跨 run 共享,以前靠唯一的全域 `run_lock` 意外撐住「全域」這個語意,run 改成 per-session 並行後(見 §4.5)這個語意就破了。**已修**:`ratelimit.rs` 加了 `GlobalRateLimiters`(`OnceLock<Mutex<...>>` process-wide singleton),`AgentState` 不再自己持有 bucket,三個消耗 rate limit 的 syscall(`llm_call`/`embed`/`http_get`)都改成向這個全域 singleton 拿 token。鎖的粒度只包在單次「試拿一個 token」這個非阻塞動作上(`try_take`),等待补充的 3 秒重試迴圈在鎖外面,不會讓一個等待中的 caller 卡住其他並行 run——不然又會變成新的全域瓶頸,違背 per-session 並行本來要達到的效果。
 - `open`:GET 自由(預設,好用優先)
 - `tofu`:新 domain 首次使用需 gateway 核准,之後永久放行——想收資料必用新 domain,必撞審核
 - `allowlist`:僅名單內 domain(最嚴)

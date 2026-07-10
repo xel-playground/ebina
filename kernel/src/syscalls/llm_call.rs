@@ -148,7 +148,7 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
         return error_json("budget_exceeded", "daily token budget exhausted");
     }
 
-    if let Err(limited) = state.llm_bucket.acquire() {
+    if let Err(limited) = crate::ratelimit::global(&state.config.ratelimit).acquire_llm() {
         if limited.sustained {
             let _ = crate::logs::notify(
                 &state.agent_home,
