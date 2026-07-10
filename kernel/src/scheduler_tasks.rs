@@ -1,5 +1,7 @@
+use crate::filelock::FileLock;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// A user- or agent-defined recurring job: "at this cron time, wake the
 /// agent with instructions read from this file" — the general-purpose
@@ -35,6 +37,17 @@ fn save_task(agent_home: &Path, task: &ScheduledTask) -> std::io::Result<()> {
     std::fs::write(task_path(agent_home, &task.id), serde_json::to_vec_pretty(task).unwrap_or_default())
 }
 
+/// Per-task lock for the load-mutate-save sequences below (`update_task`,
+/// `mark_run`) — two different writers touching the *same* task id at once
+/// (a human's webui edit landing right as the scheduler marks that task's
+/// own `last_run`, say) used to race with no locking at all, one save
+/// silently overwriting the other's change. Keyed per task file rather than
+/// one lock for the whole directory, so editing two different tasks at once
+/// still doesn't contend with each other.
+fn task_lock(agent_home: &Path, id: &str) -> FileLock {
+    FileLock::acquire(task_path(agent_home, id).with_extension("json.lock"), Duration::from_secs(5))
+}
+
 pub fn load_tasks(agent_home: &Path) -> Vec<ScheduledTask> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir(agent_home)) else {
@@ -65,6 +78,12 @@ pub fn add_task(agent_home: &Path, cron: &str, data_path: &str, description: &st
     if data_path.is_empty() {
         return Err("data_path must not be empty".to_string());
     }
+    // whole-directory lock, not a per-task one — there's no task id to key
+    // on yet, and the id itself is derived from the *current task count*
+    // (`load_tasks(...).len()`), so two concurrent add_task calls without
+    // this could compute the same id and the second save would silently
+    // clobber the first brand-new task outright, not just collide
+    let _lock = FileLock::acquire(dir(agent_home).join(".add_task.lock"), Duration::from_secs(5));
     let now = crate::logs::now_unix_secs();
     let task = ScheduledTask {
         id: format!("{now}-{}", load_tasks(agent_home).len()),
@@ -89,6 +108,7 @@ pub fn update_task(
     description: Option<&str>,
     enabled: Option<bool>,
 ) -> Result<Option<ScheduledTask>, String> {
+    let _lock = task_lock(agent_home, id);
     let Some(mut task) = load_task(agent_home, id) else {
         return Ok(None);
     };
@@ -118,6 +138,7 @@ pub fn remove_task(agent_home: &Path, id: &str) -> std::io::Result<bool> {
 }
 
 pub fn mark_run(agent_home: &Path, id: &str, ts: i64) {
+    let _lock = task_lock(agent_home, id);
     if let Some(mut task) = load_task(agent_home, id) {
         task.last_run = Some(ts);
         let _ = save_task(agent_home, &task);
