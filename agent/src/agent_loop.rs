@@ -125,6 +125,17 @@ pub fn run(trigger: &Value) {
 
         if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
             let err = resp.get("error").cloned().unwrap_or(Value::Null);
+            // an operator-requested Stop (`POST /api/abort`) surfaces as an
+            // `llm_call` failure with this exact code (see
+            // `kernel/src/syscalls/llm_call.rs`'s stream handlers) — it must
+            // never fall into the generic retry-on-failure path below, or a
+            // deliberate Stop just silently fires a brand-new `llm_call` and
+            // keeps going, which is indistinguishable from Stop doing nothing.
+            if err.get("code").and_then(|c| c.as_str()) == Some("aborted") {
+                summary = "run stopped by operator (Stop button)".to_string();
+                let _ = syscall::call("notify", &serde_json::json!({"message": summary}));
+                break;
+            }
             consecutive_llm_failures += 1;
             // most `llm_call` failures are transient (network_error,
             // rate_limited, a momentary 5xx) — one hard-aborting the whole
