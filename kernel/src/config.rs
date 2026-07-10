@@ -263,11 +263,26 @@ pub struct RuntimeConfig {
     /// headroom under the 262144-token model limit for the compaction call
     /// itself plus whatever growth happens before the next check.
     pub in_run_compact_tokens: u64,
+    /// Test flag comparing two `wasm_path` loading strategies — `false`
+    /// (default): every run compiles the wasm file fresh via
+    /// `Module::from_file` (current/original behavior), which costs a
+    /// recompile per trigger but means a hot-swapped `agent.wasm` on disk
+    /// takes effect on the very next run with no kernel restart. `true`:
+    /// the gateway builds one `WasmRuntime` (Engine/Linker/Module) at
+    /// startup and every run reuses it — skips the recompile, but a
+    /// hot-swapped `agent.wasm` needs a kernel restart to be picked up.
+    /// Engine/Linker/Module are all immutable and Send+Sync once built
+    /// (wasmtime's own documented pattern for concurrent multi-Store use),
+    /// so sharing them across concurrent runs is safe either way — this
+    /// isn't a race-safety switch, purely a perf-vs-hot-swap-convenience
+    /// one. Only `Store` ever needs to be fresh per run regardless of this
+    /// flag (see `lib.rs`'s `run_agent_with_runtime`).
+    pub cache_wasm_module: bool,
 }
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
-        RuntimeConfig { epoch_timeout_secs: 30 * 60, in_run_compact_tokens: 150_000 }
+        RuntimeConfig { epoch_timeout_secs: 30 * 60, in_run_compact_tokens: 150_000, cache_wasm_module: false }
     }
 }
 

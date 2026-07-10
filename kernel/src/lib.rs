@@ -45,6 +45,32 @@ pub struct RunOutcome {
     pub trapped: bool,
 }
 
+/// The three wasmtime objects that don't need to be rebuilt per run —
+/// `Engine`, `Linker`, and `Module` are all immutable and Send+Sync once
+/// constructed, wasmtime's own documented pattern for instantiating many
+/// concurrent `Store`s off one of these. Only `run_agent_with_runtime`'s
+/// `Store` is ever fresh per call; see `config.rs` `RuntimeConfig`'s
+/// `cache_wasm_module` doc comment for why building this is opt-in rather
+/// than the only path.
+pub struct WasmRuntime {
+    engine: Engine,
+    linker: Linker<AgentState>,
+    module: Module,
+}
+
+impl WasmRuntime {
+    pub fn build(wasm_path: &str) -> Result<Self> {
+        let mut engine_config = EngineConfig::new();
+        engine_config.epoch_interruption(true);
+        let engine = Engine::new(&engine_config)?;
+        let module = Module::from_file(&engine, wasm_path)?;
+        let mut linker: Linker<AgentState> = Linker::new(&engine);
+        p1::add_to_linker_sync(&mut linker, |state| &mut state.wasi)?;
+        abi::register(&mut linker)?;
+        Ok(WasmRuntime { engine, linker, module })
+    }
+}
+
 /// Instantiate `wasm_path` fresh, preopen `agent_home` as guest `/`, run
 /// `_start` with `args`, and return whatever it wrote to stdout plus the
 /// timestamp it asked to be woken at (if it called `sleep_until`).
@@ -53,10 +79,16 @@ pub struct RunOutcome {
 /// the only way secrets reach the network is through host-side syscalls
 /// (`llm_call`/`embed`) that read them straight from the host environment.
 pub fn run_agent(agent_home: &str, wasm_path: &str, args: &[&str]) -> Result<RunOutcome> {
-    let epoch_timeout = Config::load(&PathBuf::from(agent_home))
-        .map(|c| Duration::from_secs(c.runtime.epoch_timeout_secs))
-        .unwrap_or(DEFAULT_EPOCH_TIMEOUT);
-    run_agent_with_epoch_timeout(agent_home, wasm_path, args, epoch_timeout)
+    run_agent_with_epoch_timeout(agent_home, wasm_path, args, epoch_timeout_for(agent_home))
+}
+
+/// `config.toml`'s `[runtime] epoch_timeout_secs`, falling back to
+/// [`DEFAULT_EPOCH_TIMEOUT`] if that config can't be loaded at all — shared
+/// by [`run_agent`] and `gateway.rs`'s cached-`WasmRuntime` path
+/// (`run_agent_with_runtime`), which needs the same value but doesn't go
+/// through `run_agent`/`run_agent_with_epoch_timeout` itself.
+pub fn epoch_timeout_for(agent_home: &str) -> Duration {
+    Config::load(&PathBuf::from(agent_home)).map(|c| Duration::from_secs(c.runtime.epoch_timeout_secs)).unwrap_or(DEFAULT_EPOCH_TIMEOUT)
 }
 
 /// Same as [`run_agent`] but with a configurable epoch-interruption timeout —
@@ -68,18 +100,20 @@ pub fn run_agent_with_epoch_timeout(
     args: &[&str],
     epoch_timeout: Duration,
 ) -> Result<RunOutcome> {
+    let runtime = WasmRuntime::build(wasm_path)?;
+    run_agent_with_runtime(agent_home, &runtime, args, epoch_timeout)
+}
+
+/// Same as [`run_agent_with_epoch_timeout`] but reuses an already-built
+/// [`WasmRuntime`] instead of compiling `wasm_path` fresh — see
+/// `WasmRuntime`'s and `config.rs` `RuntimeConfig::cache_wasm_module`'s doc
+/// comments for the tradeoff. Still builds a brand-new `Store` every call —
+/// that's the part PROJECT.md's "fresh instantiate every wake" actually
+/// refers to, not the Engine/Module/Linker.
+pub fn run_agent_with_runtime(agent_home: &str, runtime: &WasmRuntime, args: &[&str], epoch_timeout: Duration) -> Result<RunOutcome> {
     let agent_home_path = PathBuf::from(agent_home);
     let config = Config::load(&agent_home_path)?;
     let secrets = Secrets::load(&secrets_path(&agent_home_path));
-
-    let mut engine_config = EngineConfig::new();
-    engine_config.epoch_interruption(true);
-    let engine = Engine::new(&engine_config)?;
-    let module = Module::from_file(&engine, wasm_path)?;
-
-    let mut linker: Linker<AgentState> = Linker::new(&engine);
-    p1::add_to_linker_sync(&mut linker, |state| &mut state.wasi)?;
-    abi::register(&mut linker)?;
 
     let stdout = MemoryOutputPipe::new(64 * 1024);
 
@@ -96,20 +130,20 @@ pub fn run_agent_with_epoch_timeout(
 
     let limits = StoreLimitsBuilder::new().memory_size(MEMORY_CAP_BYTES).build();
     let state = AgentState::new(agent_home_path.clone(), config, secrets, wasi_ctx, limits);
-    let mut store = Store::new(&engine, state);
+    let mut store = Store::new(&runtime.engine, state);
     store.limiter(|state| &mut state.limits);
     store.set_epoch_deadline(1);
     store.epoch_deadline_trap();
 
     // ticks the deadline exactly once after `epoch_timeout` — a stuck guest
     // traps instead of hanging the kernel forever (PROJECT.md 4.1)
-    let epoch_engine = engine.clone();
+    let epoch_engine = runtime.engine.clone();
     std::thread::spawn(move || {
         std::thread::sleep(epoch_timeout);
         epoch_engine.increment_epoch();
     });
 
-    let instance = linker.instantiate(&mut store, &module)?;
+    let instance = runtime.linker.instantiate(&mut store, &runtime.module)?;
     let start = instance.get_typed_func::<(), ()>(&mut store, "_start")?;
     // guest failures (traps, wasi proc_exit) are expected for escape-attempt
     // tests, so swallow them here — the caller checks captured stdout instead.

@@ -100,6 +100,12 @@ pub(crate) struct AppState {
     /// per-session; this is trigger-type-agnostic so the webui still gets a
     /// meaningful "something's running right now" signal.
     active_runs: std::sync::atomic::AtomicUsize,
+    /// `Some` only when `config.toml`'s `[runtime] cache_wasm_module` was
+    /// `true` at startup — see `WasmRuntime`'s doc comment. `Arc` (not a
+    /// bare `WasmRuntime`) so `run_trigger_inner`'s `spawn_blocking` closure
+    /// can cheaply clone a `'static` handle to it; no `Mutex` needed since
+    /// nothing about it ever changes after `serve` builds it once.
+    wasm_runtime: Option<Arc<crate::WasmRuntime>>,
 }
 
 impl AppState {
@@ -136,6 +142,16 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
     // would silently never fire for exactly the installs that most need it
     crate::discord::migrate_legacy_seed_path(&cfg.agent_home);
 
+    // built once, here, rather than lazily on first run — a bad wasm_path
+    // should fail gateway startup loudly, not surface as a mysterious first
+    // request failure
+    let cache_wasm_module = Config::load(&cfg.agent_home).map(|c| c.runtime.cache_wasm_module).unwrap_or(false);
+    let wasm_runtime = if cache_wasm_module {
+        Some(Arc::new(crate::WasmRuntime::build(&cfg.wasm_path.to_string_lossy())?))
+    } else {
+        None
+    };
+
     let state = Arc::new(AppState {
         agent_home: cfg.agent_home,
         wasm_path: cfg.wasm_path,
@@ -143,6 +159,7 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
         session_locks: KeyedLocks::new(),
         task_run_locks: KeyedLocks::new(),
         active_runs: std::sync::atomic::AtomicUsize::new(0),
+        wasm_runtime,
     });
 
     let api = Router::new()
@@ -730,11 +747,20 @@ async fn run_trigger_inner(state: &Arc<AppState>, trigger: Value) -> Value {
     let agent_home = state.agent_home.clone();
     let wasm_path = state.wasm_path.clone();
     let trigger_str = trigger.to_string();
+    let wasm_runtime = state.wasm_runtime.clone();
 
     let outcome = tokio::task::spawn_blocking(move || {
         let agent_home = agent_home.to_string_lossy().into_owned();
-        let wasm_path = wasm_path.to_string_lossy().into_owned();
-        crate::run_agent(&agent_home, &wasm_path, &["run", &trigger_str])
+        match wasm_runtime {
+            Some(runtime) => {
+                let epoch_timeout = crate::epoch_timeout_for(&agent_home);
+                crate::run_agent_with_runtime(&agent_home, &runtime, &["run", &trigger_str], epoch_timeout)
+            }
+            None => {
+                let wasm_path = wasm_path.to_string_lossy().into_owned();
+                crate::run_agent(&agent_home, &wasm_path, &["run", &trigger_str])
+            }
+        }
     })
     .await;
 
