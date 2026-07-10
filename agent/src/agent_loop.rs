@@ -10,6 +10,7 @@ use std::io::Write;
 
 const MAX_TURNS: u32 = 50;
 const NOTES_DIR: &str = "/memory/notes";
+const WORKSPACE_DIR: &str = "/workspace";
 const RETRIEVAL_TOP_K: usize = 5;
 
 /// PROJECT.md 4.2: `run(trigger_json)` — RAG-retrieve, build a prompt, call
@@ -211,7 +212,9 @@ pub fn run(trigger: &Value) {
                 let content = action.get("content").and_then(|c| c.as_str()).unwrap_or("");
                 let quota = disk_quota_bytes();
                 let projected = agent_home_size() + content.len() as u64;
-                let result = if projected > quota {
+                let result = if let Some(msg) = write_action_denial(&path, trigger) {
+                    serde_json::json!({"ok": false, "error": msg})
+                } else if projected > quota {
                     let msg = format!(
                         "disk quota exceeded: writing {path} would bring agent-home to {projected} bytes, over the {quota}-byte cap — refused"
                     );
@@ -238,7 +241,9 @@ pub fn run(trigger: &Value) {
                 let content = action.get("content").and_then(|c| c.as_str()).unwrap_or("");
                 let quota = disk_quota_bytes();
                 let projected = agent_home_size() + content.len() as u64;
-                let result = if projected > quota {
+                let result = if let Some(msg) = write_action_denial(&path, trigger) {
+                    serde_json::json!({"ok": false, "error": msg})
+                } else if projected > quota {
                     let msg = format!(
                         "disk quota exceeded: appending to {path} would bring agent-home to {projected} bytes, over the {quota}-byte cap — refused"
                     );
@@ -650,7 +655,12 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String]) -> String {
                  genuinely need to alert a human asynchronously about something unrelated to this reply. \
                  Just call `done` directly with your full answer in `summary`, verbatim, as if speaking to them \
                  (\"here's X\" / \"the answer is Y\") — not a third-person log of what you did (not \"provided X \
-                 to the user\"), and not empty just because you already said it somewhere else.{channel_note}\n"
+                 to the user\"), and not empty just because you already said it somewhere else.{channel_note} \
+                 `write_file`/`append_file` only reach `/workspace/` on a chat turn — `/memory/notes/` (and \
+                 everything else) comes back as an error, so don't bother trying to \"remember\" something by \
+                 writing a note directly. This turn is already captured for free in today's log.md; anything \
+                 worth keeping long-term gets folded into memory/notes/ by the next maintenance cycle, no \
+                 action needed from you.\n"
             )
         }
         Some("cron") => {
@@ -715,11 +725,11 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String]) -> String {
          - `{{\"action\":\"read_file\",\"path\":\"...\"}}`\n\
          - `{{\"action\":\"write_file\",\"path\":\"...\",\"content\":\"...\"}}` — overwrites the whole \
          file; refused with a `disk quota exceeded` error (and a `notify`) if it would push agent-home \
-         over its total size cap\n\
+         over its total size cap. Scoped to `/workspace/` — see \"## Paths and files\" below\n\
          - `{{\"action\":\"append_file\",\"path\":\"...\",\"content\":\"...\"}}` — appends to a file \
          (creating it if missing) instead of overwriting it; use this for a growing log/report instead of \
-         `read_file` + `write_file` the whole thing back just to add one entry. Same quota check as \
-         `write_file`\n\
+         `read_file` + `write_file` the whole thing back just to add one entry. Same quota check and \
+         `/workspace/` scoping as `write_file`\n\
          - `{{\"action\":\"notify\",\"message\":\"...\"}}` — silent background log (Live log panel), nobody's \
          watching it live\n\
          - `{{\"action\":\"chat_send\",\"message\":\"...\",\"target\":\"webui\"}}` — proactively pushes one \
@@ -932,6 +942,38 @@ fn absolute_path(path: &str) -> String {
     } else {
         format!("/{path}")
     }
+}
+
+/// `write_file`/`append_file` used to reach anywhere in agent_home on every
+/// trigger type — a normal chat turn could just decide to rewrite a curated
+/// note on its own judgment, no distillation step, no merge-with-existing-
+/// fact check. That's how a note ends up silently overwritten with
+/// something wrong (an already-seen real incident — a corrected fact got
+/// re-clobbered because a later, unrelated chat turn touched the same file
+/// directly). Only `message` (a live human chat turn, webui/Discord) is
+/// restricted now, and only to `/workspace/` — scratch space, task output,
+/// upload-adjacent files, anything a reply needs to persist for itself.
+/// Every *background*-triggered run (`cron`, `daily_maintenance`,
+/// `scheduled_task`, `manual`) keeps full access exactly as before —
+/// scheduled tasks legitimately maintain their own state files under
+/// `/memory/notes/` (e.g. the RSS task's per-source status tracker), and
+/// `daily_maintenance` is the one place curated notes are *meant* to be
+/// edited. A chat turn's own activity is still captured for free via the
+/// per-run day-log regardless, so nothing is lost by refusing here — it
+/// just waits for the next maintenance pass to get distilled properly.
+fn write_action_denial(path: &str, trigger: &Value) -> Option<String> {
+    let trigger_type = trigger.get("type").and_then(|t| t.as_str());
+    if trigger_type != Some("message") {
+        return None;
+    }
+    if path.starts_with(WORKSPACE_DIR) {
+        return None;
+    }
+    Some(format!(
+        "{path} is outside {WORKSPACE_DIR} — a live chat reply can only write_file/append_file under \
+         {WORKSPACE_DIR}. This turn's activity is already captured in today's log.md automatically; \
+         anything worth keeping long-term gets folded into memory/notes/ on the next maintenance cycle."
+    ))
 }
 
 const DEFAULT_DISK_QUOTA_BYTES: u64 = 2 * 1024 * 1024 * 1024;
