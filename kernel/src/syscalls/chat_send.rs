@@ -1,7 +1,9 @@
 use crate::abi::{error_json, ok_json};
+use crate::filelock::FileLock;
 use crate::state::AgentState;
 use serde_json::Value;
 use std::path::Path;
+use std::time::Duration;
 
 /// `chat_send(message, target?)` — proactively pushes one message into a
 /// real chat surface, for a background-triggered run (`cron`/
@@ -61,8 +63,23 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
 /// drop before it ever reaches the LLM).
 const PROACTIVE_NOTE: &str = "(the agent proactively sent the next message on its own initiative — not a reply to anything said in this conversation)";
 
+/// Locked (`session.json.lock`, same path convention as `grants.rs`/
+/// `scheduler_tasks.rs`) against two things: another concurrent `chat_send`
+/// racing this one (two background triggers proactively messaging the same
+/// target at once), and — the more likely case in practice — a live
+/// `message` turn on this exact session concurrently reaching its own
+/// end-of-turn save (`gateway.rs handle_chat_message`, which takes the same
+/// lock and reloads fresh before writing, see its doc comment). Without
+/// this, whichever side's blind `load → mutate → save` finishes last simply
+/// erases the other's turn — not a rare timing coincidence, but guaranteed
+/// to happen if a `daily_maintenance`/`cron`/`scheduled_task` run
+/// `chat_send`s while a human is mid-conversation on the same session,
+/// since `session_locks` (the per-session tokio lock) only ever covered the
+/// *triggering* run's own session — `chat_send`'s target session is never
+/// that.
 fn append_assistant_turn(agent_home: &Path, session_key: &str, message: &str) -> Value {
     let path = agent_home.join("logs/chat_sessions").join(session_key).join("session.json");
+    let _lock = FileLock::acquire(path.with_extension("json.lock"), Duration::from_secs(5));
     let mut turns: Vec<Value> =
         std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
     let now = crate::logs::now_unix_secs();

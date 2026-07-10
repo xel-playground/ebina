@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::filelock::FileLock;
 use crate::secrets::Secrets;
 use axum::extract::{Path as AxumPath, Query, Request, State};
 use axum::http::StatusCode;
@@ -505,7 +506,8 @@ pub(crate) async fn handle_chat_message(state: Arc<AppState>, session_key: Strin
     // all-empty-reply guard further down exists for — give it a placeholder
     // instead of ever sending "" as a block's text
     let display_text = if text.trim().is_empty() && !attachments.is_empty() { "(附件)".to_string() } else { text.clone() };
-    session.push(SessionTurn { role: "user".to_string(), content: display_text, attachments, ts: crate::logs::now_unix_secs() });
+    let user_turn = SessionTurn { role: "user".to_string(), content: display_text, attachments, ts: crate::logs::now_unix_secs() };
+    session.push(user_turn.clone());
     let supports_vision = Config::load(&state.agent_home).map(|c| c.llm.supports_vision).unwrap_or(false);
     let history: Vec<Value> = session.iter().map(|t| turn_to_message(&state.agent_home, supports_vision, t)).collect();
 
@@ -527,12 +529,39 @@ pub(crate) async fn handle_chat_message(state: Arc<AppState>, session_key: Strin
     if reply.trim().is_empty() {
         reply = "(no reply — the run ended without producing one; check Live Log / LLM logs for what happened)".to_string();
     }
-    session.push(SessionTurn { role: "assistant".to_string(), content: reply, attachments: Vec::new(), ts: crate::logs::now_unix_secs() });
-    let _ = save_session(&state.agent_home, &session_key, &session);
+    let assistant_turn = SessionTurn { role: "assistant".to_string(), content: reply, attachments: Vec::new(), ts: crate::logs::now_unix_secs() };
+
+    let agent_home = state.agent_home.clone();
+    let key_for_save = session_key.clone();
+    let _ = tokio::task::spawn_blocking(move || append_turns_locked(&agent_home, &key_for_save, vec![user_turn, assistant_turn])).await;
 
     maybe_auto_compact(&state, &session_key);
 
     outcome
+}
+
+/// Appends this turn's new messages onto whatever's *currently* on disk,
+/// rather than the snapshot `session` was loaded into at the top of
+/// `handle_chat_message` — `run_trigger`'s `.await` above is a whole LLM
+/// round trip (seconds, sometimes much longer), and `session_locks` (the
+/// per-session tokio lock) only ever covers *this* run's own session_key;
+/// it has no idea about `chat_send` (kernel/src/syscalls/chat_send.rs),
+/// which runs from a completely unrelated, unlocked background trigger and
+/// can append a proactive turn to this exact `session.json` at any point
+/// during that window. Blindly overwriting with the stale start-of-turn
+/// snapshot (the old behavior) would silently erase that turn forever —
+/// not a rare timing coincidence, guaranteed to happen whenever the two
+/// overlap. Locked with the same `session.json.lock` convention
+/// `chat_send` uses, so the two can't race this reload-then-save against
+/// each other either. Called via `spawn_blocking` since `FileLock::acquire`
+/// spin-waits with `std::thread::sleep` — fine off the async executor
+/// thread, not fine on it.
+fn append_turns_locked(agent_home: &Path, session_key: &str, new_turns: Vec<SessionTurn>) {
+    let path = session_path(agent_home, session_key);
+    let _lock = FileLock::acquire(path.with_extension("json.lock"), Duration::from_secs(5));
+    let mut turns = load_session(agent_home, session_key);
+    turns.extend(new_turns);
+    let _ = save_session(agent_home, session_key, &turns);
 }
 
 /// Fires a background compact once this session's last-measured context
@@ -743,13 +772,24 @@ fn extract_result(stdout: &str) -> Value {
     Value::Null
 }
 
+/// Called at the end of *every* `run_trigger`, including fully-concurrent
+/// background triggers (see `AppState::session_locks`'s doc comment) — a
+/// plain `std::fs::write` here (open-truncate-write, not atomic) meant two
+/// runs finishing close together could interleave writes to the same
+/// `last_run.json` into a torn/corrupt file, same defect class the
+/// `http_get` cache write race was fixed for. Temp file + `rename` instead:
+/// `rename` is atomic on POSIX same-filesystem, so `scheduler_loop`'s read
+/// of this file always sees either the old or the new complete payload,
+/// never a mix.
 fn persist_last_run(agent_home: &Path, sleep_until: Option<i64>, result: &Value) -> anyhow::Result<()> {
     let path = agent_home.join("logs/last_run.json");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let payload = json!({"ts": crate::logs::now_unix_secs(), "sleep_until": sleep_until, "result": result});
-    std::fs::write(path, serde_json::to_vec_pretty(&payload)?)?;
+    let tmp_path = path.with_extension(format!("json.{}.tmp", crate::logs::now_unix_nanos()));
+    std::fs::write(&tmp_path, serde_json::to_vec_pretty(&payload)?)?;
+    std::fs::rename(&tmp_path, &path)?;
     Ok(())
 }
 
@@ -865,8 +905,16 @@ struct SetSecretBody {
 /// Sets one secret in the vault. Response echoes back only the *names*
 /// present in the vault, never values, as confirmation — there is no GET
 /// endpoint for secrets at all.
+///
+/// Locked (`secrets.toml.lock`) — same lost-update class the `grants.rs`
+/// fix closed: a bare load-mutate-save here meant two concurrent
+/// `POST /api/secrets` calls (setting two *different* names) could each
+/// load the same snapshot and each save their own version back, the second
+/// silently discarding the first secret entirely rather than just
+/// duplicating it.
 async fn post_secret(State(state): State<Arc<AppState>>, Json(body): Json<SetSecretBody>) -> impl IntoResponse {
     let path = crate::secrets_path(&state.agent_home);
+    let _lock = FileLock::acquire(path.with_extension("toml.lock"), Duration::from_secs(5));
     let mut secrets = Secrets::load(&path);
     secrets.set(&body.name, &body.value);
     match secrets.save(&path) {

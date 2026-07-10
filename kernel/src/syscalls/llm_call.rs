@@ -1,4 +1,5 @@
 use crate::abi::{error_json, ok_json};
+use crate::filelock::FileLock;
 use crate::logs::{append_jsonl, now_unix_nanos, now_unix_secs};
 use crate::state::AgentState;
 use serde::{Deserialize, Serialize};
@@ -102,7 +103,16 @@ fn save_circuit(agent_home: &Path, state: &CircuitState) {
 /// Records one fully-failed call (all `MAX_SEND_ATTEMPTS` exhausted) and
 /// trips the breaker once `CIRCUIT_FAILURE_THRESHOLD` such calls happen in a
 /// row.
+///
+/// Locked (`llm_circuit_breaker.json.lock`) — this is one global file (no
+/// session key, unlike `budget`/`chat_sessions`), and every concurrent
+/// `llm_call` across every session/trigger hits it. Without a lock, two
+/// calls finishing at nearly the same moment (routine now that background
+/// triggers run fully concurrently) do a lost-update load-mutate-save race:
+/// one's increment silently vanishes, undercounting consecutive failures
+/// and delaying the trip.
 fn record_circuit_failure(agent_home: &Path) {
+    let _lock = FileLock::acquire(circuit_path(agent_home).with_extension("json.lock"), Duration::from_secs(5));
     let mut circuit = load_circuit(agent_home);
     circuit.consecutive_failures += 1;
     if circuit.consecutive_failures >= CIRCUIT_FAILURE_THRESHOLD {
@@ -116,6 +126,7 @@ fn record_circuit_failure(agent_home: &Path) {
 }
 
 fn record_circuit_success(agent_home: &Path) {
+    let _lock = FileLock::acquire(circuit_path(agent_home).with_extension("json.lock"), Duration::from_secs(5));
     let circuit = load_circuit(agent_home);
     if circuit.consecutive_failures > 0 || circuit.tripped_until != 0 {
         save_circuit(agent_home, &CircuitState::default());
