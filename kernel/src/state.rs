@@ -71,6 +71,12 @@ impl AgentState {
                 let _ = std::fs::create_dir_all(parent);
             }
             let conn = Connection::open(path)?;
+            // WAL: readers (e.g. DB Browser for SQLite opened externally for
+            // debugging) don't block a concurrent writer here and vice versa
+            // — default rollback journal takes an exclusive lock on write,
+            // which "database is locked" against any external tool that has
+            // the file open read-write at the same time.
+            conn.pragma_update(None, "journal_mode", "WAL")?;
             crate::syscalls::db_exec::harden(&conn, self.config.db.query_timeout_secs)?;
             self.db = Some(conn);
         }

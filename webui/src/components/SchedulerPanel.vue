@@ -6,6 +6,10 @@ const tasks = ref([])
 const selectedTask = ref(null)
 const isNewTask = ref(false)
 const taskResult = ref('')
+// the task's `data_path` file content — separate from selectedTask since it
+// loads async (a second request) and isn't part of the task JSON itself
+const taskFile = ref('')
+const taskFileResult = ref('')
 
 async function refresh() {
   tasks.value = (await api('/scheduler/tasks')).body.tasks || []
@@ -13,15 +17,29 @@ async function refresh() {
   if (stillThere) selectedTask.value = stillThere
 }
 
+async function loadTaskFile(path) {
+  taskFileResult.value = ''
+  taskFile.value = path ? (await api('/scheduler/task_file?path=' + encodeURIComponent(path))).body : ''
+}
+
 function selectTask(t) {
   isNewTask.value = false
   taskResult.value = ''
   selectedTask.value = { ...t }
+  loadTaskFile(t.data_path)
 }
 function newTask() {
   isNewTask.value = true
   taskResult.value = ''
+  taskFile.value = ''
+  taskFileResult.value = ''
   selectedTask.value = { cron: '0 9 * * *', data_path: '/workspace/tasks/', description: '', enabled: true }
+}
+async function saveTaskFile() {
+  const { body } = await api('/scheduler/task_file?path=' + encodeURIComponent(selectedTask.value.data_path), {
+    method: 'PUT', headers: { 'Content-Type': 'text/plain' }, body: taskFile.value,
+  })
+  taskFileResult.value = typeof body === 'string' ? body : JSON.stringify(body)
 }
 async function saveTask() {
   const t = selectedTask.value
@@ -77,7 +95,10 @@ defineExpose({ refresh })
             <input type="text" v-model="selectedTask.cron" placeholder="0 9 * * *">
             <label v-if="!isNewTask" class="row" style="margin:0"><input type="checkbox" v-model="selectedTask.enabled"> enabled</label>
           </div>
-          <input type="text" v-model="selectedTask.data_path" placeholder="/workspace/tasks/x.md">
+          <div class="row">
+            <input type="text" v-model="selectedTask.data_path" placeholder="/workspace/tasks/x.md">
+            <button class="secondary" @click="loadTaskFile(selectedTask.data_path)">Load file</button>
+          </div>
           <input type="text" v-model="selectedTask.description" placeholder="one-line description">
           <div class="hint" v-if="!isNewTask">
             id: {{ selectedTask.id }} — last run: {{ selectedTask.last_run ? new Date(selectedTask.last_run * 1000).toLocaleString() : 'never' }}
@@ -87,6 +108,11 @@ defineExpose({ refresh })
             <button class="secondary" @click="deleteTask" v-if="!isNewTask">Delete</button>
           </div>
           <pre v-if="taskResult">{{ taskResult }}</pre>
+
+          <div class="hint" style="margin-top:1rem">data_path 內容 — 直接編輯後按 Save file</div>
+          <textarea v-model="taskFile" style="min-height:12rem"></textarea>
+          <div class="row"><button @click="saveTaskFile" :disabled="!selectedTask.data_path">Save file</button></div>
+          <pre v-if="taskFileResult">{{ taskFileResult }}</pre>
         </div>
         <div class="hint" v-else>select a task on the left, or click New</div>
       </div>

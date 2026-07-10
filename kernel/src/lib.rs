@@ -25,14 +25,23 @@ use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtxBuilder};
 
 /// PROJECT.md 4.1: epoch interruption timeout (fresh instantiate every wake,
-/// so a stuck guest just gets trapped rather than needing a kernel restart)
-pub const DEFAULT_EPOCH_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// so a stuck guest just gets trapped rather than needing a kernel restart).
+/// Fallback only — [`run_agent`] prefers `config.toml`'s `[runtime]
+/// epoch_timeout_secs` (see `config.rs` `RuntimeConfig`) and only falls
+/// back to this if that config can't be loaded at all.
+pub const DEFAULT_EPOCH_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// PROJECT.md 4.1: linear memory cap per instance
 pub const MEMORY_CAP_BYTES: usize = 512 * 1024 * 1024;
 
 pub struct RunOutcome {
     pub stdout: String,
     pub sleep_until: Option<i64>,
+    /// `true` when the guest never produced a `RESULT:` line — see the
+    /// `!stdout.contains("RESULT:")` check below. `gateway.rs`'s
+    /// `run_trigger` uses this to hand back an actual "run trapped" summary
+    /// instead of a bare `null` result, which otherwise renders as an
+    /// unhelpful generic "(no summary)" in the webui's Schedule history panel.
+    pub trapped: bool,
 }
 
 /// Instantiate `wasm_path` fresh, preopen `agent_home` as guest `/`, run
@@ -43,7 +52,10 @@ pub struct RunOutcome {
 /// the only way secrets reach the network is through host-side syscalls
 /// (`llm_call`/`embed`) that read them straight from the host environment.
 pub fn run_agent(agent_home: &str, wasm_path: &str, args: &[&str]) -> Result<RunOutcome> {
-    run_agent_with_epoch_timeout(agent_home, wasm_path, args, DEFAULT_EPOCH_TIMEOUT)
+    let epoch_timeout = Config::load(&PathBuf::from(agent_home))
+        .map(|c| Duration::from_secs(c.runtime.epoch_timeout_secs))
+        .unwrap_or(DEFAULT_EPOCH_TIMEOUT);
+    run_agent_with_epoch_timeout(agent_home, wasm_path, args, epoch_timeout)
 }
 
 /// Same as [`run_agent`] but with a configurable epoch-interruption timeout —
@@ -106,6 +118,23 @@ pub fn run_agent_with_epoch_timeout(
     drop(store);
     let stdout = String::from_utf8_lossy(&stdout.contents()).into_owned();
 
+    // A real `run` invocation (`agent_loop.rs`'s `run()`) always ends with a
+    // `RESULT:` line, success or not — `run()`'s own error paths still print
+    // one. Its absence means the guest got trapped (most likely this epoch
+    // deadline, mid-turn — e.g. right after deciding on a `chat_send` but
+    // before executing it) partway through and never got back to finish,
+    // which otherwise fails *completely* silently: no `RESULT:`, no
+    // `write_memory_note` entry, nothing `notify`'d from inside the guest
+    // (it never got the chance). Surfacing it here is the only place left
+    // that still can.
+    let trapped = !stdout.contains("RESULT:");
+    if trapped {
+        let _ = logs::notify(
+            &agent_home_path,
+            &format!("run produced no result (likely trapped at the {epoch_timeout:?} epoch deadline mid-turn) — args: {args:?}"),
+        );
+    }
+
     // PROJECT.md 4.1: guest stdio goes to logs, not the kernel's own terminal
     let _ = logs::append_jsonl(
         &agent_home_path.join("logs/stdout.jsonl"),
@@ -118,7 +147,7 @@ pub fn run_agent_with_epoch_timeout(
         let _ = logs::notify(&agent_home_path, &format!("auto-commit failed: {e}"));
     }
 
-    Ok(RunOutcome { stdout, sleep_until })
+    Ok(RunOutcome { stdout, sleep_until, trapped })
 }
 
 /// `EBINA_SECRETS` env var if set, else `<parent of agent_home>/secrets.toml`

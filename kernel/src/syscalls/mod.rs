@@ -3,7 +3,6 @@ pub mod db_exec;
 pub mod embed;
 pub mod http_get;
 pub mod llm_call;
-pub mod memory_kv;
 pub mod notify;
 pub mod schedule_task;
 pub mod search_web;
@@ -20,8 +19,6 @@ pub fn dispatch(state: &mut AgentState, name: &str, req: Value) -> Value {
         "chat_send" => chat_send::call(state, req),
         "sleep_until" => sleep_until::call(state, req),
         "db_exec" => db_exec::call(state, req),
-        "memory_get" => memory_kv::get(state, req),
-        "memory_set" => memory_kv::set(state, req),
         "llm_call" => llm_call::call(state, req),
         "embed" => embed::call(state, req),
         "http_get" => http_get::call(state, req),

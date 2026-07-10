@@ -15,13 +15,13 @@ const RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
 /// bad-status body costs nothing extra, so it's read here regardless of
 /// whether this turns out to be the final attempt.
 enum SendResult {
-    /// `provider = "ollama"` *and* a successful status — handed back
-    /// unread so the caller can stream it (`handle_ollama_stream`); this is
-    /// the only outcome that isn't already read to a `Value`.
+    /// any successful status, any provider — every provider streams now,
+    /// so this is handed back unread for the caller to dispatch to the
+    /// right per-provider stream parser (`handle_ollama_stream`/
+    /// `handle_openai_stream`/`handle_anthropic_stream`).
     Stream(reqwest::blocking::Response),
-    /// every other success, or the last attempt's failure — retried
-    /// attempts don't reach here, only the one that finally succeeded or
-    /// the one that ran out of attempts.
+    /// the last attempt's failure (a non-success status) — retried
+    /// attempts don't reach here, only the one that ran out of attempts.
     Body { status: reqwest::StatusCode, json: Value },
     /// every attempt failed before a status code ever came back (DNS/
     /// connect/timeout) — nothing to parse.
@@ -38,7 +38,7 @@ enum SendResult {
 /// worst-case added latency) — long enough to ride out more than a single
 /// blip, short enough that one call doesn't hang the whole `run_lock`-
 /// serialized agent for minutes over a dead API.
-fn send_with_retries(request: reqwest::blocking::RequestBuilder, is_ollama: bool) -> SendResult {
+fn send_with_retries(request: reqwest::blocking::RequestBuilder) -> SendResult {
     let mut last_connect_err: Option<String> = None;
     for attempt in 0..MAX_SEND_ATTEMPTS {
         if attempt > 0 {
@@ -53,11 +53,11 @@ fn send_with_retries(request: reqwest::blocking::RequestBuilder, is_ollama: bool
             }
         };
         let status = response.status();
-        if is_ollama && status.is_success() {
+        if status.is_success() {
             return SendResult::Stream(response);
         }
         let json: Value = response.json().unwrap_or(Value::Null);
-        if status.is_success() || attempt + 1 == MAX_SEND_ATTEMPTS {
+        if attempt + 1 == MAX_SEND_ATTEMPTS {
             return SendResult::Body { status, json };
         }
         // bad status, attempts remain — loop again
@@ -132,11 +132,13 @@ fn record_circuit_success(agent_home: &Path) {
 /// touching the network, then logs full (raw, provider-shaped) prompt/
 /// response + token usage.
 ///
-/// For `provider = "ollama"` this streams the response so the reasoning
-/// ("thinking") text can be tailed live by the gateway (`GET /api/thinking`)
-/// while the guest is still blocked waiting on this call, and so an
-/// operator can abort mid-generation (`POST /api/abort`) instead of burning
-/// through the whole response.
+/// Every provider streams now — so reasoning/"thinking" text (where the
+/// provider sends any: ollama's `thinking`, an OpenAI-compatible
+/// provider's `reasoning_content` delta, Anthropic's `thinking_delta`) can
+/// be tailed live by the gateway (`GET /api/thinking`) while the guest is
+/// still blocked waiting on this call, and so an operator can abort
+/// mid-generation (`POST /api/abort`) instead of burning through the whole
+/// response — regardless of which provider is configured.
 pub fn call(state: &mut AgentState, req: Value) -> Value {
     if !state.budget.has_headroom() {
         let _ = crate::logs::notify(
@@ -186,7 +188,13 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
     if let Value::Object(ref mut map) = body {
         map.remove("_meta");
         map.entry("model").or_insert_with(|| Value::String(state.config.llm.model.clone()));
-        map.insert("stream".to_string(), Value::Bool(provider == "ollama"));
+        map.insert("stream".to_string(), Value::Bool(true));
+        if provider == "openai" {
+            // without this, an OpenAI-compatible stream's chunks carry no
+            // usage at all — most such APIs (this one included) only add a
+            // final usage-only chunk when this is explicitly requested
+            map.insert("stream_options".to_string(), serde_json::json!({"include_usage": true}));
+        }
     }
     if provider == "anthropic" {
         normalize_for_anthropic(&mut body);
@@ -198,58 +206,25 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
         "ollama" | "openai" => request.bearer_auth(&api_key),
         _ => request.header("x-api-key", &api_key).header("anthropic-version", "2023-06-01"),
     };
-    let (status, response_json) = match send_with_retries(request.json(&body), provider == "ollama") {
+    match send_with_retries(request.json(&body)) {
         SendResult::Stream(response) => {
             record_circuit_success(&state.agent_home);
-            return handle_ollama_stream(state, body, response, &source);
+            match provider.as_str() {
+                "ollama" => handle_ollama_stream(state, body, response, &source),
+                "openai" => handle_openai_stream(state, body, response, &source),
+                _ => handle_anthropic_stream(state, body, response, &source),
+            }
         }
-        SendResult::Body { status, json } => (status, json),
+        SendResult::Body { status, json } => {
+            write_transcript(state, &body, &json, &source);
+            record_circuit_failure(&state.agent_home);
+            error_json("llm_error", &format!("HTTP {status}: {json}"))
+        }
         SendResult::ConnectFailed(e) => {
             record_circuit_failure(&state.agent_home);
-            return error_json("network_error", &e);
+            error_json("network_error", &e)
         }
-    };
-
-    write_transcript(state, &body, &response_json, &source);
-    if !status.is_success() {
-        record_circuit_failure(&state.agent_home);
-        return error_json("llm_error", &format!("HTTP {status}: {response_json}"));
     }
-    record_circuit_success(&state.agent_home);
-
-    // only Anthropic/OpenAI-shaped (or an ollama error body) reaches here — ollama success is streamed above
-    let (text, input_tokens, output_tokens) = if provider == "openai" {
-        let text = response_json
-            .get("choices")
-            .and_then(|c| c.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|choice| choice.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let input = response_json.get("usage").and_then(|u| u.get("prompt_tokens")).and_then(|v| v.as_u64()).unwrap_or(0);
-        let output = response_json.get("usage").and_then(|u| u.get("completion_tokens")).and_then(|v| v.as_u64()).unwrap_or(0);
-        (text, input, output)
-    } else {
-        let input = response_json.get("usage").and_then(|u| u.get("input_tokens")).and_then(|v| v.as_u64()).unwrap_or(0);
-        let output = response_json.get("usage").and_then(|u| u.get("output_tokens")).and_then(|v| v.as_u64()).unwrap_or(0);
-        let text = response_json
-            .get("content")
-            .and_then(|c| c.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|block| block.get("text"))
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        (text, input, output)
-    };
-
-    record_usage(state, input_tokens, output_tokens, &source);
-    ok_json(serde_json::json!({
-        "text": text,
-        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
-    }))
 }
 
 /// Keyed by session, same as `chat_sessions/` itself — otherwise a
@@ -363,6 +338,166 @@ fn handle_ollama_stream(state: &mut AgentState, body: Value, response: reqwest::
     }))
 }
 
+/// Reads an OpenAI-compatible SSE stream (`data: {...}` lines, `[DONE]`
+/// sentinel) — same live-thinking-trace + abort-check pattern as
+/// `handle_ollama_stream`. `delta.reasoning_content` (the Kimi/DeepSeek-
+/// style extended-thinking extension several OpenAI-compatible providers
+/// support) goes to the same live trace file ollama's `thinking` deltas
+/// do; plain `delta.content` accumulates into the final answer. Usage only
+/// arrives because `call()` set `stream_options.include_usage` on the
+/// request — without it most providers never send one in stream mode.
+fn handle_openai_stream(state: &mut AgentState, body: Value, response: reqwest::blocking::Response, source: &Value) -> Value {
+    let think_path = thinking_path(&state.agent_home, source);
+    let _ = std::fs::create_dir_all(think_path.parent().unwrap());
+
+    let abort_path = abort_flag_path(&state.agent_home);
+    let _ = std::fs::remove_file(&abort_path);
+
+    let mut full_content = String::new();
+    let mut full_thinking = String::new();
+    let mut input_tokens = 0u64;
+    let mut output_tokens = 0u64;
+    let mut aborted = false;
+
+    for line in BufReader::new(response).lines() {
+        let Ok(line) = line else { break };
+        let Some(data) = line.strip_prefix("data: ") else { continue };
+        if data == "[DONE]" {
+            break;
+        }
+        let Ok(chunk) = serde_json::from_str::<Value>(data) else { continue };
+
+        if let Some(delta) = chunk.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first()).and_then(|c| c.get("delta")) {
+            if let Some(c) = delta.get("content").and_then(|v| v.as_str()) {
+                full_content.push_str(c);
+            }
+            if let Some(t) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+                full_thinking.push_str(t);
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&think_path) {
+                    use std::io::Write as _;
+                    let _ = f.write_all(t.as_bytes());
+                }
+            }
+        }
+        if let Some(usage) = chunk.get("usage").filter(|u| !u.is_null()) {
+            input_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(input_tokens);
+            output_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(output_tokens);
+        }
+
+        if abort_path.exists() {
+            let _ = std::fs::remove_file(&abort_path);
+            aborted = true;
+            break;
+        }
+    }
+
+    write_transcript(
+        state,
+        &body,
+        &serde_json::json!({
+            "choices": [{"message": {"content": full_content, "reasoning_content": full_thinking}}],
+            "usage": {"prompt_tokens": input_tokens, "completion_tokens": output_tokens},
+            "aborted": aborted,
+        }),
+        source,
+    );
+
+    if aborted {
+        return error_json("aborted", "generation cancelled by operator");
+    }
+
+    record_usage(state, input_tokens, output_tokens, source);
+    ok_json(serde_json::json!({
+        "text": full_content,
+        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+    }))
+}
+
+/// Reads Anthropic's SSE stream — event type lives in each `data: {...}`
+/// line's own `"type"` field (the redundant top-level `event: <type>` line
+/// is ignored, standard practice for SSE clients). `content_block_delta`
+/// carries either a `text_delta` (final answer) or a `thinking_delta`
+/// (extended thinking, when enabled) — the latter goes to the same live
+/// trace file as the other two providers'. `message_start`/`message_delta`
+/// carry input/output token counts respectively (Anthropic reports them in
+/// two separate events, not one final usage object like the other two).
+fn handle_anthropic_stream(state: &mut AgentState, body: Value, response: reqwest::blocking::Response, source: &Value) -> Value {
+    let think_path = thinking_path(&state.agent_home, source);
+    let _ = std::fs::create_dir_all(think_path.parent().unwrap());
+
+    let abort_path = abort_flag_path(&state.agent_home);
+    let _ = std::fs::remove_file(&abort_path);
+
+    let mut full_content = String::new();
+    let mut full_thinking = String::new();
+    let mut input_tokens = 0u64;
+    let mut output_tokens = 0u64;
+    let mut aborted = false;
+
+    for line in BufReader::new(response).lines() {
+        let Ok(line) = line else { break };
+        let Some(data) = line.strip_prefix("data: ") else { continue };
+        let Ok(chunk) = serde_json::from_str::<Value>(data) else { continue };
+
+        match chunk.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            "message_start" => {
+                input_tokens = chunk
+                    .get("message")
+                    .and_then(|m| m.get("usage"))
+                    .and_then(|u| u.get("input_tokens"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+            }
+            "content_block_delta" => {
+                if let Some(delta) = chunk.get("delta") {
+                    if let Some(t) = delta.get("text").and_then(|v| v.as_str()) {
+                        full_content.push_str(t);
+                    }
+                    if let Some(t) = delta.get("thinking").and_then(|v| v.as_str()) {
+                        full_thinking.push_str(t);
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&think_path) {
+                            use std::io::Write as _;
+                            let _ = f.write_all(t.as_bytes());
+                        }
+                    }
+                }
+            }
+            "message_delta" => {
+                output_tokens = chunk.get("usage").and_then(|u| u.get("output_tokens")).and_then(|v| v.as_u64()).unwrap_or(output_tokens);
+            }
+            _ => {}
+        }
+
+        if abort_path.exists() {
+            let _ = std::fs::remove_file(&abort_path);
+            aborted = true;
+            break;
+        }
+    }
+
+    write_transcript(
+        state,
+        &body,
+        &serde_json::json!({
+            "content": [{"type": "text", "text": full_content}],
+            "thinking": full_thinking,
+            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+            "aborted": aborted,
+        }),
+        source,
+    );
+
+    if aborted {
+        return error_json("aborted", "generation cancelled by operator");
+    }
+
+    record_usage(state, input_tokens, output_tokens, source);
+    ok_json(serde_json::json!({
+        "text": full_content,
+        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+    }))
+}
+
 fn record_usage(state: &mut AgentState, input_tokens: u64, output_tokens: u64, source: &Value) {
     let total_tokens = input_tokens + output_tokens;
     if let Err(e) = state.budget.record(total_tokens) {
@@ -387,7 +522,8 @@ fn record_usage(state: &mut AgentState, input_tokens: u64, output_tokens: u64, s
 fn normalize_for_anthropic(body: &mut Value) {
     let Value::Object(map) = body else { return };
     map.entry("max_tokens").or_insert(Value::from(1024));
-    map.remove("stream");
+    // `stream` stays as `call()` set it (true) — Anthropic streams now too,
+    // see `handle_anthropic_stream`
 
     let Some(Value::Array(messages)) = map.get_mut("messages") else {
         return;

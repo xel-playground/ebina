@@ -327,6 +327,24 @@ http_per_domain_per_min = 10   # 對外禮貌,防同站連打被 ban IP
 - [ ] 測試:secret 用在未綁定 domain → 拒絕(domain 綁定機制延後,無法測)
 - [x]→removed 測試:`exec_wasm` 跑通(用純 WASI 測試二進位而非真裝 jq.wasm)、工具讀不到 `memory/`——`exec_wasm` 回退後這兩個測試也一起刪了;`http_fetch` 打 `192.168.x.x`/`127.0.0.1`/`169.254.169.254` 全被拒(這條還在)
 
+### Phase 6 — 品質債(2026-07-09 assessment,今天一天連續修出至少 6 個實際 bug 後補記)
+- [ ] `agent/` crate 補單元測試——目前 `agent/src/*.rs` **零測試**,今天改動最密集的
+      `agent_loop.rs`(`recent_log_entries`/`write_memory_note`/llm_call 失敗重試邏輯)全靠手動跑
+      live server 驗證。`kernel/` 有 23 個 test 撐著,`agent/` 這邊裸奔——優先度最高,今天的 bug
+      密度就是訊號
+- [ ] `cli/`(`ebinactl`)補測試——目前零測試
+- [ ] `PROJECT.md` 同步實際程式碼:仍寫著已移除的 `memory_get`/`memory_set`、`http_fetch`(已改名
+      `http_get`)、沒提 `ebinactl`/`http_get` HTML 自動抽字/`daily_maintenance` 改 6 小時循環等
+- [ ] LLM provider 單點依賴——目前只有一個 provider,該 provider 掛掉會連鎖影響
+      daily_maintenance/cron 等背景喚醒(今天 Moonshot 斷線就是活生生案例);評估要不要 fallback
+      provider,或至少現況接受、記錄下來當已知限制
+- [ ] 單一 run 內沒有主動式 context 監控/壓縮——目前只有「source 端防堵」(`http_get`
+      `response_max_bytes` cap + HTML 抽字)擋單點爆量,跟「run 與 run 之間」的被動 compact
+      (`[chat] auto_compact_tokens`,session 累積超過門檻下次訊息才觸發)。真正缺的是第三種:
+      單一 run 的 turn loop 中途邊估算邊主動壓縮/摘要(像 Claude Code 那樣),現在完全沒有——
+      多個中型 tool result 在同一個 run 裡疊加、沒有單一來源大到觸發 cap,一樣有機會累積爆表。
+      優先度低於補測試,但值得記錄
+
 ### 未來糖果罐(延後)
 - [ ] **Agent 互通(A2A,actor model)**:設計已定——新 syscall `send_agent(target, msg)`,kernel **複製**訊息至對方 `inbox/from-<sender>/` 並喚醒;不共享任何目錄,Store 間零接觸;通訊拓撲在 kernel config 逐條宣告(capability),未宣告組合拒絕;訊息全經 kernel = 全量 A2A log,gateway 可視化對話圖。支援監督者模式、互相 review 等玩法;新 agent = 新資料夾 + 一行拓撲
 - [ ] 多 agent 基礎(每 agent 一個 Store + 資料夾,scheduler 泛化)

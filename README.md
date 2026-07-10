@@ -11,81 +11,202 @@ Toy microkernel agent OS. See [PROJECT.md](PROJECT.md) for full design/TODO.
 - `webui/` — the gateway's web UI: a fully independent Vite + Vue project.
   Nothing wires it to `kernel/` except both talking to the same `/api/*` HTTP
   surface — no shared code, no build-time embedding, no runtime static-file
-  serving from the kernel side. Run them separately (see below); a wrapper
-  that starts both together with one command doesn't exist yet.
-- `tmp/agent-home/` — an agent's whole world (config, memory, workspace, logs); gitignored
-- `tmp/secrets.toml` — API keys, lives *outside* agent-home so the sandboxed guest can never read it
+  serving from the kernel side.
+- `cli/` (`ebinactl`) — the actual entry point for running an agent day to
+  day: scaffolds a fresh agent (`agent init`), starts the gateway + webui
+  together behind one port (`agent run`), and spins up local Docker deps
+  for `[embed]`/`[search]`/`[ssh]` (`local-deps start`). Depends on `kernel`
+  as a library; deliberately never touches `kernel`'s own CLI/`main.rs`.
+  `agent.wasm` and the built `webui/dist/` are embedded into the `ebinactl`
+  binary itself at compile time (`cli/src/embedded.rs`) — `init` writes them
+  out, no separate build/copy step for a human running it.
+- an **`ebinactl` workspace** (e.g. `./ebina`, or `tmp/main` in this repo's
+  own dev/test setup) — the container a running agent actually lives in:
+  `<workspace>/agent-home/` (the sandboxed guest root: config, memory,
+  workspace, logs), plus host-only siblings `<workspace>/secrets.toml`,
+  `<workspace>/.git` (autocommit history), `<workspace>/agent.wasm`,
+  `<workspace>/webui/`. One workspace = one self-contained agent; nothing
+  inside it ever depends on where `ebinactl` itself was built or run from.
 
-## Build
+## Architecture
+
+Core idea: **full autonomy inside the sandbox, a minimal boundary around
+it.** The security boundary is the wasmtime `Store` boundary — not content
+filtering, not a permissions list the model has to respect, just "the guest
+physically cannot call anything except what's wired up as a syscall."
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│ ebinactl (CLI) — agent init / agent run / local-deps               │
+│  spawns the gateway, serves webui/, reverse-proxies /api/*         │
+└──────────────────────────────┬─────────────────────────────────────┘
+                                │
+┌───────────────────────────────▼─────────────────────────────────────┐
+│ kernel (host, Rust)                                                   │
+│                                                                        │
+│  ┌─────────────┐   ┌───────────────┐   ┌────────────────────────┐   │
+│  │ Gateway      │   │ Scheduler      │   │ Syscall dispatch        │   │
+│  │ (axum)       │   │ (30s tick:     │   │ llm_call · embed        │   │
+│  │ webui API,   │   │  cron ·        │   │ db_exec (RAG engine —   │   │
+│  │ SSE, grants  │   │  daily_        │   │  only agent/src/        │   │
+│  │ (tofu domain)│   │  maintenance · │   │  memory.rs calls this,  │   │
+│  │              │   │  scheduled_    │   │  no guest action        │   │
+│  │              │   │  task)         │   │  reaches it directly)   │   │
+│  └──────┬───────┘   └───────┬────────┘   │ http_get (GET-only) ·   │   │
+│         │ one trigger        │            │  search_web · ssh_exec  │   │
+│         │ at a time           │            │ notify · chat_send      │   │
+│         │ (run_lock)          │            │ sleep_until ·           │   │
+│         └──────────┬──────────┘            │  schedule_task family   │   │
+│                     ▼                       └────────────┬─────────────┘
+│         ┌─────────────────────────────────────────────────┐          │
+│         │ wasmtime Store — fresh instantiate every single   │          │
+│         │ run, zero state carried over in-process            │          │
+│         │ fuel/epoch limit · memory cap · empty env ·         │          │
+│         │ stdio → log                                          │        │
+│         │  ┌──────────────────────────────────────────────┐   │        │
+│         │  │ agent.wasm — the *only* code that can ever      │   │        │
+│         │  │ emit a syscall                                  │   │        │
+│         │  └──────────────────────────────────────────────┘   │        │
+│         └────────────────────────┬────────────────────────────┘        │
+│                                   │ WASI preopen                        │
+│         ┌─────────────────────────▼───────────────────────────┐        │
+│         │ agent-home/ — the entire "/" the guest can see         │      │
+│         │  config.toml · SOUL.md · memory/(notes, skills,        │      │
+│         │  index.db) · workspace/ · scheduler/ · logs/            │      │
+│         └───────────────────────────────────────────────────────┘      │
+└────────────────────────────────┬────────────────────────────────────────┘
+              ┌───────────────────┼──────────────────┬─────────────────┐
+              │ HTTPS (API key)   │ HTTPS (GET-only)  │ SSH (one fixed  │
+              ▼                   ▼                   │  target, no pty)│
+        LLM / embed API     open internet (read-only)  ▼
+                                                   docker/VM — the one
+                                                   syscall here with no
+                                                   pre-approval gate at all
+```
+
+**Every run is stateless in-process, persistent on disk.** Each trigger
+(`message`/`cron`/`daily_maintenance`/`scheduled_task`/`manual`) gets a
+brand-new wasmtime instantiation — nothing survives in memory between runs.
+What *does* persist is entirely on the filesystem, under `agent-home/`:
+`memory/notes/` (RAG-searched curated facts + a raw per-run log, see
+[Memory](#memory-memorynotes-rag--daily_maintenance) below),
+`logs/chat_sessions/<key>/session.json` (per-surface conversation history —
+webui and each Discord DM/channel get their own key), `scheduler/` (cron
+jobs the agent set up for itself), and `logs/*.jsonl` (egress, SSH,
+notifications, LLM transcripts — full audit trail, nothing silently
+dropped).
+
+**Syscalls are the entire capability surface** — 12 of them
+(`llm_call`, `embed`, `db_exec`, `http_get`, `search_web`, `ssh_exec`,
+`notify`, `chat_send`, `sleep_until`, `schedule_task`/`update_task`/
+`delete_task`), dispatched from one match statement
+(`kernel/src/syscalls/mod.rs`). Each caps a specific kind of harm rather
+than trying to sandbox arbitrary behavior: `http_get` is structurally
+GET-only (no `method` field exists in its request shape at all, so there's
+nothing to route a write through even if the model tried), `db_exec` is
+never reachable from a guest action at all (only the host-side RAG engine
+calls it), `ssh_exec` is the one deliberate exception — a fixed,
+human-configured target with no pre-approval gate, because an equivalent
+capability (arbitrary command execution) existing ungated *somewhere* made
+gating a second, weaker path to the same place pure friction rather than
+real containment.
+
+**Trust boundary, not a content filter**: nothing here scans `http_get`
+results or tool output for prompt injection. The bet is a narrow boundary
+(no writes without a human-fixed target, no filesystem access outside
+agent-home, no arbitrary network reach) beats trying to detect malicious
+instructions in arbitrary text — read [Web fetch](#web-fetch-http_get-syscall)'s
+"untrusted content from the open internet, same as a tool's stdout" framing
+for how the agent itself is told to treat it.
+
+## Quick start (`ebinactl`)
+
+This is the normal way to run an agent — build once, then everything else
+is one binary:
 
 ```bash
 cargo build -p kernel
-cd agent && cargo build --target wasm32-wasip1
-cd webui && npm install && npm run build   # produces webui/dist/
+cargo build -p agent --target wasm32-wasip1 --release
+cd webui && npm install && npm run build && cd ..   # produces webui/dist/
+cargo build -p ebinactl   # embeds the wasm + webui build from the two steps above
 ```
 
-## Running
-
-One-off CLI run (mainly for dev/testing):
-
 ```bash
-AGENT_HOME=tmp/agent-home cargo run -p kernel -- target/wasm32-wasip1/debug/agent.wasm run '{"type":"manual","text":"..."}'
+./target/debug/ebinactl agent init ./ebina        # scaffolds ./ebina/agent-home, generates gateway_token + an ssh keypair
+./target/debug/ebinactl local-deps start ./ebina   # optional: Ollama (embed) + SearXNG (search) + an ssh_exec target, docker compose
+# edit ./ebina/agent-home/config.toml's [llm] section + add the matching key
+# to ./ebina/secrets.toml — the one thing local-deps can't provide for you
+./target/debug/ebinactl agent run ./ebina          # gateway + webui on one port (default 8080)
 ```
 
-Gateway API (chat/status/notes/skills/grants/config/secrets/logs — no UI, just `/api/*`):
+`agent run` moves the raw gateway to `port + 1` and serves the webui (static
+files + a reverse proxy to `/api/*`) on the public `--port` — one origin, no
+CORS, matches how the Vite dev proxy behaves. If `<workspace>/webui/` isn't
+there (or was never written), it just serves the bare `/api/*` gateway on
+`--port` directly. See `ebinactl --help` / `ebinactl agent --help` for every
+flag (`--wasm`, `--webui`, `--port`, workspace defaults to `./ebina`).
+
+The gateway's login token is **not** an env var — it's the `gateway_token`
+entry `agent init` generates in `<workspace>/secrets.toml` (kernel refuses to
+start without one).
+
+### `local-deps` — Docker-hosted `[embed]`/`[search]`/`[ssh]`
 
 ```bash
-export AGENT_HOME=tmp/agent-home
-export AGENT_WASM=target/wasm32-wasip1/debug/agent.wasm
-export GATEWAY_PORT=8099
-cargo run -p kernel -- serve
+./target/debug/ebinactl local-deps start ./ebina   # docker compose up -d + pull/warm the embed model
+./target/debug/ebinactl local-deps stop ./ebina    # docker compose down
 ```
 
-The gateway's login token is **not** an env var — it must be a `gateway_token`
-entry in `tmp/secrets.toml` (kernel refuses to start without one).
+Writes `<workspace>/docker-compose.yml` if missing (edit it freely after —
+never overwritten once it exists) and shells out to `docker compose`. Three
+services (`ollama`, `searxng`, `ssh-target`), pre-wired to exactly match
+`agent init`'s starter `config.toml` so there's nothing to edit after
+running this — `[embed]`/`[search]`/`[ssh]` just work.
 
-**Real frontend/backend split** (PROJECT.md §4.4 note — this reverses an
-earlier "single embedded HTML file, no build step" decision, and then goes
-further at the user's explicit request: the kernel doesn't even serve
-`webui/dist/` as static files anymore — it used to, via `tower-http`'s
-`ServeDir`, and that coupling was deliberately removed too). Run both
-separately — there's no single command that starts both yet:
+Never invoked by anything else in this CLI automatically — starting
+containers is a real, visible host action (ports, processes, disk for
+images/volumes), so it only happens when a human explicitly runs this
+command. Requires Docker + the `compose` plugin (`docker compose version`);
+not installed for you.
+
+### Manual / dev (no `ebinactl`)
+
+Still works, and is what `ebinactl agent run` does under the hood — useful
+for iterating on `kernel`/`webui` themselves without rebuilding the CLI:
 
 ```bash
-# terminal 1 — the gateway
-cargo run -p kernel -- serve
+# terminal 1 — the gateway only
+AGENT_HOME=tmp/main/agent-home AGENT_WASM=target/wasm32-wasip1/debug/agent.wasm GATEWAY_PORT=8099 cargo run -p kernel -- serve
 
 # terminal 2 — Vite dev server on :5173, proxies /api to localhost:8099
 # (see webui/vite.config.js) so the browser only ever talks to one origin
 cd webui && npm run dev
 ```
 
-For a built, non-dev frontend (`npm run build` → `webui/dist/`), you need
-your own static file server pointed at that directory (`npx serve dist`,
-`python3 -m http.server`, etc.) — the kernel won't do it, and without a dev
-proxy in front, cross-origin requests from that server's port to the
-kernel's port need CORS or a reverse proxy in between. Neither exists yet;
-a wrapper tying kernel + built webui together into one command is planned
-but not built.
+One-off single trigger, no gateway (mainly for dev/testing):
+
+```bash
+AGENT_HOME=tmp/main/agent-home cargo run -p kernel -- target/wasm32-wasip1/debug/agent.wasm run '{"type":"manual","text":"..."}'
+```
 
 ## Credentials
 
-`tmp/agent-home/config.toml` never holds a literal API key — it lives inside
+`<workspace>/agent-home/config.toml` never holds a literal API key — it lives inside
 agent-home, which the guest reads to build its own prompt. Instead:
 
 ```toml
 [llm]
-api_key = "{secrets.ollama}"   # name of an entry in tmp/secrets.toml
+api_key = "{secrets.ollama}"   # name of an entry in <workspace>/secrets.toml
 ```
 
 ```toml
-# tmp/secrets.toml
+# <workspace>/secrets.toml
 ollama = "the-real-key"
 ```
 
 ## Persona (`SOUL.md`)
 
-`tmp/agent-home/SOUL.md` — free-form markdown, no required shape (persona,
+`<workspace>/agent-home/SOUL.md` — free-form markdown, no required shape (persona,
 values, tone, whatever). If present, it's included **in full** in every
 system prompt (unlike skills, which are progressive-disclosure: name +
 description until asked for). No dedicated action for it — the agent reads
@@ -93,6 +214,29 @@ and edits it with the same `read_file`/`write_file` actions it uses for
 anything else at `/SOUL.md`; a human can do the same via `GET`/`POST
 /api/soul` (raw text, same shape as `/api/config`) or the webui's Soul tab.
 It's fine for the file not to exist yet.
+
+## Memory (`memory/notes/` RAG + `daily_maintenance`)
+
+Two layers, deliberately kept separate:
+
+- **Curated notes** — `memory/notes/*.md` (one topic per file, e.g.
+  `pet.md`), written by the agent via `write_file`/`append_file`. These are
+  the only thing embedded and searched (`hybrid_search` — BM25 + cosine
+  similarity, reciprocal rank fusion) every turn.
+- **The raw daily log** — `memory/notes/<date>/log.md`, one entry per
+  *every* run (any trigger type, success or abort), written automatically —
+  never embedded/searched. Embedding it once meant an old, since-corrected
+  fact stayed permanently retrievable (a user message quoting wrong data
+  while correcting it, indexed verbatim) and, in a small note corpus, log
+  entries drowned out anything actually relevant.
+
+`daily_maintenance` is what bridges the two: a built-in self-driven wake,
+now on a 6-hour cycle (not once/day), reviewing only what's new since its
+own last successful run (`since_ts`, tracked in
+`memory/maintenance_reports/.last_run` — a run that hard-aborts does *not*
+advance this, so a transient failure can't silently skip a whole window)
+and distilling anything worth keeping into the curated notes above. One
+report per run lands in `memory/maintenance_reports/<date>_<HHMM>.md`.
 
 ## LLM / embed providers
 
@@ -130,7 +274,7 @@ mkdir -p ~/.local/ollama && zstd -d /tmp/ollama.tar.zst -c | tar -x -C ~/.local/
 ~/.local/ollama/bin/ollama pull nomic-embed-text
 ```
 
-Then in `tmp/agent-home/config.toml`:
+Then in `<workspace>/agent-home/config.toml`:
 
 ```toml
 [embed]
@@ -174,6 +318,10 @@ untrusted code that needs isolating:
   directories included
 - `{"action":"delete_path","path":"...","recursive":false}` — removes a
   file; a directory needs `"recursive":true` or it's refused
+- `{"action":"append_file","path":"...","content":"..."}` — appends instead
+  of overwriting (creating the file if missing); for a growing log/report
+  file so the agent isn't forced to `read_file` the whole thing back just to
+  add one entry
 
 ## SSH (`ssh_exec` syscall)
 
@@ -188,17 +336,17 @@ disposable dev container, not anything holding data you care about).
 **Setup**:
 
 ```toml
-# agent-home/config.toml
+# <workspace>/agent-home/config.toml
 [ssh]
 host = "192.168.1.50"
 port = 22
 user = "dev"
-timeout_secs = 30        # hard wall-clock cap per command, see below
-max_output_bytes = 65536 # combined stdout+stderr cap
+timeout_secs = 30          # hard wall-clock cap per command, see below
+max_output_bytes = 3145728 # combined stdout+stderr cap; default shown (3MB), all fields optional/overridable
 ```
 
 ```toml
-# tmp/secrets.toml — private key file lives on disk outside agent-home;
+# <workspace>/secrets.toml — private key file lives on disk outside agent-home;
 # only its *path* is a secret here, never the key bytes themselves
 ssh_key_path = "/home/you/.ssh/id_ed25519"
 ssh_key_passphrase = "only if the key needs one"
@@ -224,6 +372,25 @@ itself. `timeout_secs` is a hard wall-clock deadline checked on every read,
 independent of whether the command is still actively producing output — it
 returns `{"timed_out": true}` with whatever partial output was captured
 rather than hanging.
+
+## Web fetch (`http_get` syscall)
+
+GET-only — no `method` field exists in the action shape at all, so there's
+nothing to even try making a write with (writes used to route through here
+behind an approval queue; removed once `ssh_exec` existed as an *ungated*
+way to do the exact same thing, which made the gate here friction rather
+than containment). Guards: denylists private/loopback/link-local/metadata
+IPs (checked post-DNS-resolution, pinned against rebinding), every request
+logged in full regardless of outcome, gated by `[network] get_mode`
+(`"open"` default / `"tofu"` — new domain needs one-time approval / `"allowlist"`).
+
+An HTML response (by `Content-Type`, or sniffed if that header's missing)
+comes back as **extracted text**, not raw markup — `<script>`/`<style>`
+blocks and all tags stripped, common entities decoded. Raw HTML is mostly
+markup/JS/CSS noise; a plain blog page came back at 400KB+ of it once and
+alone blew a single `llm_call` past its model's token limit. The body is
+also hard-capped at `[network] response_max_bytes` (default 3MB) regardless
+of content type — a marker at the end says so if it got cut.
 
 ## Web search (`search_web` syscall)
 
@@ -260,7 +427,7 @@ docker run -d --name ebina-searxng \
   searxng/searxng:latest
 ```
 
-Then in `tmp/agent-home/config.toml`:
+Then in `<workspace>/agent-home/config.toml`:
 
 ```toml
 [search]
@@ -272,7 +439,7 @@ max_results = 5
 No `api_key` needed for `searxng` (the field is ignored for that provider,
 but must still resolve if you *do* set it — omit it entirely). For `tavily`,
 set `provider = "tavily"` and `api_key = "{secrets.tavily}"` with a matching
-entry in `tmp/secrets.toml`.
+entry in `<workspace>/secrets.toml`.
 
 **Why bind to `127.0.0.1` and not `0.0.0.0`**: the container has no auth of
 its own — anything that can reach the port can query (and, on some
@@ -299,7 +466,7 @@ gateway runs exactly as without it.
 4. Add the token to the vault:
 
 ```toml
-# tmp/secrets.toml
+# <workspace>/secrets.toml
 discord_bot_token = "the-real-bot-token"
 ```
 

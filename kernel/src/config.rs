@@ -14,6 +14,7 @@ pub struct Config {
     pub chat: ChatConfig,
     pub disk: DiskConfig,
     pub ssh: SshConfig,
+    pub runtime: RuntimeConfig,
 }
 
 impl Default for Config {
@@ -29,6 +30,7 @@ impl Default for Config {
             chat: ChatConfig::default(),
             disk: DiskConfig::default(),
             ssh: SshConfig::default(),
+            runtime: RuntimeConfig::default(),
         }
     }
 }
@@ -174,6 +176,12 @@ pub struct NetworkConfig {
     pub url_max_len: usize,
     pub daily_request_cap: u64,
     pub allowlist: Vec<String>,
+    /// `http_get`'s response body had no cap at all until a plain blog page
+    /// (raw HTML — scripts, styles, all of it) came back at 400KB+ and blew
+    /// a single `llm_call` past its 262144-token model limit two such pages
+    /// in one run was enough. This truncates the body before it ever
+    /// becomes a tool-result message.
+    pub response_max_bytes: usize,
 }
 
 impl Default for NetworkConfig {
@@ -183,6 +191,7 @@ impl Default for NetworkConfig {
             url_max_len: 2048,
             daily_request_cap: 500,
             allowlist: Vec::new(),
+            response_max_bytes: 100_000,
         }
     }
 }
@@ -198,6 +207,28 @@ impl Default for DbConfig {
         DbConfig {
             query_timeout_secs: 10,
         }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(default)]
+pub struct RuntimeConfig {
+    /// wasmtime epoch-interruption deadline for one *whole run* (every turn
+    /// combined, not a per-step limit) — a genuinely stuck guest (infinite
+    /// loop, no host calls at all) traps at this deadline instead of
+    /// hanging the gateway forever. A well-behaved multi-turn task (several
+    /// `http_get`/`llm_call` round-trips — e.g. a report pulling from a few
+    /// RSS sources) can legitimately run long, so this needs real headroom:
+    /// a run that hits this trap mid-turn is silently discarded — whatever
+    /// the guest was about to do (even something already decided, like a
+    /// `chat_send` the model had already committed to) never happens, with
+    /// nothing written to disk from that point on.
+    pub epoch_timeout_secs: u64,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        RuntimeConfig { epoch_timeout_secs: 30 * 60 }
     }
 }
 
@@ -243,7 +274,7 @@ pub struct SshConfig {
 
 impl Default for SshConfig {
     fn default() -> Self {
-        SshConfig { host: String::new(), port: 22, user: "root".to_string(), timeout_secs: 30, max_output_bytes: 65_536 }
+        SshConfig { host: String::new(), port: 22, user: "root".to_string(), timeout_secs: 30, max_output_bytes: 3 * 1024 * 1024 }
     }
 }
 

@@ -102,13 +102,116 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
         }
     };
     let status = response.status().as_u16();
+    let content_type = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).map(str::to_string);
     let body_text = response.text().unwrap_or_default();
     let redacted = redact_secrets(&state.secrets, &body_text);
-
+    // logged against the actual bytes received over the wire, before any
+    // stripping/truncation below touches what's handed back to the agent
     log_egress(state, url_str, &host, Some(redacted.len()), None, &source);
     let _ = state.http_daily.record(1);
 
-    ok_json(serde_json::json!({"status": status, "body": redacted}))
+    let content = if looks_like_html(content_type.as_deref(), &redacted) { strip_html_tags(&redacted) } else { redacted };
+    let body = truncate_bytes(&content, state.config.network.response_max_bytes);
+
+    ok_json(serde_json::json!({"status": status, "body": body}))
+}
+
+fn looks_like_html(content_type: Option<&str>, body: &str) -> bool {
+    if let Some(ct) = content_type {
+        return ct.contains("text/html");
+    }
+    // no/ambiguous content-type header — sniff the start of the body
+    let head = ascii_lowercase_same_len(&body.chars().take(200).collect::<String>());
+    head.contains("<!doctype html") || head.contains("<html")
+}
+
+/// Lowercases only ASCII letters, leaving every other char (byte-width and
+/// all) untouched — unlike `str::to_lowercase`, this can never change the
+/// string's byte length (some Unicode chars expand under real lowercasing),
+/// so byte offsets found in the result stay valid to slice the original
+/// string with. Only used to case-insensitively search for ASCII markers
+/// (`<script`, `<style`, `<!doctype html`) in possibly-non-ASCII HTML.
+fn ascii_lowercase_same_len(s: &str) -> String {
+    s.chars().map(|c| if c.is_ascii_uppercase() { c.to_ascii_lowercase() } else { c }).collect()
+}
+
+/// Strips `<script>`/`<style>` blocks (content included) and every
+/// remaining tag, leaving just text — raw HTML is mostly markup/JS/CSS
+/// noise the model never asked for; this keeps far more actual *content*
+/// per byte than blind truncation alone would (`truncate_bytes` still runs
+/// after this, as a backstop on genuinely huge pages). Not a real parser —
+/// good enough for "readable text for an LLM", not for anything that needs
+/// exact HTML semantics.
+fn strip_html_tags(html: &str) -> String {
+    let no_scripts = remove_tag_blocks(html, "<script", "</script>");
+    let no_styles = remove_tag_blocks(&no_scripts, "<style", "</style>");
+
+    let mut out = String::with_capacity(no_styles.len() / 2);
+    let mut in_tag = false;
+    for c in no_styles.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+
+    decode_entities(&collapse_whitespace(&out))
+}
+
+fn remove_tag_blocks(s: &str, start: &str, end: &str) -> String {
+    let lower = ascii_lowercase_same_len(s); // same byte offsets as `s`
+    let mut out = String::with_capacity(s.len());
+    let mut pos = 0;
+    loop {
+        let Some(start_rel) = lower[pos..].find(start) else {
+            out.push_str(&s[pos..]);
+            break;
+        };
+        let start_idx = pos + start_rel;
+        out.push_str(&s[pos..start_idx]);
+        let Some(end_rel) = lower[start_idx..].find(end) else {
+            break; // unterminated block — drop the rest rather than guess
+        };
+        pos = start_idx + end_rel + end.len();
+    }
+    out
+}
+
+fn collapse_whitespace(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_was_space = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !last_was_space {
+                out.push(' ');
+            }
+            last_was_space = true;
+        } else {
+            out.push(c);
+            last_was_space = false;
+        }
+    }
+    out
+}
+
+fn decode_entities(s: &str) -> String {
+    s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'").replace("&nbsp;", " ")
+}
+
+/// Truncates at a UTF-8 char boundary at or before `max_bytes` — a plain
+/// byte-index slice can land mid-codepoint on non-ASCII content (this
+/// project's primary chat language is CJK) and panic.
+fn truncate_bytes(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n\n...[truncated: response was {} bytes, kept first {}]", &s[..end], s.len(), end)
 }
 
 fn rate_limited_json(limited: &crate::ratelimit::RateLimited) -> Value {
@@ -186,4 +289,40 @@ fn redact_secrets(secrets: &crate::secrets::Secrets, body: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod strip_tests {
+    use super::*;
+
+    #[test]
+    fn strips_scripts_styles_and_tags_keeping_text() {
+        let html = r#"<!DOCTYPE html><html><head><style>body{color:red}</style>
+            <script>fetch('/evil').then(x=>console.log(x))</script></head>
+            <body><h1>Hello &amp; welcome</h1><p>Some   text   here.</p></body></html>"#;
+        let out = strip_html_tags(html);
+        assert!(!out.contains("color:red"));
+        assert!(!out.contains("console.log"));
+        assert!(!out.contains('<'));
+        assert!(out.contains("Hello & welcome"));
+        assert!(out.contains("Some text here."));
+    }
+
+    #[test]
+    fn looks_like_html_prefers_content_type_over_sniffing() {
+        assert!(looks_like_html(Some("text/html; charset=utf-8"), "not html at all"));
+        assert!(!looks_like_html(Some("application/json"), "<html>tricky</html>"));
+        assert!(looks_like_html(None, "<!DOCTYPE html><html>...</html>"));
+        assert!(!looks_like_html(None, "{\"just\":\"json\"}"));
+    }
+
+    #[test]
+    fn truncate_bytes_never_splits_a_utf8_char() {
+        // 3 bytes/char — a byte cap landing mid-character (100 isn't a
+        // multiple of 3) is exactly the case that panics without the
+        // char-boundary walk-back in `truncate_bytes`
+        let s = "早".repeat(1000);
+        let out = truncate_bytes(&s, 100); // must not panic
+        assert!(out.starts_with("早早早"));
+    }
 }

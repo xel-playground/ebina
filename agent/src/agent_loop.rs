@@ -76,6 +76,7 @@ pub fn run(trigger: &Value) {
 
     let mut summary = String::new();
     let mut last_input_tokens: Option<u64> = None;
+    let mut consecutive_llm_failures: u32 = 0;
     for turn in 0..MAX_TURNS {
         // tags every `syscall::call`/`perf::record` from here on with this
         // turn number, so `/logs/performance.jsonl` lines can be grouped
@@ -124,10 +125,37 @@ pub fn run(trigger: &Value) {
 
         if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
             let err = resp.get("error").cloned().unwrap_or(Value::Null);
-            summary = format!("run aborted: llm_call failed: {err}");
-            let _ = syscall::call("notify", &serde_json::json!({"message": summary}));
-            break;
+            consecutive_llm_failures += 1;
+            // most `llm_call` failures are transient (network_error,
+            // rate_limited, a momentary 5xx) — one hard-aborting the whole
+            // run on the first hit meant a single blip threw away every
+            // turn of progress already made. Give it a few tries with the
+            // error visible in context (same "append to the last message
+            // instead of pushing a new one" trick as the memory-refresh
+            // block above, to never put two same-role messages back to
+            // back) before actually giving up — a token-limit-exceeded
+            // error won't recover by retrying the identical request, but
+            // this cap keeps that case bounded rather than silently
+            // burning all of `MAX_TURNS` on it.
+            const MAX_CONSECUTIVE_LLM_FAILURES: u32 = 3;
+            if consecutive_llm_failures >= MAX_CONSECUTIVE_LLM_FAILURES {
+                summary = format!("run aborted: llm_call failed {consecutive_llm_failures}x in a row: {err}");
+                let _ = syscall::call("notify", &serde_json::json!({"message": summary}));
+                break;
+            }
+            trace(&think_path, &format!("[turn {}] ✗ llm_call failed ({err}), retrying ({consecutive_llm_failures}/{MAX_CONSECUTIVE_LLM_FAILURES})", turn + 1));
+            let note = format!("[llm_call failed: {err} — retrying]");
+            match messages.last_mut() {
+                Some(Value::Object(map)) if matches!(map.get("content"), Some(Value::String(_))) => {
+                    if let Some(Value::String(content)) = map.get_mut("content") {
+                        content.push_str(&format!("\n\n{note}"));
+                    }
+                }
+                _ => messages.push(serde_json::json!({"role": "user", "content": note})),
+            }
+            continue;
         }
+        consecutive_llm_failures = 0;
         last_input_tokens = resp
             .get("result")
             .and_then(|r| r.get("usage"))
@@ -189,15 +217,31 @@ pub fn run(trigger: &Value) {
                 };
                 push_tool_result(&mut messages, &result);
             }
-            Some("memory_get") => {
-                let key = action.get("key").and_then(|k| k.as_str()).unwrap_or("");
-                let result = syscall::call("memory_get", &serde_json::json!({"key": key}));
-                push_tool_result(&mut messages, &result);
-            }
-            Some("memory_set") => {
-                let key = action.get("key").and_then(|k| k.as_str()).unwrap_or("");
-                let value = action.get("value").and_then(|v| v.as_str()).unwrap_or("");
-                let result = syscall::call("memory_set", &serde_json::json!({"key": key, "value": value}));
+            Some("append_file") => {
+                // for a growing log/report file — `write_file` would need
+                // a `read_file` first to not clobber what's already there;
+                // this is one action instead of two, and doesn't round-trip
+                // the whole existing file through the model's context just
+                // to tack one more entry onto the end of it
+                let path = absolute_path(action.get("path").and_then(|p| p.as_str()).unwrap_or(""));
+                let content = action.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                let quota = disk_quota_bytes();
+                let projected = agent_home_size() + content.len() as u64;
+                let result = if projected > quota {
+                    let msg = format!(
+                        "disk quota exceeded: appending to {path} would bring agent-home to {projected} bytes, over the {quota}-byte cap — refused"
+                    );
+                    let _ = syscall::call("notify", &serde_json::json!({"message": msg}));
+                    serde_json::json!({"ok": false, "error": msg})
+                } else {
+                    if let Some(parent) = std::path::Path::new(&path).parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    match fs::OpenOptions::new().create(true).append(true).open(&path).and_then(|mut f| f.write_all(content.as_bytes())) {
+                        Ok(()) => serde_json::json!({"ok": true}),
+                        Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}),
+                    }
+                };
                 push_tool_result(&mut messages, &result);
             }
             Some("notify") => {
@@ -346,7 +390,7 @@ pub fn run(trigger: &Value) {
             _ => {
                 messages.push(serde_json::json!({
                     "role": "user",
-                    "content": "unrecognized `action` — use read_file/write_file/list_dir/make_dir/delete_path/memory_get/memory_set/notify/ssh_exec/request_external/done"
+                    "content": "unrecognized `action` — use read_file/write_file/append_file/list_dir/make_dir/delete_path/notify/ssh_exec/request_external/done"
                 }));
             }
         }
@@ -403,9 +447,38 @@ pub fn run(trigger: &Value) {
 /// Appends one line to the live-progress file cleared at the top of `run()`
 /// — best-effort, a failed write here shouldn't ever interrupt a real run.
 fn trace(path: &str, line: &str) {
+    // a leading newline only if the file doesn't already end with one —
+    // `llm_call.rs`'s stream handlers (ollama/openai/anthropic) append raw
+    // reasoning-token deltas to this same file with no guaranteed trailing
+    // newline (they're arbitrary partial-text chunks, not lines), so
+    // without this a trace line like `[turn 2] → ...` lands glued onto
+    // whatever reasoning text was streamed right before it. Unconditionally
+    // prepending one instead would add a pointless blank line between two
+    // consecutive `trace()` calls (e.g. each `[setup] memory[N]: ...` line),
+    // which already end in a newline from `writeln!` below.
+    let needs_leading_newline = !ends_with_newline(path);
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        if needs_leading_newline {
+            let _ = writeln!(f);
+        }
         let _ = writeln!(f, "{line}");
     }
+}
+
+fn ends_with_newline(path: &str) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = fs::File::open(path) else {
+        return true; // doesn't exist yet — nothing to separate from
+    };
+    let Ok(len) = f.metadata().map(|m| m.len()) else { return true };
+    if len == 0 {
+        return true;
+    }
+    if f.seek(SeekFrom::End(-1)).is_err() {
+        return true;
+    }
+    let mut last_byte = [0u8; 1];
+    f.read_exact(&mut last_byte).is_ok() && last_byte[0] == b'\n'
 }
 
 /// Keyed by session, same reasoning as `kernel/src/syscalls/llm_call.rs`
@@ -629,12 +702,13 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String]) -> String {
          directly as your plain message text, and nothing else. Respond with EXACTLY ONE JSON object per \
          turn — no other text before or after it. Valid actions:\n\n\
          - `{{\"action\":\"read_file\",\"path\":\"...\"}}`\n\
-         - `{{\"action\":\"write_file\",\"path\":\"...\",\"content\":\"...\"}}` — refused with a \
-         `disk quota exceeded` error (and a `notify`) if it would push agent-home over its total size cap\n\
-         - `{{\"action\":\"memory_get\",\"key\":\"...\"}}` — returns `{{\"value\":...}}` (null if unset); \
-         for a single exact fact you want back verbatim (a name, a preference, a counter) — no SQL, no \
-         schema\n\
-         - `{{\"action\":\"memory_set\",\"key\":\"...\",\"value\":\"...\"}}` — sets/overwrites one key\n\
+         - `{{\"action\":\"write_file\",\"path\":\"...\",\"content\":\"...\"}}` — overwrites the whole \
+         file; refused with a `disk quota exceeded` error (and a `notify`) if it would push agent-home \
+         over its total size cap\n\
+         - `{{\"action\":\"append_file\",\"path\":\"...\",\"content\":\"...\"}}` — appends to a file \
+         (creating it if missing) instead of overwriting it; use this for a growing log/report instead of \
+         `read_file` + `write_file` the whole thing back just to add one entry. Same quota check as \
+         `write_file`\n\
          - `{{\"action\":\"notify\",\"message\":\"...\"}}` — silent background log (Live log panel), nobody's \
          watching it live\n\
          - `{{\"action\":\"chat_send\",\"message\":\"...\",\"target\":\"webui\"}}` — proactively pushes one \
@@ -646,8 +720,11 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String]) -> String {
          for the code)\n\
          - `{{\"action\":\"http_get\",\"url\":\"...\"}}` — GET only, no `method` field exists for this \
          action at all; a brand-new domain under tofu mode queues for a human's approval and comes back as \
-         `pending_approval` — tell the user that instead of retrying immediately. For anything that writes \
-         (POST/PUT/webhooks/etc), use `ssh_exec` (e.g. `curl -X POST ...`) instead\n\
+         `pending_approval` — tell the user that instead of retrying immediately. An HTML response comes \
+         back as extracted text, not raw markup (scripts/styles/tags stripped) — don't expect to parse tags \
+         out of it yourself, and note it can still be truncated (a marker at the end says so) on a very long \
+         page. For anything that writes (POST/PUT/webhooks/etc), use `ssh_exec` (e.g. `curl -X POST ...`) \
+         instead\n\
          - `{{\"action\":\"search_web\",\"query\":\"...\"}}` — general web search, returns \
          `{{\"results\":[{{\"title\",\"url\",\"snippet\"}}]}}`; use this whenever you need current \
          information you don't already know (news, local businesses, prices, anything time-sensitive) \
@@ -793,11 +870,12 @@ fn reindex_if_markdown(path: &std::path::Path, embed_model: &str) -> bool {
 /// own system-prompt instructions tell it to review the day's logs) is
 /// exactly what blew a single run's input to 160k tokens. Just the trigger
 /// *type* plus a short text preview is enough to know what kind of run this
-/// was; `summary` is capped too (a generous cap, not the tight
-/// `TRACE_FIELD_MAX_CHARS` used for the live trace — this file is the
-/// agent's actual long-term memory, not a throwaway progress line).
-const MEMORY_NOTE_SUMMARY_MAX_CHARS: usize = 1000;
-
+/// was — that's what was actually quadratic. `summary` is the model's own
+/// one-shot output for this run (a daily report, a distilled fact list,
+/// ...); it doesn't compound run over run the way a duplicated `history`
+/// does, so it's kept in full, uncapped — truncating it silently drops
+/// real content the run produced (e.g. a multi-section report) with no
+/// compounding-growth problem to justify the loss.
 fn write_memory_note(trigger: &Value, summary: &str) {
     let day_dir = format!("{NOTES_DIR}/{}", today_utc());
     let _ = fs::create_dir_all(&day_dir);
@@ -809,7 +887,6 @@ fn write_memory_note(trigger: &Value, summary: &str) {
     } else {
         format!("{trigger_type} — {}", truncate_chars(trigger_text, TRACE_FIELD_MAX_CHARS))
     };
-    let summary = truncate_chars(summary, MEMORY_NOTE_SUMMARY_MAX_CHARS);
 
     // `(ts=N)` alongside the human-readable timestamp — `recent_log_entries`
     // parses this back out to filter entries by time (daily_maintenance's

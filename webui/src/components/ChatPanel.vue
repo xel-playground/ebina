@@ -66,11 +66,16 @@ async function refreshSession() {
 }
 
 async function resetSession() {
+  // same reasoning as `sendMessage`'s own guard — the button already hides
+  // behind `:disabled="sending"`, this is the belt-and-suspenders backstop
+  // for any other path that might call this directly
+  if (sending.value) return
   await api('/session/reset', { method: 'POST' })
   await refreshSession()
 }
 
 async function compactSession() {
+  if (sending.value) return
   await api('/session/compact', { method: 'POST' })
   await refreshSession()
 }
@@ -141,6 +146,12 @@ async function uploadPendingFiles() {
 }
 
 async function sendMessage() {
+  // the Send button already hides itself behind `v-if="!sending"` (Stop
+  // shows instead), but the textarea's `@keydown.enter` handler calls this
+  // directly with no such guard — hitting Enter mid-run would otherwise
+  // fire a second overlapping `/api/message` while the first is still
+  // in-flight, racing over the same session
+  if (sending.value) return
   const text = msg.value.trim()
   if (!text && !pendingFiles.value.length) return
   const myToken = ++runToken
@@ -252,8 +263,8 @@ defineExpose({ refreshSession })
         context: ~{{ contextTokens.toLocaleString() }} tokens
       </span>
       <span class="row" style="margin:0; gap:0.4rem;">
-        <button class="secondary" @click="compactSession" v-if="chatMessages.length">Compact</button>
-        <button class="secondary" @click="resetSession" v-if="chatMessages.length">Reset</button>
+        <button class="secondary" @click="compactSession" v-if="chatMessages.length" :disabled="sending">Compact</button>
+        <button class="secondary" @click="resetSession" v-if="chatMessages.length" :disabled="sending">Reset</button>
       </span>
     </h2>
     <div class="chat-log" ref="chatLog">

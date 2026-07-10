@@ -86,6 +86,7 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
         .route("/scheduler/runs", get(get_scheduled_runs))
         .route("/scheduler/tasks", get(get_scheduler_tasks).post(post_scheduler_task))
         .route("/scheduler/tasks/{id}", axum::routing::put(put_scheduler_task).delete(delete_scheduler_task))
+        .route("/scheduler/task_file", get(get_task_file).put(put_task_file))
         .route("/skills", get(get_skills).post(post_skill))
         .route("/skills/{name}", axum::routing::delete(delete_skill))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth))
@@ -149,8 +150,25 @@ async fn scheduler_loop(state: Arc<AppState>) {
         let last_maintenance = read_last_maintenance(&state.agent_home);
         if now - last_maintenance >= MAINTENANCE_INTERVAL_SECS && last_daily_maintenance_attempt.is_none_or(|last| now - last >= 900) {
             last_daily_maintenance_attempt = Some(now);
-            run_scheduled(state.clone(), json!({"type": "daily_maintenance", "since_ts": last_maintenance})).await;
-            write_last_maintenance(&state.agent_home, now);
+            let outcome = run_scheduled(state.clone(), json!({"type": "daily_maintenance", "since_ts": last_maintenance})).await;
+            // only advance the checkpoint on a real completion — `run()`'s
+            // one hard-failure path (agent_loop.rs: an `llm_call` error
+            // aborts the whole run) still reports a `summary`, just one
+            // starting with "run aborted". Advancing on that would silently
+            // skip whatever happened in `[last_maintenance, now)` forever:
+            // the next run's `since_ts` moves past it with nothing ever
+            // having actually reviewed that window (this is exactly what
+            // happened during the 2026-07-08 Moonshot API outage — a failed
+            // run's checkpoint write ate a 6h window's worth of activity).
+            // run_trigger's outcome shape: {"ok":true,"result":{"summary":..},...}
+            // on a completed run, {"ok":false,"error":..} only on a
+            // panic/spawn failure — a plain llm_call abort still comes back
+            // `ok:true` with `result.summary` starting "run aborted"
+            let aborted = !outcome.get("ok").and_then(Value::as_bool).unwrap_or(false)
+                || outcome.get("result").and_then(|r| r.get("summary")).and_then(Value::as_str).is_some_and(|s| s.starts_with("run aborted"));
+            if !aborted {
+                write_last_maintenance(&state.agent_home, now);
+            }
         }
 
         let last_run: Option<Value> = std::fs::read_to_string(state.agent_home.join("logs/last_run.json"))
@@ -183,16 +201,16 @@ async fn scheduler_loop(state: Arc<AppState>) {
 /// `/api/wake`) and, since nothing else logs these, records `{trigger,
 /// outcome}` to `logs/scheduled_runs/<ts>-<type>.json` — "要有 session 紀錄"
 /// for scheduler-driven wakes, browsable via `GET /api/scheduler/runs`.
-async fn run_scheduled(state: Arc<AppState>, trigger: Value) {
+async fn run_scheduled(state: Arc<AppState>, trigger: Value) -> Value {
     let ts = crate::logs::now_unix_secs();
     let trigger_type = trigger.get("type").and_then(|t| t.as_str()).unwrap_or("cron").to_string();
     let outcome = run_trigger(state.clone(), trigger.clone()).await;
     let dir = state.agent_home.join("logs/scheduled_runs");
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let record = json!({"ts": ts, "trigger": trigger, "outcome": outcome});
+        let _ = std::fs::write(dir.join(format!("{ts}-{trigger_type}.json")), serde_json::to_vec_pretty(&record).unwrap_or_default());
     }
-    let record = json!({"ts": ts, "trigger": trigger, "outcome": outcome});
-    let _ = std::fs::write(dir.join(format!("{ts}-{trigger_type}.json")), serde_json::to_vec_pretty(&record).unwrap_or_default());
+    outcome
 }
 
 async fn get_scheduled_runs(State(state): State<Arc<AppState>>) -> Json<Value> {
@@ -271,6 +289,70 @@ async fn delete_scheduler_task(State(state): State<Arc<AppState>>, AxumPath(id):
         Ok(true) => Json(json!({"ok": true})),
         Ok(false) => Json(json!({"ok": false, "error": "no such task"})),
         Err(e) => Json(json!({"ok": false, "error": e.to_string()})),
+    }
+}
+
+#[derive(Deserialize)]
+struct TaskFileQuery {
+    /// a task's `data_path` verbatim — guest-absolute (e.g.
+    /// `/workspace/tasks/x.md`), same root as the wasm preopen
+    path: String,
+}
+
+/// `data_path` is guest-absolute; the guest's preopen root is exactly
+/// `agent_home`, so the host-side file lives at `agent_home/<path minus
+/// leading '/'>`. Rejects any `..` component so this can't be steered
+/// outside agent_home (same shape check as `get_attachment`'s
+/// `workspace/uploads/` scoping, just not fixed to one subdirectory since a
+/// task's `data_path` can legitimately point anywhere under agent_home).
+fn resolve_guest_path(agent_home: &Path, guest_path: &str) -> Result<PathBuf, String> {
+    let rel = Path::new(guest_path.trim_start_matches('/'));
+    if rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return Err("path must not contain ..".to_string());
+    }
+    Ok(agent_home.join(rel))
+}
+
+/// `GET /api/scheduler/task_file?path=...` — lets the Scheduler panel show a
+/// task's `data_path` contents next to its cron/description, instead of the
+/// human needing to go find the file some other way. Missing file reads as
+/// empty (a brand-new task's `data_path` usually doesn't exist yet) rather
+/// than an error.
+async fn get_task_file(State(state): State<Arc<AppState>>, Query(q): Query<TaskFileQuery>) -> impl IntoResponse {
+    let full = match resolve_guest_path(&state.agent_home, &q.path) {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::BAD_REQUEST, e),
+    };
+    match std::fs::read_to_string(&full) {
+        Ok(content) => (StatusCode::OK, content),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (StatusCode::OK, String::new()),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// `PUT /api/scheduler/task_file?path=... <raw body>` — same disk-quota
+/// enforcement as the guest's own `write_file` (agent_loop.rs) and
+/// `save_attachment` above, so editing a task's instructions from the UI
+/// can't bypass the cap the guest itself is held to.
+async fn put_task_file(State(state): State<Arc<AppState>>, Query(q): Query<TaskFileQuery>, body: String) -> impl IntoResponse {
+    let full = match resolve_guest_path(&state.agent_home, &q.path) {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::BAD_REQUEST, e),
+    };
+    let quota = Config::load(&state.agent_home).map(|c| c.disk.quota_bytes).unwrap_or_else(|_| crate::config::DiskConfig::default().quota_bytes);
+    let existing_len = std::fs::metadata(&full).map(|m| m.len()).unwrap_or(0);
+    let projected = agent_home_disk_usage(&state.agent_home) - existing_len + body.len() as u64;
+    if projected > quota {
+        return (StatusCode::BAD_REQUEST, format!("disk quota exceeded: writing would bring agent-home to {projected} bytes, over the {quota}-byte cap"));
+    }
+    if let Some(parent) = full.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+        }
+    }
+    match std::fs::write(&full, &body) {
+        Ok(()) => (StatusCode::OK, "file updated".to_string()),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("write failed: {e}")),
     }
 }
 
@@ -510,7 +592,19 @@ async fn run_trigger(state: Arc<AppState>, trigger: Value) -> Value {
 
     match outcome {
         Ok(Ok(outcome)) => {
-            let result = extract_result(&outcome.stdout);
+            // `outcome.trapped` means the guest never reached its own
+            // `RESULT:` line (almost always the epoch-timeout trap mid-turn
+            // — see `run_agent_with_epoch_timeout`'s doc comment) — without
+            // this, `result` stays `null` and every caller (the webui's
+            // Schedule history panel included) has no way to tell "it
+            // failed silently" apart from "it genuinely had nothing to
+            // say", both of which otherwise render as the same unhelpful
+            // "(no summary)".
+            let result = if outcome.trapped {
+                json!({"summary": "(run timed out — trapped mid-turn with no result, see notifications log)"})
+            } else {
+                extract_result(&outcome.stdout)
+            };
             let _ = persist_last_run(&state.agent_home, outcome.sleep_until, &result);
             json!({"ok": true, "result": result, "sleep_until": outcome.sleep_until, "stdout": outcome.stdout})
         }
