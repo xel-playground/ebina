@@ -112,8 +112,59 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
 
     let content = if looks_like_html(content_type.as_deref(), &redacted) { strip_html_tags(&redacted) } else { redacted };
     let body = truncate_bytes(&content, state.config.network.response_max_bytes);
+    let cache_path = cache_full_response(state, url_str, &content);
 
-    ok_json(serde_json::json!({"status": status, "body": body}))
+    let mut result = serde_json::json!({"status": status, "body": body, "total_bytes": content.len()});
+    if let Some(rel) = cache_path {
+        result["cache_path"] = Value::String(rel);
+    }
+    ok_json(result)
+}
+
+const HTTP_CACHE_DIR: &str = "workspace/.http_cache";
+
+/// Caches the *full* stripped page (not just the `response_max_bytes`-
+/// truncated `body` handed back directly) under `workspace/.http_cache/`,
+/// keyed by a hash of the URL — a re-fetch of the same URL just overwrites
+/// its own entry rather than growing the cache unbounded. Returns the
+/// guest-absolute path (e.g. `/workspace/.http_cache/<hash>.txt`) so the
+/// model can `read_file` past the truncation point via its own
+/// `start_line`/`byte_offset` paging instead of losing the rest outright.
+/// Sweeps expired entries first (lazy — no separate scheduled job needed,
+/// a fetch is exactly when it's cheap to also do this) so a page nobody
+/// re-reads doesn't sit on disk forever.
+fn cache_full_response(state: &AgentState, url: &str, content: &str) -> Option<String> {
+    let dir = state.agent_home.join(HTTP_CACHE_DIR);
+    std::fs::create_dir_all(&dir).ok()?;
+    sweep_expired_cache(&dir, state.config.network.http_cache_ttl_secs);
+
+    let hash = fnv1a_hex(url);
+    let file_name = format!("{hash}.txt");
+    std::fs::write(dir.join(&file_name), content).ok()?;
+    Some(format!("/{HTTP_CACHE_DIR}/{file_name}"))
+}
+
+fn sweep_expired_cache(dir: &std::path::Path, ttl_secs: u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(modified) = meta.modified() else { continue };
+        let expired = std::time::SystemTime::now().duration_since(modified).map(|age| age.as_secs() > ttl_secs).unwrap_or(false);
+        if expired {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// FNV-1a 64-bit — same non-cryptographic "stable key from a string" use as
+/// `agent/src/memory.rs`'s `content_hash`, just on the host side here.
+fn fnv1a_hex(s: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in s.bytes() {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 fn looks_like_html(content_type: Option<&str>, body: &str) -> bool {

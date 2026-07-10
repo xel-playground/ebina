@@ -182,6 +182,15 @@ pub struct NetworkConfig {
     /// in one run was enough. This truncates the body before it ever
     /// becomes a tool-result message.
     pub response_max_bytes: usize,
+    /// how long the *full* stripped page (not just the `response_max_bytes`-
+    /// truncated part handed back directly) stays cached under
+    /// `workspace/.http_cache/` before a lazy sweep (run at the start of
+    /// every `http_get` call) deletes it. The cache is what lets the model
+    /// `read_file` past the truncation point via `read_file`'s own
+    /// `start_line`/`byte_offset` paging instead of losing the rest of a
+    /// long page outright — this just bounds how long that costs disk space
+    /// for a page nobody asked for a second look at.
+    pub http_cache_ttl_secs: u64,
 }
 
 impl Default for NetworkConfig {
@@ -192,6 +201,7 @@ impl Default for NetworkConfig {
             daily_request_cap: 500,
             allowlist: Vec::new(),
             response_max_bytes: 100_000,
+            http_cache_ttl_secs: 24 * 3600,
         }
     }
 }
@@ -224,11 +234,22 @@ pub struct RuntimeConfig {
     /// `chat_send` the model had already committed to) never happens, with
     /// nothing written to disk from that point on.
     pub epoch_timeout_secs: u64,
+    /// mid-*run* context cap — distinct from `chat.auto_compact_tokens`,
+    /// which only compacts a chat *session* (`session.json`) between runs.
+    /// This one watches a single run's own `messages` array as it grows
+    /// turn over turn (tool results piling up — a long `ssh_exec`
+    /// exploration or many `http_get`s in one run) and triggers an in-run
+    /// compaction once the last `llm_call`'s `input_tokens` crosses this,
+    /// so a single long-running turn loop can't blow its own context on its
+    /// own accumulated history before ever finishing. 150,000 leaves
+    /// headroom under the 262144-token model limit for the compaction call
+    /// itself plus whatever growth happens before the next check.
+    pub in_run_compact_tokens: u64,
 }
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
-        RuntimeConfig { epoch_timeout_secs: 30 * 60 }
+        RuntimeConfig { epoch_timeout_secs: 30 * 60, in_run_compact_tokens: 150_000 }
     }
 }
 
