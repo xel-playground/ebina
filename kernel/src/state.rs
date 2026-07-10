@@ -71,6 +71,18 @@ impl AgentState {
             // which "database is locked" against any external tool that has
             // the file open read-write at the same time.
             conn.pragma_update(None, "journal_mode", "WAL")?;
+            // Without this, two writers racing `index.db` (two concurrent
+            // `db_exec` write statements from different sessions, or one
+            // colliding with `agent/src/memory.rs`'s `reindex_file`'s own
+            // `BEGIN IMMEDIATE`) get an immediate `SQLITE_BUSY` — SQLite's
+            // own locking already keeps the file itself correct either way,
+            // this isn't a correctness fix, but a bare `SQLITE_BUSY` failure
+            // surfacing as a user-visible `db_error` is a new failure mode
+            // that plain didn't happen back when one global lock meant only
+            // one run — and so only one writer — was ever active at a time.
+            // 5s comfortably covers a normal single-statement write/commit
+            // without masking a genuinely stuck connection for long.
+            conn.busy_timeout(std::time::Duration::from_secs(5))?;
             crate::syscalls::db_exec::harden(&conn, self.config.db.query_timeout_secs)?;
             self.db = Some(conn);
         }
