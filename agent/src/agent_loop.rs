@@ -26,6 +26,11 @@ const READ_FILE_MAX_BYTES: usize = 100_000;
 /// that even a file full of long lines still gets caught by
 /// `truncate_bytes_with_marker`'s byte cap on the way out.
 const DEFAULT_HEAD_LINES: usize = 200;
+/// per-match cap for `grep_file` — a matched line is meant to be a short
+/// excerpt to skim, not a full dump; if the matched line itself is huge
+/// (e.g. a transcript's one-line JSON blob), still cut it down rather than
+/// letting one match blow the whole response
+const GREP_MATCH_LINE_MAX_BYTES: usize = 2_000;
 
 /// PROJECT.md 4.2: `run(trigger_json)` — RAG-retrieve, build a prompt, call
 /// the LLM, execute the action it asks for, loop until `done`, write memory,
@@ -196,6 +201,18 @@ pub fn run(trigger: &Value) {
             .to_string();
         messages.push(serde_json::json!({"role": "assistant", "content": text}));
 
+        // this run's own `messages` growing turn over turn (tool results
+        // piling up — a long `ssh_exec` exploration, several `http_get`s)
+        // is a *different* budget from `chat.auto_compact_tokens`, which
+        // only ever fires between runs on the saved session — a single long
+        // run has no such backstop otherwise and can blow its own context
+        // before ever reaching `done`. Checked here (right after this
+        // turn's reply lands, before parsing its action) so a bloated
+        // history gets compacted without losing the reply just received.
+        if last_input_tokens.unwrap_or(0) >= in_run_compact_tokens() {
+            compact_run_messages(&mut messages, &think_path, turn);
+        }
+
         let action: Value = match serde_json::from_str(text.trim()) {
             Ok(v) => v,
             Err(e) => {
@@ -218,11 +235,24 @@ pub fn run(trigger: &Value) {
                 let start_line = action.get("start_line").and_then(Value::as_u64).unwrap_or(0) as usize;
                 let head_lines = action.get("head_lines").and_then(Value::as_u64).map(|n| n as usize);
                 let tail_lines = action.get("tail_lines").and_then(Value::as_u64).map(|n| n as usize);
+                let byte_offset = action.get("byte_offset").and_then(Value::as_u64).map(|n| n as usize);
+                let byte_count = action.get("byte_count").and_then(Value::as_u64).map(|n| n as usize);
                 let result = match fs::read_to_string(&path) {
                     Ok(contents) => {
                         let total_bytes = contents.len();
                         let total_lines = contents.lines().count();
-                        if let Some(n) = tail_lines {
+                        if byte_offset.is_some() || byte_count.is_some() {
+                            // line-based windowing can't help when a single line is itself
+                            // gigantic (a transcript's pretty-printed JSON keeps a whole
+                            // escaped multi-KB string on one line) — this ignores line
+                            // boundaries entirely and slices raw bytes instead
+                            let offset = byte_offset.unwrap_or(0);
+                            let count = byte_count.unwrap_or(READ_FILE_MAX_BYTES);
+                            serde_json::json!({
+                                "ok": true, "contents": byte_range(&contents, offset, count),
+                                "total_bytes": total_bytes, "total_lines": total_lines, "byte_offset": offset,
+                            })
+                        } else if let Some(n) = tail_lines {
                             serde_json::json!({
                                 "ok": true, "contents": take_tail_lines(&contents, n),
                                 "total_bytes": total_bytes, "total_lines": total_lines,
@@ -245,6 +275,42 @@ pub fn run(trigger: &Value) {
                         }
                     }
                     Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}),
+                };
+                push_tool_result(&mut messages, &result);
+            }
+            Some("grep_file") => {
+                // finding one entry in a big log/transcript by content, not position —
+                // read_file's start_line/byte_offset need you to already know roughly
+                // where to look; this doesn't
+                let path = absolute_path(action.get("path").and_then(|p| p.as_str()).unwrap_or(""));
+                let pattern = action.get("pattern").and_then(|p| p.as_str()).unwrap_or("");
+                let max_matches = action.get("max_matches").and_then(Value::as_u64).map(|n| n as usize).unwrap_or(50);
+                let result = if pattern.is_empty() {
+                    serde_json::json!({"ok": false, "error": "grep_file requires a non-empty \"pattern\""})
+                } else {
+                    match fs::read_to_string(&path) {
+                        Ok(contents) => {
+                            let total_lines = contents.lines().count();
+                            // per-line cap, not a cap on the whole match list — a matched
+                            // line can itself be huge (a transcript's one-line JSON blob),
+                            // and truncating the *serialized array* instead would leave
+                            // broken JSON in a field the model has to parse
+                            let matches: Vec<Value> = contents
+                                .lines()
+                                .enumerate()
+                                .filter(|(_, line)| line.contains(pattern))
+                                .take(max_matches)
+                                .map(|(i, line)| serde_json::json!({"line": i, "text": truncate_bytes_with_marker(line, GREP_MATCH_LINE_MAX_BYTES)}))
+                                .collect();
+                            let total_matches = matches.len();
+                            serde_json::json!({
+                                "ok": true, "matches": matches,
+                                "total_matches_returned": total_matches, "total_lines": total_lines,
+                                "truncated_at_max_matches": total_matches >= max_matches,
+                            })
+                        }
+                        Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}),
+                    }
                 };
                 push_tool_result(&mut messages, &result);
             }
@@ -447,7 +513,7 @@ pub fn run(trigger: &Value) {
             _ => {
                 messages.push(serde_json::json!({
                     "role": "user",
-                    "content": "unrecognized `action` — use read_file/write_file/append_file/list_dir/make_dir/delete_path/notify/ssh_exec/request_external/done"
+                    "content": "unrecognized `action` — use read_file/grep_file/write_file/append_file/list_dir/make_dir/delete_path/notify/ssh_exec/request_external/done"
                 }));
             }
         }
@@ -499,6 +565,59 @@ pub fn run(trigger: &Value) {
     let _ = syscall::call("sleep_until", &serde_json::json!({"timestamp": sleep_at}));
 
     println!("RESULT:{}", serde_json::json!({"summary": summary}));
+}
+
+/// Keeps `messages[0]` (the system prompt) and the last `COMPACT_KEEP_TAIL`
+/// entries (the turn that just landed, plus whatever prompted it) verbatim,
+/// summarizes everything in between via one extra `llm_call`, and splices
+/// the result back in. No-op if there isn't enough middle to bother with —
+/// a run that's only a few turns in in the first place has nothing to gain.
+const COMPACT_KEEP_TAIL: usize = 2;
+fn compact_run_messages(messages: &mut Vec<Value>, think_path: &str, turn: u32) {
+    if messages.len() <= COMPACT_KEEP_TAIL + 2 {
+        return;
+    }
+    let system_prompt = messages[0].clone();
+    let split_at = messages.len() - COMPACT_KEEP_TAIL;
+    let tail = messages[split_at..].to_vec();
+    let middle = &messages[1..split_at];
+
+    let middle_text = middle
+        .iter()
+        .map(|m| {
+            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("?");
+            let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("(non-text content)");
+            format!("{role}: {content}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let summarize_resp = syscall::call(
+        "llm_call",
+        &serde_json::json!({"messages": [
+            {"role": "system", "content": "Summarize the following action/tool-result history from an \
+                in-progress autonomous agent run. This summary REPLACES the full history so the run can \
+                keep going with far less context — preserve every concrete fact learned, decision made, and \
+                anything still unfinished/pending. Be terse but do not drop anything actionable. Plain text, \
+                no JSON."},
+            {"role": "user", "content": middle_text},
+        ]}),
+    );
+    let summary_text = summarize_resp
+        .get("result")
+        .and_then(|r| r.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("(compaction summary failed — continuing with a gap in history)")
+        .to_string();
+
+    trace(think_path, &format!("[turn {}] [compact] context over budget — summarized {} earlier message(s)", turn + 1, middle.len()));
+
+    let mut rebuilt = vec![system_prompt, serde_json::json!({
+        "role": "user",
+        "content": format!("[earlier context from this run, compacted to save space]\n\n{summary_text}")
+    })];
+    rebuilt.extend(tail);
+    *messages = rebuilt;
 }
 
 /// Appends one line to the live-progress file cleared at the top of `run()`
@@ -763,14 +882,21 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String]) -> String {
          Do NOT use tool calls or function calls — you have none available. Put your single JSON action \
          directly as your plain message text, and nothing else. Respond with EXACTLY ONE JSON object per \
          turn — no other text before or after it. Valid actions:\n\n\
-         - `{{\"action\":\"read_file\",\"path\":\"...\",\"start_line\":N,\"head_lines\":N,\"tail_lines\":N}}` \
-         — all three optional. Response always includes `total_bytes`/`total_lines` so you know the real \
-         size regardless of how much came back. A file over 100,000 bytes with none of these given \
-         auto-windows to the first 200 lines rather than dumping it whole (e.g. `logs/transcripts/*.json` \
-         can be 900KB+ — reading one in full would blow your own context on the spot) — check \
-         `total_bytes`/`total_lines` in that response and re-read with `start_line`/`head_lines` to page \
-         further in, or `tail_lines` to jump to the end. `tail_lines` is almost always what you want for \
-         `logs/*.jsonl`-style append-only files — the newest entries are at the end, not the start\n\
+         - `{{\"action\":\"read_file\",\"path\":\"...\",\"start_line\":N,\"head_lines\":N,\"tail_lines\":N,\
+\"byte_offset\":N,\"byte_count\":N}}` — all optional. Response always includes `total_bytes`/`total_lines` \
+         so you know the real size regardless of how much came back. A file over 100,000 bytes with none of \
+         these given auto-windows to the first 200 lines rather than dumping it whole (e.g. \
+         `logs/transcripts/*.json` can be 900KB+ — reading one in full would blow your own context on the \
+         spot) — check `total_bytes`/`total_lines` in that response and re-read with `start_line`/\
+         `head_lines` to page further in, or `tail_lines` to jump to the end. `tail_lines` is almost always \
+         what you want for `logs/*.jsonl`-style append-only files — the newest entries are at the end, not \
+         the start. If a file has very few (or one) very long lines, line-based paging won't help — use \
+         `byte_offset`/`byte_count` instead to slice by raw position regardless of line breaks\n\
+         - `{{\"action\":\"grep_file\",\"path\":\"...\",\"pattern\":\"...\",\"max_matches\":N}}` — plain \
+         substring match (not regex), one entry per matching line as `{{\"line\":N,\"text\":\"...\"}}` \
+         (each `text` capped at 2,000 bytes), `max_matches` defaults to 50. Use this to find where \
+         something is in a big file before deciding how to `read_file` it, rather than guessing a \
+         `start_line`\n\
          - `{{\"action\":\"write_file\",\"path\":\"...\",\"content\":\"...\"}}` — overwrites the whole \
          file; refused with a `disk quota exceeded` error (and a `notify`) if it would push agent-home \
          over its total size cap. Scoped to `/workspace/` — see \"## Paths and files\" below\n\
@@ -791,9 +917,11 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String]) -> String {
          action at all; a brand-new domain under tofu mode queues for a human's approval and comes back as \
          `pending_approval` — tell the user that instead of retrying immediately. An HTML response comes \
          back as extracted text, not raw markup (scripts/styles/tags stripped) — don't expect to parse tags \
-         out of it yourself, and note it can still be truncated (a marker at the end says so) on a very long \
-         page. For anything that writes (POST/PUT/webhooks/etc), use `ssh_exec` (e.g. `curl -X POST ...`) \
-         instead\n\
+         out of it yourself. `body` is truncated on a very long page (a marker at the end says so), but the \
+         response also includes `total_bytes` (the real, untruncated size) and `cache_path` — the full page \
+         is cached there, `read_file` it (with `start_line`/`byte_offset`/`tail_lines`) if you need past what \
+         `body` already gave you, rather than re-fetching. For anything that writes (POST/PUT/webhooks/etc), \
+         use `ssh_exec` (e.g. `curl -X POST ...`) instead\n\
          - `{{\"action\":\"search_web\",\"query\":\"...\"}}` — general web search, returns \
          `{{\"results\":[{{\"title\",\"url\",\"snippet\"}}]}}`; use this whenever you need current \
          information you don't already know (news, local businesses, prices, anything time-sensitive) \
@@ -1009,6 +1137,27 @@ fn take_tail_lines(text: &str, n: usize) -> String {
     truncate_bytes_with_marker(&lines[start..].join("\n"), READ_FILE_MAX_BYTES)
 }
 
+/// Pure byte-position slice, ignoring line structure entirely — the only way
+/// to page through a file whose "lines" (by newline count) don't actually
+/// bound its size, e.g. a pretty-printed JSON transcript where one `content`
+/// field holds an entire multi-KB string with escaped `\n`s, not real ones.
+/// UTF-8-safe: snaps both ends inward to the nearest char boundary rather
+/// than ever slicing mid-codepoint.
+fn byte_range(s: &str, offset: usize, count: usize) -> String {
+    if offset >= s.len() {
+        return String::new();
+    }
+    let mut start = offset;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    let mut end = (start + count).min(s.len());
+    while end > start && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[start..end].to_string()
+}
+
 /// Defense in depth for `take_head_lines`/`take_tail_lines`: a requested
 /// line count is normally small, but nothing stops a single pathological
 /// line (e.g. a minified JSON blob) from being huge on its own — still cap
@@ -1085,6 +1234,32 @@ fn disk_quota_bytes() -> u64 {
         }
     }
     DEFAULT_DISK_QUOTA_BYTES
+}
+
+/// Same hand-rolled `[section] key = N` extraction as `disk_quota_bytes` —
+/// see its doc comment for why this doesn't pull in a real TOML parser.
+const DEFAULT_IN_RUN_COMPACT_TOKENS: u64 = 150_000;
+fn in_run_compact_tokens() -> u64 {
+    let config_text = fs::read_to_string("/config.toml").unwrap_or_default();
+    let mut in_runtime_section = false;
+    for line in config_text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_runtime_section = line == "[runtime]";
+            continue;
+        }
+        if !in_runtime_section {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("in_run_compact_tokens").map(str::trim_start) {
+            if let Some(value) = rest.strip_prefix('=') {
+                if let Ok(n) = value.trim().parse::<u64>() {
+                    return n;
+                }
+            }
+        }
+    }
+    DEFAULT_IN_RUN_COMPACT_TOKENS
 }
 
 /// Sums every regular file's size under `/` — the whole of agent-home, not
