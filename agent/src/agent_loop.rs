@@ -567,20 +567,28 @@ pub fn run(trigger: &Value) {
     println!("RESULT:{}", serde_json::json!({"summary": summary}));
 }
 
-/// Keeps `messages[0]` (the system prompt) and the last `COMPACT_KEEP_TAIL`
-/// entries (the turn that just landed, plus whatever prompted it) verbatim,
-/// summarizes everything in between via one extra `llm_call`, and splices
-/// the result back in. No-op if there isn't enough middle to bother with —
-/// a run that's only a few turns in in the first place has nothing to gain.
+/// Keeps `messages[0..COMPACT_KEEP_HEAD]` (the system prompt *and* the very
+/// first real task message — for a chat turn, the conversation's opening
+/// message; for cron/scheduled_task/daily_maintenance, the trigger itself,
+/// since there's no `history` there and `messages[1]` is the whole task)
+/// and the last `COMPACT_KEEP_TAIL` entries (the turn that just landed, plus
+/// whatever prompted it) verbatim, summarizes everything in between via one
+/// extra `llm_call`, and splices the result back in. Without pinning the
+/// root task message specifically, an early compaction pass can fold the
+/// original intent itself into the summary — a summary of a summary of a
+/// summary drifts, but the root ask never should. No-op if there isn't
+/// enough middle to bother with — a run that's only a few turns in in the
+/// first place has nothing to gain.
+const COMPACT_KEEP_HEAD: usize = 2;
 const COMPACT_KEEP_TAIL: usize = 2;
 fn compact_run_messages(messages: &mut Vec<Value>, think_path: &str, turn: u32) {
-    if messages.len() <= COMPACT_KEEP_TAIL + 2 {
+    if messages.len() <= COMPACT_KEEP_HEAD + COMPACT_KEEP_TAIL {
         return;
     }
-    let system_prompt = messages[0].clone();
+    let head = messages[..COMPACT_KEEP_HEAD].to_vec();
     let split_at = messages.len() - COMPACT_KEEP_TAIL;
     let tail = messages[split_at..].to_vec();
-    let middle = &messages[1..split_at];
+    let middle = &messages[COMPACT_KEEP_HEAD..split_at];
 
     let middle_text = middle
         .iter()
@@ -612,10 +620,11 @@ fn compact_run_messages(messages: &mut Vec<Value>, think_path: &str, turn: u32) 
 
     trace(think_path, &format!("[turn {}] [compact] context over budget — summarized {} earlier message(s)", turn + 1, middle.len()));
 
-    let mut rebuilt = vec![system_prompt, serde_json::json!({
+    let mut rebuilt = head;
+    rebuilt.push(serde_json::json!({
         "role": "user",
         "content": format!("[earlier context from this run, compacted to save space]\n\n{summary_text}")
-    })];
+    }));
     rebuilt.extend(tail);
     *messages = rebuilt;
 }
