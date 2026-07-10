@@ -31,26 +31,43 @@ pub(crate) struct AppState {
     pub(crate) agent_home: PathBuf,
     wasm_path: PathBuf,
     token: String,
-    /// serializes every wasm run — chat (`/api/message`), manual (`/api/wake`),
-    /// session compact, and all three scheduler-driven kinds all funnel
-    /// through `run_trigger` below, which holds this for the run's duration.
-    /// `tokio::sync::Mutex` (not `std::sync::Mutex`) because the guard needs
-    /// to stay held across the `spawn_blocking(...).await`. Without it two
-    /// runs could land on the same `memory/index.db` connection-per-run at
-    /// once — fresh `Store`/`Connection` each time, so not a Rust data race,
-    /// but SQLite itself only tolerates one writer at a time.
-    run_lock: tokio::sync::Mutex<()>,
-    /// PID of the `kernel worker` child process currently executing inside
-    /// `run_trigger` (`None` when idle) — lets `post_abort` `SIGKILL` it
-    /// directly. This is the only way to guarantee an *instant* stop
-    /// regardless of what the run is blocked on: wasmtime's epoch trap can't
-    /// interrupt guest code blocked inside a host function (a stuck
-    /// `http_get`/`ssh_exec`/`llm_call` connect), and the cooperative
-    /// abort-flag file only gets checked inside `llm_call`'s own streaming
-    /// loop. A real child process (not just an in-process thread) is
-    /// required for this — you can't forcibly kill one thread of your own
-    /// process without risking the whole kernel.
-    current_run_pid: tokio::sync::Mutex<Option<u32>>,
+    /// Only `message`-type runs (a real conversation) get serialized, and
+    /// only against *their own session* — same session's turns must land in
+    /// strict order (`session.json` is a read-modify-write per turn; two
+    /// concurrent turns on the same session would race that) and a human
+    /// doesn't want two replies interleaving one conversation. Every other
+    /// trigger type (`cron`/`daily_maintenance`/`scheduled_task`/`manual`)
+    /// has no session to protect this way and runs fully concurrently with
+    /// everything else — safe now that `write_file`/`append_file`'s target
+    /// directories no longer overlap between trigger types (see
+    /// `agent_loop.rs`'s `write_action_denial`): a `message` run can only
+    /// touch `/workspace/`, curated `memory/notes/` is `daily_maintenance`-
+    /// only, and only one `daily_maintenance` is ever in flight at a time
+    /// (the scheduler's own 6h-cycle gating). The residual risk this
+    /// doesn't close — two *background* runs (e.g. two `scheduled_task`s)
+    /// racing on `memory/index.db` reindexing the same note, or both
+    /// hitting `.git/index.lock` on autocommit at once — is accepted rather
+    /// than solved with finer-grained locking; both fail soft (a duplicated
+    /// index row, a skipped commit that a later run's autocommit picks up)
+    /// rather than corrupting anything.
+    session_locks: tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// how many `run_trigger` calls are currently in flight, of any trigger
+    /// type — `GET /api/status`'s `busy` field used to be "is the one
+    /// global lock held", which stopped meaning anything once locking went
+    /// per-session; this is trigger-type-agnostic so the webui still gets a
+    /// meaningful "something's running right now" signal.
+    active_runs: std::sync::atomic::AtomicUsize,
+}
+
+impl AppState {
+    /// Returns (creating if needed) the dedicated lock for one session key.
+    /// Never removed once created — session keys are bounded (webui + one
+    /// per Discord DM/channel), not something that grows unbounded over the
+    /// life of a long-running gateway.
+    async fn session_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.session_locks.lock().await;
+        locks.entry(key.to_string()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+    }
 }
 
 /// Kernel space: this is the only piece of the system that knows agent-home
@@ -67,8 +84,8 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
         agent_home: cfg.agent_home,
         wasm_path: cfg.wasm_path,
         token: cfg.token,
-        run_lock: tokio::sync::Mutex::new(()),
-        current_run_pid: tokio::sync::Mutex::new(None),
+        session_locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        active_runs: std::sync::atomic::AtomicUsize::new(0),
     });
 
     let api = Router::new()
@@ -588,85 +605,55 @@ async fn post_wake(State(state): State<Arc<AppState>>, Json(trigger): Json<Value
     Json(run_trigger(state, trigger).await)
 }
 
-/// Runs one trigger as a genuine child OS process (`kernel worker ...`, see
-/// `main.rs`) rather than an in-process thread — the only way `post_abort`
-/// can guarantee an *instant*, unconditional stop no matter what the run is
-/// blocked on (see `AppState::current_run_pid`'s doc comment for why an
-/// in-process thread can't offer that). `kernel` and `ebinactl` land in the
-/// same target dir at build time, so a sibling-binary lookup off
-/// `current_exe()` finds it without a hardcoded path.
+/// Runs one trigger in-process (`spawn_blocking`, since wasmtime + reqwest's
+/// blocking client both panic if driven directly on a tokio runtime
+/// thread). Locking is per-session and only for `message`-type triggers —
+/// see `AppState::session_locks`'s doc comment for why everything else runs
+/// fully concurrently with no lock at all.
 async fn run_trigger(state: Arc<AppState>, trigger: Value) -> Value {
-    let _permit = state.run_lock.lock().await; // held for the whole run below — see AppState::run_lock
+    let is_message = trigger.get("type").and_then(|t| t.as_str()) == Some("message");
+    let session_key = trigger.get("session_key").and_then(|s| s.as_str()).unwrap_or(DEFAULT_SESSION_KEY).to_string();
 
+    let _session_guard = if is_message { Some(state.session_lock(&session_key).await.lock_owned().await) } else { None };
+    state.active_runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let outcome = run_trigger_inner(&state, trigger).await;
+    state.active_runs.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    outcome
+}
+
+async fn run_trigger_inner(state: &Arc<AppState>, trigger: Value) -> Value {
     let agent_home = state.agent_home.clone();
     let wasm_path = state.wasm_path.clone();
     let trigger_str = trigger.to_string();
 
-    let kernel_bin = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("kernel")))
-        .unwrap_or_else(|| PathBuf::from("kernel"));
+    let outcome = tokio::task::spawn_blocking(move || {
+        let agent_home = agent_home.to_string_lossy().into_owned();
+        let wasm_path = wasm_path.to_string_lossy().into_owned();
+        crate::run_agent(&agent_home, &wasm_path, &["run", &trigger_str])
+    })
+    .await;
 
-    let mut cmd = tokio::process::Command::new(&kernel_bin);
-    cmd.arg("worker")
-        .arg(&wasm_path)
-        .arg("run")
-        .arg(&trigger_str)
-        .env("AGENT_HOME", &agent_home)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit());
-
-    let child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => return json!({"ok": false, "error": format!("failed to spawn run worker ({}): {e}", kernel_bin.display())}),
-    };
-    *state.current_run_pid.lock().await = child.id();
-
-    let output = child.wait_with_output().await;
-    *state.current_run_pid.lock().await = None;
-
-    let output = match output {
-        Ok(o) => o,
-        Err(e) => return json!({"ok": false, "error": format!("run worker wait failed: {e}")}),
-    };
-
-    // killed by `post_abort`'s SIGKILL: no JSON envelope was ever printed
-    // (the worker only prints one at the very end, after the whole run
-    // finishes), so there's nothing to parse — synthesize the result
-    // directly. `"run aborted: ..."` prefix matches the same string
-    // `scheduler_loop` already checks to keep a killed `daily_maintenance`
-    // run from advancing its checkpoint (see `write_last_maintenance`
-    // gating), and doubles as the chat reply text `handle_chat_message`
-    // sends straight to the user — both need this to read as "stopped", not
-    // "succeeded with nothing to say".
-    use std::os::unix::process::ExitStatusExt;
-    if output.status.signal() == Some(9) {
-        let result = json!({"summary": "run aborted: 已被使用者按 Stop 手動停止"});
-        let _ = persist_last_run(&state.agent_home, None, &result);
-        return json!({"ok": true, "result": result, "sleep_until": Value::Null});
+    match outcome {
+        Ok(Ok(outcome)) => {
+            // `outcome.trapped` means the guest never reached its own
+            // `RESULT:` line (almost always the epoch-timeout trap mid-turn
+            // — see `run_agent_with_epoch_timeout`'s doc comment) — without
+            // this, `result` stays `null` and every caller (the webui's
+            // Schedule history panel included) has no way to tell "it
+            // failed silently" apart from "it genuinely had nothing to
+            // say", both of which otherwise render as the same unhelpful
+            // "(no summary)".
+            let result = if outcome.trapped {
+                json!({"summary": "(run timed out — trapped mid-turn with no result, see notifications log)"})
+            } else {
+                extract_result(&outcome.stdout)
+            };
+            let _ = persist_last_run(&state.agent_home, outcome.sleep_until, &result);
+            json!({"ok": true, "result": result, "sleep_until": outcome.sleep_until, "stdout": outcome.stdout})
+        }
+        Ok(Err(e)) => json!({"ok": false, "error": e.to_string()}),
+        Err(e) => json!({"ok": false, "error": format!("run panicked: {e}")}),
     }
-
-    let Ok(envelope) = serde_json::from_slice::<Value>(&output.stdout) else {
-        return json!({"ok": false, "error": format!("run worker produced no parseable output (exit: {:?})", output.status)});
-    };
-    let stdout = envelope.get("stdout").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let sleep_until = envelope.get("sleep_until").and_then(Value::as_i64);
-    let trapped = envelope.get("trapped").and_then(Value::as_bool).unwrap_or(false);
-
-    // `trapped` means the guest never reached its own `RESULT:` line (almost
-    // always the epoch-timeout trap mid-turn — see
-    // `run_agent_with_epoch_timeout`'s doc comment) — without this, `result`
-    // stays `null` and every caller (the webui's Schedule history panel
-    // included) has no way to tell "it failed silently" apart from "it
-    // genuinely had nothing to say", both of which otherwise render as the
-    // same unhelpful "(no summary)".
-    let result = if trapped {
-        json!({"summary": "(run timed out — trapped mid-turn with no result, see notifications log)"})
-    } else {
-        extract_result(&stdout)
-    };
-    let _ = persist_last_run(&state.agent_home, sleep_until, &result);
-    json!({"ok": true, "result": result, "sleep_until": sleep_until, "stdout": stdout})
 }
 
 /// pulls the JSON after `RESULT:` (the guest's own convention, see
@@ -694,14 +681,12 @@ fn persist_last_run(agent_home: &Path, sleep_until: Option<i64>, result: &Value)
 
 async fn get_status(State(state): State<Arc<AppState>>) -> Json<Value> {
     let read_json = |p: PathBuf| std::fs::read_to_string(p).ok().and_then(|s| serde_json::from_str::<Value>(&s).ok());
-    // non-blocking: `try_lock` fails immediately if `run_trigger` currently
-    // holds `run_lock` for the whole duration of a run, rather than
-    // (dropping in) waiting for it to finish — this is a status *check*,
-    // it must never itself queue behind a long-running turn. Lets a
-    // freshly loaded/reloaded webui tab find out a run is already in
-    // progress (e.g. a long `ssh_exec` chain) instead of having no idea
+    // `active_runs` counts every in-flight `run_trigger` call regardless of
+    // trigger type or which session (if any) it's locked against — lets a
+    // freshly loaded/reloaded webui tab find out *something's* running
+    // right now (e.g. a long `ssh_exec` chain) instead of having no idea
     // one exists just because *this* page load didn't start it itself.
-    let busy = state.run_lock.try_lock().is_err();
+    let busy = state.active_runs.load(std::sync::atomic::Ordering::Relaxed) > 0;
     Json(json!({
         "budget": read_json(state.agent_home.join("logs/budget-state.json")),
         "last_run": read_json(state.agent_home.join("logs/last_run.json")),
@@ -1218,24 +1203,18 @@ fn parse_skill(text: &str) -> Option<Value> {
 
 // ---- live "thinking" stream + abort ----
 
-/// Two layers: sets a flag `llm_call` checks between streamed chunks (a
-/// clean cutoff if the run happens to be mid-SSE-stream right now — see
-/// `handle_ollama_stream` etc.), then unconditionally `SIGKILL`s the
-/// `kernel worker` child process running the current trigger, if any (see
-/// `AppState::current_run_pid`). The kill is the real guarantee — the flag
-/// alone leaves gaps (`http_get`/`ssh_exec` in progress, or a `llm_call`
-/// still waiting on its first response byte don't check it at all), so this
-/// stops the run outright regardless of what it's blocked on.
+/// Sets a flag `llm_call` checks between streamed chunks — cuts a
+/// runaway/unproductive generation short instead of paying for tokens the
+/// agent doesn't need (kernel/src/syscalls/llm_call.rs's stream handlers).
+/// Cooperative only: doesn't reach a run that's inside `http_get`/`ssh_exec`
+/// or still waiting on `llm_call`'s first response byte — accepted
+/// trade-off for staying in-process (see `AppState::session_locks`'s doc
+/// comment for the concurrency side of the same decision); those cases just
+/// run to completion instead of stopping instantly.
 async fn post_abort(State(state): State<Arc<AppState>>) -> Json<Value> {
     let path = state.agent_home.join("logs/abort_requested");
-    let _ = std::fs::write(&path, "");
-
-    let pid = *state.current_run_pid.lock().await;
-    let Some(pid) = pid else {
-        return Json(json!({"ok": true, "note": "no run currently in progress"}));
-    };
-    match tokio::process::Command::new("kill").arg("-9").arg(pid.to_string()).status().await {
-        Ok(_) => Json(json!({"ok": true, "killed_pid": pid})),
+    match std::fs::write(&path, "") {
+        Ok(()) => Json(json!({"ok": true})),
         Err(e) => Json(json!({"ok": false, "error": e.to_string()})),
     }
 }

@@ -9,9 +9,6 @@ async fn main() -> Result<()> {
     if first.as_deref() == Some("serve") {
         return serve().await;
     }
-    if first.as_deref() == Some("worker") {
-        return worker(args.collect()).await;
-    }
 
     // direct CLI run, mainly for dev/testing: `kernel <wasm-path> [guest-args...]`
     let agent_home = std::env::var("AGENT_HOME").unwrap_or_else(|_| "agent-home".to_string());
@@ -35,41 +32,6 @@ async fn main() -> Result<()> {
         eprintln!("[kernel] agent asked to sleep until {t}");
     }
 
-    Ok(())
-}
-
-/// `kernel worker <wasm-path> [guest-args...]` — same execution as the raw
-/// dev/debug path above, but spawned as a real child process by
-/// `gateway.rs`'s `run_trigger` specifically so `POST /api/abort` can
-/// `SIGKILL` it outright (an in-process thread can't be force-killed without
-/// risking the whole kernel — see `AppState::current_run_pid`'s doc
-/// comment). Prints one JSON line — `{stdout, sleep_until, trapped}` — to
-/// stdout instead of raw guest text, so the parent can parse
-/// [`kernel::RunOutcome`] back out; the guest's own stdout never touches the
-/// real process stdout either way (WASI redirects it into an in-memory
-/// pipe), so this can't collide with anything the guest printed.
-async fn worker(mut args: Vec<String>) -> Result<()> {
-    if args.is_empty() {
-        anyhow::bail!("usage: kernel worker <wasm-path> [guest-args...]");
-    }
-    let wasm_path = args.remove(0);
-    let agent_home = std::env::var("AGENT_HOME").unwrap_or_else(|_| "agent-home".to_string());
-    let guest_args = args;
-
-    let outcome = tokio::task::spawn_blocking(move || {
-        let guest_args: Vec<&str> = guest_args.iter().map(String::as_str).collect();
-        kernel::run_agent(&agent_home, &wasm_path, &guest_args)
-    })
-    .await??;
-
-    println!(
-        "{}",
-        serde_json::to_string(&serde_json::json!({
-            "stdout": outcome.stdout,
-            "sleep_until": outcome.sleep_until,
-            "trapped": outcome.trapped,
-        }))?
-    );
     Ok(())
 }
 
