@@ -103,7 +103,13 @@ const PROACTIVE_NOTE: &str = "(the agent proactively sent the next message on it
 /// that.
 fn append_assistant_turn(agent_home: &Path, session_key: &str, message: &str) -> Value {
     let path = agent_home.join("logs/chat_sessions").join(session_key).join("session.json");
-    let _lock = FileLock::acquire(path.with_extension("json.lock"), Duration::from_secs(5));
+    // surfaced to the model (not just logged) — this is a syscall it called
+    // directly and can react to (retry next turn, fall back to `done`'s
+    // summary instead), unlike the host-internal callers of `FileLock`
+    let _lock = match FileLock::acquire(path.with_extension("json.lock"), Duration::from_secs(5)) {
+        Ok(lock) => lock,
+        Err(e) => return error_json("lock_timeout", &e),
+    };
     let mut turns: Vec<Value> =
         std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
     let now = crate::logs::now_unix_secs();

@@ -64,7 +64,7 @@ fn save_grants(agent_home: &Path, grants: &[PendingGrant]) -> anyhow::Result<()>
 /// called from inside `approve`, which already holds the lock — a second
 /// `acquire` here would deadlock against itself.
 pub fn request_grant(agent_home: &Path, kind: &str, method: &str, url: &str, domain: &str) -> anyhow::Result<String> {
-    let _lock = FileLock::acquire(grants_path(agent_home).with_extension("json.lock"), Duration::from_secs(5));
+    let _lock = FileLock::acquire(grants_path(agent_home).with_extension("json.lock"), Duration::from_secs(5)).map_err(|e| anyhow::anyhow!(e))?;
     let mut grants = load_grants(agent_home);
     let id = format!("{}-{}", crate::logs::now_unix_secs(), grants.len());
     grants.push(PendingGrant {
@@ -81,7 +81,7 @@ pub fn request_grant(agent_home: &Path, kind: &str, method: &str, url: &str, dom
 }
 
 pub fn approve(agent_home: &Path, id: &str) -> anyhow::Result<Option<PendingGrant>> {
-    let _lock = FileLock::acquire(grants_path(agent_home).with_extension("json.lock"), Duration::from_secs(5));
+    let _lock = FileLock::acquire(grants_path(agent_home).with_extension("json.lock"), Duration::from_secs(5)).map_err(|e| anyhow::anyhow!(e))?;
     let mut grants = load_grants(agent_home);
     let Some(grant) = grants.iter_mut().find(|g| g.id == id) else {
         return Ok(None);
@@ -96,7 +96,7 @@ pub fn approve(agent_home: &Path, id: &str) -> anyhow::Result<Option<PendingGran
 }
 
 pub fn deny(agent_home: &Path, id: &str) -> anyhow::Result<Option<PendingGrant>> {
-    let _lock = FileLock::acquire(grants_path(agent_home).with_extension("json.lock"), Duration::from_secs(5));
+    let _lock = FileLock::acquire(grants_path(agent_home).with_extension("json.lock"), Duration::from_secs(5)).map_err(|e| anyhow::anyhow!(e))?;
     let mut grants = load_grants(agent_home);
     let Some(grant) = grants.iter_mut().find(|g| g.id == id) else {
         return Ok(None);

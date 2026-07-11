@@ -63,7 +63,7 @@ impl BudgetTracker {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let _lock = FileLock::acquire(self.path.with_extension("lock"), Duration::from_secs(5));
+        let _lock = FileLock::acquire(self.path.with_extension("lock"), Duration::from_secs(5)).map_err(|e| anyhow::anyhow!(e))?;
         let mut state = read_state(&self.path);
         state.tokens_used += tokens;
         std::fs::write(&self.path, serde_json::to_string(&state)?)?;

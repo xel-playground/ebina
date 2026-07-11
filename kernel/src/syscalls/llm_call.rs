@@ -112,7 +112,15 @@ fn save_circuit(agent_home: &Path, state: &CircuitState) {
 /// one's increment silently vanishes, undercounting consecutive failures
 /// and delaying the trip.
 fn record_circuit_failure(agent_home: &Path) {
-    let _lock = FileLock::acquire(circuit_path(agent_home).with_extension("json.lock"), Duration::from_secs(5));
+    let _lock = match FileLock::acquire(circuit_path(agent_home).with_extension("json.lock"), Duration::from_secs(5)) {
+        Ok(lock) => lock,
+        // low-stakes bookkeeping, nobody's blocked on this — skip this
+        // update rather than hold up the llm_call that's already failed
+        Err(e) => {
+            let _ = crate::logs::notify(agent_home, &format!("circuit breaker failed to lock: {e}"));
+            return;
+        }
+    };
     let mut circuit = load_circuit(agent_home);
     circuit.consecutive_failures += 1;
     if circuit.consecutive_failures >= CIRCUIT_FAILURE_THRESHOLD {
@@ -126,7 +134,13 @@ fn record_circuit_failure(agent_home: &Path) {
 }
 
 fn record_circuit_success(agent_home: &Path) {
-    let _lock = FileLock::acquire(circuit_path(agent_home).with_extension("json.lock"), Duration::from_secs(5));
+    let _lock = match FileLock::acquire(circuit_path(agent_home).with_extension("json.lock"), Duration::from_secs(5)) {
+        Ok(lock) => lock,
+        Err(e) => {
+            let _ = crate::logs::notify(agent_home, &format!("circuit breaker failed to lock: {e}"));
+            return;
+        }
+    };
     let circuit = load_circuit(agent_home);
     if circuit.consecutive_failures > 0 || circuit.tripped_until != 0 {
         save_circuit(agent_home, &CircuitState::default());

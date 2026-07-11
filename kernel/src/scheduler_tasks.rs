@@ -44,7 +44,7 @@ fn save_task(agent_home: &Path, task: &ScheduledTask) -> std::io::Result<()> {
 /// silently overwriting the other's change. Keyed per task file rather than
 /// one lock for the whole directory, so editing two different tasks at once
 /// still doesn't contend with each other.
-fn task_lock(agent_home: &Path, id: &str) -> FileLock {
+fn task_lock(agent_home: &Path, id: &str) -> Result<FileLock, String> {
     FileLock::acquire(task_path(agent_home, id).with_extension("json.lock"), Duration::from_secs(5))
 }
 
@@ -83,7 +83,7 @@ pub fn add_task(agent_home: &Path, cron: &str, data_path: &str, description: &st
     // (`load_tasks(...).len()`), so two concurrent add_task calls without
     // this could compute the same id and the second save would silently
     // clobber the first brand-new task outright, not just collide
-    let _lock = FileLock::acquire(dir(agent_home).join(".add_task.lock"), Duration::from_secs(5));
+    let _lock = FileLock::acquire(dir(agent_home).join(".add_task.lock"), Duration::from_secs(5))?;
     let now = crate::logs::now_unix_secs();
     let task = ScheduledTask {
         id: format!("{now}-{}", load_tasks(agent_home).len()),
@@ -108,7 +108,7 @@ pub fn update_task(
     description: Option<&str>,
     enabled: Option<bool>,
 ) -> Result<Option<ScheduledTask>, String> {
-    let _lock = task_lock(agent_home, id);
+    let _lock = task_lock(agent_home, id)?;
     let Some(mut task) = load_task(agent_home, id) else {
         return Ok(None);
     };
@@ -138,7 +138,16 @@ pub fn remove_task(agent_home: &Path, id: &str) -> std::io::Result<bool> {
 }
 
 pub fn mark_run(agent_home: &Path, id: &str, ts: i64) {
-    let _lock = task_lock(agent_home, id);
+    let _lock = match task_lock(agent_home, id) {
+        Ok(lock) => lock,
+        // scheduler_loop's own background bookkeeping, nobody's waiting on
+        // this call for a result — log and skip this checkpoint write
+        // rather than hold up the trigger it's meant to just be recording
+        Err(e) => {
+            let _ = crate::logs::notify(agent_home, &format!("mark_run({id}) failed to lock: {e}"));
+            return;
+        }
+    };
     if let Some(mut task) = load_task(agent_home, id) {
         task.last_run = Some(ts);
         let _ = save_task(agent_home, &task);

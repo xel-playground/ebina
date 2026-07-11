@@ -26,7 +26,7 @@ use std::time::Duration;
 /// just local git subprocess invocations.
 pub fn commit_run(agent_home: &Path, message: &str) -> anyhow::Result<()> {
     let git_dir = git_dir_path(agent_home);
-    let _lock = FileLock::acquire(git_dir.with_extension("commit-lock"), Duration::from_secs(30));
+    let _lock = FileLock::acquire(git_dir.with_extension("commit-lock"), Duration::from_secs(30)).map_err(|e| anyhow::anyhow!(e))?;
     migrate_legacy_git_dir(agent_home, &git_dir)?;
 
     if !git_dir.exists() {

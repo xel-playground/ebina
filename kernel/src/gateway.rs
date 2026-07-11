@@ -550,7 +550,14 @@ pub(crate) async fn handle_chat_message(state: Arc<AppState>, session_key: Strin
 
     let agent_home = state.agent_home.clone();
     let key_for_save = session_key.clone();
-    let _ = tokio::task::spawn_blocking(move || append_turns_locked(&agent_home, &key_for_save, vec![user_turn, assistant_turn])).await;
+    // nothing left to return this to — the HTTP response already carries
+    // `outcome` by the time this resolves — so a lock failure here (rare:
+    // only if `chat_send` or another turn on this session is somehow still
+    // holding session.json.lock past its own 5s deadline) at least lands in
+    // Live Log instead of silently vanishing along with the turn itself
+    if let Ok(Err(e)) = tokio::task::spawn_blocking(move || append_turns_locked(&agent_home, &key_for_save, vec![user_turn, assistant_turn])).await {
+        let _ = crate::logs::notify(&state.agent_home, &format!("failed to save this turn to session {session_key}: {e}"));
+    }
 
     maybe_auto_compact(&state, &session_key);
 
@@ -573,12 +580,12 @@ pub(crate) async fn handle_chat_message(state: Arc<AppState>, session_key: Strin
 /// each other either. Called via `spawn_blocking` since `FileLock::acquire`
 /// spin-waits with `std::thread::sleep` — fine off the async executor
 /// thread, not fine on it.
-fn append_turns_locked(agent_home: &Path, session_key: &str, new_turns: Vec<SessionTurn>) {
+fn append_turns_locked(agent_home: &Path, session_key: &str, new_turns: Vec<SessionTurn>) -> Result<(), String> {
     let path = session_path(agent_home, session_key);
-    let _lock = FileLock::acquire(path.with_extension("json.lock"), Duration::from_secs(5));
+    let _lock = FileLock::acquire(path.with_extension("json.lock"), Duration::from_secs(5))?;
     let mut turns = load_session(agent_home, session_key);
     turns.extend(new_turns);
-    let _ = save_session(agent_home, session_key, &turns);
+    save_session(agent_home, session_key, &turns).map_err(|e| e.to_string())
 }
 
 /// Fires a background compact once this session's last-measured context
@@ -940,7 +947,10 @@ struct SetSecretBody {
 /// duplicating it.
 async fn post_secret(State(state): State<Arc<AppState>>, Json(body): Json<SetSecretBody>) -> impl IntoResponse {
     let path = crate::secrets_path(&state.agent_home);
-    let _lock = FileLock::acquire(path.with_extension("toml.lock"), Duration::from_secs(5));
+    let _lock = match FileLock::acquire(path.with_extension("toml.lock"), Duration::from_secs(5)) {
+        Ok(lock) => lock,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"ok": false, "error": e}))),
+    };
     let mut secrets = Secrets::load(&path);
     secrets.set(&body.name, &body.value);
     match secrets.save(&path) {
@@ -1315,7 +1325,10 @@ async fn post_skill(State(state): State<Arc<AppState>>, Json(skill): Json<SkillB
     // shouldn't reset just because a human tweaked the content (mirrors
     // agent/src/skills.rs `save`'s same reasoning exactly)
     let path = dir.join(format!("{}.md", skill.name));
-    let _lock = FileLock::acquire(path.with_extension("md.lock"), Duration::from_secs(5));
+    let _lock = match FileLock::acquire(path.with_extension("md.lock"), Duration::from_secs(5)) {
+        Ok(lock) => lock,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
     let existing = std::fs::read_to_string(&path).ok().and_then(|t| parse_skill(&t));
     let created_at = existing.as_ref().and_then(|s| s["created_at"].as_u64()).unwrap_or_else(|| crate::logs::now_unix_secs() as u64);
     let used_count = existing.as_ref().and_then(|s| s["used_count"].as_u64()).unwrap_or(0);
