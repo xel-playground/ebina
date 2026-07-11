@@ -466,14 +466,15 @@ http_per_domain_per_min = 10   # 對外禮貌,防同站連打被 ban IP
         喚醒的雜訊,不然會擠掉真正的跨 session 聊天內容),筆數改可設定
         (`ChatConfig::cross_session_staging_entries`,預設 5,guest 端跟 `memory::
         current_embed_model` 同款 crude scan `/config.toml`,不用 toml parser)
-- [x] 新增 `memory_search`/`remember` 兩個 action(2026-07-12)——`hybrid_search` 原本只在 run
-      開頭跑一次,用 trigger 文字當 query,中途想換個查詢沒辦法,`memory_search(query,top_k)`
-      補上這條路;`remember(topic,content)` 則是給「這件事不該等 daily_maintenance(最長 6h)
-      才記」的明確例外——聊天 turn 原本完全不能寫 `memory/notes/`(`write_action_denial` 只准
-      寫 `/workspace/`,故意逼寫入走蒸餾),這個開一條窄的、append-only、topic 名稱防路徑穿越
-      (`/`、`..` 擋掉)的正式管道。寫完不用額外 reindex,run 結束時本來就有的 `reindex_all_notes`
-      會撿到,下一輪 `hybrid_search`/`memory_search` 就查得到——線上驗證過 `remember` 寫完,
-      緊接著下一輪 `memory_search` 真的把它撈成第一筆結果
+- [x] 新增 `memory_search` action(2026-07-12)——`hybrid_search` 原本只在 run 開頭跑一次,用
+      trigger 文字當 query,中途想換個查詢沒辦法,這個補上這條路(讀,不寫,風險不比現有的自動
+      檢索高)
+- [x] ~~`remember(topic,content)` action~~(2026-07-12 加,同日撤掉):原本想做「不等
+      daily_maintenance 就能立刻記住」的例外,但沒做主人驗證——`sender_note` 只是給 LLM 看的
+      文字提醒,不是 host 端強制擋,任何在公開頻道 @mention 它的陌生人(DM 已擋,頻道沒擋)都能
+      立刻寫進全域 `memory/notes/`,比原本得經過 daily_maintenance LLM review 才併入的路徑還
+      危險——直接判斷「這個能力不該存在」比「補一個 host 端 owner gate 修它」更乾脆,撤掉,
+      記憶寫入維持只有 daily_maintenance 一條路
 
 ### 未來糖果罐(延後)
 - [ ] **Agent 互通(A2A,actor model)**:設計已定——新 syscall `send_agent(target, msg)`,kernel **複製**訊息至對方 `inbox/from-<sender>/` 並喚醒;不共享任何目錄,Store 間零接觸;通訊拓撲在 kernel config 逐條宣告(capability),未宣告組合拒絕;訊息全經 kernel = 全量 A2A log,gateway 可視化對話圖。支援監督者模式、互相 review 等玩法;新 agent = 新資料夾 + 一行拓撲
