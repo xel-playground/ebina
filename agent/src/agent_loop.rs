@@ -1173,10 +1173,20 @@ fn write_memory_note(trigger: &Value, summary: &str) {
 
     let trigger_type = trigger.get("type").and_then(|t| t.as_str()).unwrap_or("unknown");
     let trigger_text = trigger.get("text").and_then(|t| t.as_str()).unwrap_or("");
+    // `session_key` only exists on a `message` trigger (webui's is always
+    // `"webui"`; Discord's is `discord-dm-<user>`/`discord-channel-<id>`,
+    // gateway.rs `handle_chat_message`) — without it here, every session's
+    // turns landed in the shared daily log.md as identical-looking
+    // "message — <text>" lines, so `daily_maintenance` had no way to tell
+    // which conversation thread a fact came from once multiple Discord
+    // channels/DMs were active alongside webui. That's what was actually
+    // making Discord memory distill so poorly: not a retrieval problem,
+    // a missing attribution problem in the raw log this gets distilled from.
+    let session_note = trigger.get("session_key").and_then(|s| s.as_str()).map(|s| format!(" [{s}]")).unwrap_or_default();
     let trigger_line = if trigger_text.is_empty() {
-        trigger_type.to_string()
+        format!("{trigger_type}{session_note}")
     } else {
-        format!("{trigger_type} — {}", truncate_chars(trigger_text, TRACE_FIELD_MAX_CHARS))
+        format!("{trigger_type}{session_note} — {}", truncate_chars(trigger_text, TRACE_FIELD_MAX_CHARS))
     };
 
     // `(ts=N)` alongside the human-readable timestamp — `recent_log_entries`
