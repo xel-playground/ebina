@@ -52,7 +52,7 @@ physically cannot call anything except what's wired up as a syscall."
 │  │ (tofu domain)│   │  maintenance · │   │  memory.rs calls this,  │   │
 │  │              │   │  scheduled_    │   │  no guest action        │   │
 │  │              │   │  task)         │   │  reaches it directly)   │   │
-│  └──────┬───────┘   └───────┬────────┘   │ http_get (GET-only) ·   │   │
+│  └──────┬───────┘   └───────┬────────┘   │ http_fetch (domain-gated)·│   │
 │         │ per-session         │            │  search_web · ssh_exec  │   │
 │         │ + per-task_id        │            │ notify · chat_send      │   │
 │         │ (else concurrent)    │            │ sleep_until ·           │   │
@@ -114,7 +114,7 @@ before writing rather than trust a snapshot taken before the run started.
 `POST /api/abort?session=<key>` (the webui's Stop button, defaulting to the
 webui session) is cooperative: it sets a flag `llm_call` checks between
 streamed chunks, scoped per session so aborting one doesn't touch another
-concurrent run — but a run blocked inside `http_get`/`ssh_exec`, or still
+concurrent run — but a run blocked inside `http_fetch`/`ssh_exec`, or still
 waiting on `llm_call`'s first response byte, just runs to completion
 instead of stopping instantly. An earlier version of this ran every trigger
 as its own killable child process for a true instant stop; reverted — the
@@ -122,13 +122,14 @@ guaranteed-stop property wasn't worth carrying a second binary that had to
 ship alongside the first and could drift out of version sync with it.
 
 **Syscalls are the entire capability surface** — 12 of them
-(`llm_call`, `embed`, `db_exec`, `http_get`, `search_web`, `ssh_exec`,
+(`llm_call`, `embed`, `db_exec`, `http_fetch`, `search_web`, `ssh_exec`,
 `notify`, `chat_send`, `sleep_until`, `schedule_task`/`update_task`/
 `delete_task`), dispatched from one match statement
 (`kernel/src/syscalls/mod.rs`). Each caps a specific kind of harm rather
-than trying to sandbox arbitrary behavior: `http_get` is structurally
-GET-only (no `method` field exists in its request shape at all, so there's
-nothing to route a write through even if the model tried), `db_exec` is
+than trying to sandbox arbitrary behavior: `http_fetch`'s containment is
+the domain gate (`[network] get_mode`), applied uniformly whether the
+request is a plain read or a `POST`/`PUT`/`PATCH`/`DELETE` — not a
+structural ban on writing, `db_exec` is
 never reachable from a guest action at all (only the host-side RAG engine
 calls it), `ssh_exec` is the one deliberate exception — a fixed,
 human-configured target with no pre-approval gate, because an equivalent
@@ -136,11 +137,12 @@ capability (arbitrary command execution) existing ungated *somewhere* made
 gating a second, weaker path to the same place pure friction rather than
 real containment.
 
-**Trust boundary, not a content filter**: nothing here scans `http_get`
+**Trust boundary, not a content filter**: nothing here scans `http_fetch`
 results or tool output for prompt injection. The bet is a narrow boundary
-(no writes without a human-fixed target, no filesystem access outside
-agent-home, no arbitrary network reach) beats trying to detect malicious
-instructions in arbitrary text — read [Web fetch](#web-fetch-http_get-syscall)'s
+(writes only to a fixed target — `ssh_exec` — or a domain-gated one —
+`http_fetch` — never an unfiltered arbitrary destination, no filesystem
+access outside agent-home) beats trying to detect malicious instructions in
+arbitrary text — read [Web fetch](#web-fetch-http_fetch-syscall)'s
 "untrusted content from the open internet, same as a tool's stdout" framing
 for how the agent itself is told to treat it.
 
@@ -274,7 +276,7 @@ report per run lands in `memory/maintenance_reports/<date>_<HHMM>.md`.
 Separate from `daily_maintenance` and from `[chat] auto_compact_tokens`
 (which only ever compacts a saved chat *session* between runs) — this one
 watches a single *run's own* `messages` array as it grows turn over turn
-(tool results piling up: a long `ssh_exec` exploration, several `http_get`s
+(tool results piling up: a long `ssh_exec` exploration, several `http_fetch`s
 in one run). Once the last `llm_call`'s `input_tokens` crosses
 `runtime.in_run_compact_tokens` (default 100,000 — deliberately well under
 the model's real context limit, not just avoiding overflow: every internal
@@ -472,16 +474,36 @@ deadline checked on every read, independent of whether the command is
 still actively producing output — it returns `{"timed_out": true}` with
 whatever partial output was captured rather than hanging.
 
-## Web fetch (`http_get` syscall)
+## Web fetch (`http_fetch` syscall)
 
-GET-only — no `method` field exists in the action shape at all, so there's
-nothing to even try making a write with (writes used to route through here
-behind an approval queue; removed once `ssh_exec` existed as an *ungated*
-way to do the exact same thing, which made the gate here friction rather
-than containment). Guards: denylists private/loopback/link-local/metadata
-IPs (checked post-DNS-resolution, pinned against rebinding), every request
-logged in full regardless of outcome, gated by `[network] get_mode`
-(`"open"` default / `"tofu"` — new domain needs one-time approval / `"allowlist"`).
+`method` defaults to `"GET"` with no `headers`/`body`, which behaves
+exactly like a plain read (same HTML-stripping/truncation/caching pipeline
+below). `POST`/`PUT`/`PATCH`/`DELETE` with `headers`/`body` are supported
+too — writes used to route through here behind a separate approval queue,
+removed (and the syscall renamed `http_get` to make that removal
+structural) once `ssh_exec` existed as an *ungated* way to do the exact
+same thing, which made a write-specific gate here friction rather than
+containment; re-added (2026-07-12, back under the name `http_fetch`) once
+domain-bound credential support gave writes here a real use (calling an
+authenticated API without a remote host). Guards apply uniformly regardless
+of method: denylists private/loopback/link-local/metadata IPs (checked
+post-DNS-resolution, pinned against rebinding), every request logged in
+full regardless of outcome, gated by `[network] get_mode` (`"open"` default
+/ `"tofu"` — new domain needs one-time approval / `"allowlist"`).
+
+A header or body value may reference `{secrets.NAME}` — resolved host-side
+(`secrets::resolve_placeholders_in`, same function `ssh_exec` uses), the
+guest only ever sees the placeholder text. Gated by `[network].credentials`
+(`[[network.credentials]] host = "..."`, `secret = "..."`) — `NAME` must be
+bound to the *exact* host the request's URL resolves to, or the whole
+request fails closed with `bad_secret_placeholder` before anything is sent.
+Deliberately a static, human-edited list rather than anything reachable
+through `grants.rs`'s tofu queue: that queue is fine for "can this agent
+read from this domain at all", a low-stakes, often-routine approval; a
+domain+secret binding is a materially different, higher-stakes grant (a
+live credential, not just read access), and mixing the two into one
+approval flow risks a human approving a credential-carrying request while
+thinking it's routine domain access.
 
 An HTML response (by `Content-Type`, or sniffed if that header's missing)
 comes back as **extracted text**, not raw markup — `<script>`/`<style>`
@@ -500,7 +522,7 @@ the model can `read_file` past the truncation point (via its own
 [Reading large files](#reading-large-files-read_file-paging-grep_file)
 above) instead of losing the rest of a long page outright. Cache entries
 are bounded two ways: a lazy TTL sweep (`[network] http_cache_ttl_secs`,
-default 24h, run at the start of every `http_get` call) and an LRU eviction
+default 24h, run at the start of every `http_fetch` call) and an LRU eviction
 pass keyed on file mtime once the cache exceeds `[network]
 http_cache_max_bytes` (default 20MB) — a burst of many unique pages inside
 one TTL window doesn't grow the cache unbounded either.

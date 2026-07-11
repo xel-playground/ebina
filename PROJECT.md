@@ -85,7 +85,7 @@
 | `sleep_until` | `(timestamp)` | agent 宣告下次喚醒,結束本次執行 |
 | `notify` | `(message)` | 單向通知人類,寫 `logs/notifications.jsonl`,gateway Live Log 面板顯示;不會被人類看到當作聊天回覆 |
 | `chat_send` | `(message, target?, channel_id?)` | 主動推播一則訊息到真實聊天介面(webui 或 Discord),給背景喚醒(cron/daily_maintenance/scheduled_task)用,不是回覆用(那是 `done.summary`)。`target:"discord"` 預設推給配對的 owner DM,帶 `channel_id`(2026-07-11 補做)可指定推到某個 guild 頻道,key 跟 incoming 訊息用的 `discord-channel-<id>` 一致 |
-| `http_get` | `(url) -> {status, body, total_bytes, cache_path}` | **GET-only**,request/action schema 裡沒有 `method` 欄位(結構性拿掉 POST,見 §4.6/§4.10)。Denylist 私網段防 SSRF;全量 egress log;`network.get_mode` 控管(open/tofu/allowlist);secret 佔位符注入(§4.8)。`body` 截斷在 `response_max_bytes`(預設 100,000 bytes),但完整內容另存 `workspace/.http_cache/<url-hash>.txt`(`cache_path` 回傳這個路徑),agent 可用 `read_file` 分頁讀過截斷點;cache 有 TTL 過期(`http_cache_ttl_secs`,預設 24h)+ LRU 依 mtime 驅逐(`http_cache_max_bytes`,預設 20MB) |
+| `http_fetch` | `(url, method?, headers?, body?) -> {status, body, total_bytes, cache_path}` | `method` 預設 `GET`,不帶 `headers`/`body` 時行為跟舊版 `http_get` 完全一樣。`POST`/`PUT`/`PATCH`/`DELETE` 2026-07-12 重新加回(見下方同日條目),domain gate 一視同仁套用,不因為是寫入額外加關卡。Denylist 私網段防 SSRF;全量 egress log(只記未解析文字);`network.get_mode` 控管(open/tofu/allowlist);`headers`/`body` 可帶 `{secrets.NAME}`,依 `network.credentials` 綁定的 host 解析(§4.8,跟 `ssh_exec` 同一個函式)。`body` 截斷在 `response_max_bytes`(預設 100,000 bytes),但完整內容另存 `workspace/.http_cache/<url-hash>.txt`(`cache_path` 回傳這個路徑),agent 可用 `read_file` 分頁讀過截斷點;cache 有 TTL 過期(`http_cache_ttl_secs`,預設 24h)+ LRU 依 mtime 驅逐(`http_cache_max_bytes`,預設 20MB) |
 | `search_web` | `(query) -> {results[]}` | tavily 或 self-host searxng,一般網頁搜尋 |
 | `ssh_exec` | `(command) -> {stdout, stderr, exit_code, timed_out}` | 見 §4.9——固定目標、無 pty、硬 wall-clock deadline、全量 audit log,是專案裡**唯一沒有事前審核的寫入能力** |
 | `schedule_task` / `update_task` / `delete_task` | CRUD | agent 自己設「每天早上提醒我」這種排程任務(`scheduler/<id>.json`),不用人手動去前端建;webui 也能直接編輯 task 的 `data_path` 內容(`GET/PUT /api/scheduler/task_file`) |
@@ -475,6 +475,28 @@ http_per_domain_per_min = 10   # 對外禮貌,防同站連打被 ban IP
       立刻寫進全域 `memory/notes/`,比原本得經過 daily_maintenance LLM review 才併入的路徑還
       危險——直接判斷「這個能力不該存在」比「補一個 host 端 owner gate 修它」更乾脆,撤掉,
       記憶寫入維持只有 daily_maintenance 一條路
+- [x] **`http_fetch` 重新加回寫入能力 + per-domain secret 綁定**(2026-07-12)——§4.10 曾把
+      `http_fetch` 拿掉 POST/寫入、改名 `http_get`,理由是 `ssh_exec` 已是沒審核的等價能力,
+      這裡加關卡是虛的。這次改名復原(`http_get`→`http_fetch`),重新支援
+      `method`/`headers`/`body`,同一套理由依然成立——containment 是 domain gate(§4.6 的
+      open/tofu/allowlist),不是另外加一層 write-specific 審核。
+  - [x] **`NetworkConfig::credentials`**(`[[network.credentials]] host, secret`):`headers`/
+        `body` 裡的 `{secrets.NAME}` 只有 `NAME` 綁在**這次請求實際解析驗證過的 host** 才會
+        代入(`secrets::resolve_placeholders_in`,跟 `ssh_exec` 同一個函式)。純靜態、人類手動
+        編輯 config.toml,刻意不掛在 `grants.rs` 的 tofu 動態核准佇列上——tofu 核准的是「能不能
+        讀這個網域」,低風險、常態核准;domain+secret 綁定是完全不同量級的授權(帶著活的憑證),
+        混在同一個核准流程裡,人類可能用核准一般網域存取的心態誤核准了憑證授權
+  - [x] 順便修：`resolve_placeholders_in` 的錯誤訊息原本寫死「`[ssh] allowed_secrets`/ssh_exec」
+        字樣,`http_fetch` 用的是不同來源的 allowlist(`network.credentials`),字面錯誤——改成
+        不點名任何一個呼叫端 config 區塊的通用措辭
+  - [x] 線上端到端驗證:對 httpbin.org 綁定測試 secret,實際打 `https://httpbin.org/headers`
+        確認代入真的送出(自己在 agent 之外直接 curl 同一個 endpoint 帶同樣的值，證明
+        httpbin 本身不會遮蔽,對照組確認 agent 收到的 `[REDACTED]` 是自家 `redact_secrets` 抓到
+        echo 回來的憑證,不是 httpbin 預設行為——agent 自己當下的解釋其實講錯了原因,只是連
+        帶驗證了 redact_secrets 這層防護有正常運作);對 example.com 用未綁定的
+        `discord_bot_token` 測試,確認 `bad_secret_placeholder` 正確擋下、請求根本沒送出。
+        37 個 kernel test 全過(`http_get_*` 系列改名 `http_fetch_*`,「method 欄位被忽略」
+        那個測試改寫成「method 真的會送出」,新增一個 unbound secret 拒絕測試)
 
 ### 未來糖果罐(延後)
 - [ ] **Agent 互通(A2A,actor model)**:設計已定——新 syscall `send_agent(target, msg)`,kernel **複製**訊息至對方 `inbox/from-<sender>/` 並喚醒;不共享任何目錄,Store 間零接觸;通訊拓撲在 kernel config 逐條宣告(capability),未宣告組合拒絕;訊息全經 kernel = 全量 A2A log,gateway 可視化對話圖。支援監督者模式、互相 review 等玩法;新 agent = 新資料夾 + 一行拓撲
