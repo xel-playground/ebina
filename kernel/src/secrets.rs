@@ -69,6 +69,46 @@ pub fn resolve_placeholder(secrets: &Secrets, spec: &str) -> Result<String, Stri
         .ok_or_else(|| format!("no secret named `{name}` in the vault"))
 }
 
+/// Resolves every `{secrets.NAME}` occurrence *within* a larger string —
+/// unlike `resolve_placeholder`, which requires the whole field to be
+/// nothing but one placeholder — for a syscall like `ssh_exec` where a
+/// secret needs to be substituted into one piece of an otherwise
+/// guest-authored command (e.g. `curl -H "Authorization: Bot
+/// {secrets.discord_bot_token}" ...`). Errors, rather than leaving the
+/// literal placeholder text sitting in the command, the moment any named
+/// secret is missing, not in `allowed`, or a `{secrets.` is left
+/// unterminated.
+///
+/// `allowed` is a deliberate allowlist, not "any secret in the vault" —
+/// even though `ssh_exec`'s destination is fixed (the same property that
+/// makes `llm_call`'s api_key resolution safe, unlike `http_get`'s
+/// arbitrary guest-chosen URL), the agent still authors the *whole*
+/// command, and the target machine has its own outbound network access.
+/// Without this list, a prompt-injected agent could put any other vault
+/// secret's placeholder — the LLM provider's api_key, `ssh_key_passphrase`
+/// — into an `ssh_exec` command just as easily as the one secret actually
+/// meant to be usable this way (see `SshConfig::allowed_secrets`).
+pub fn resolve_placeholders_in(secrets: &Secrets, text: &str, allowed: &[String]) -> Result<String, String> {
+    let mut result = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(PREFIX) {
+        result.push_str(&rest[..start]);
+        let after_prefix = &rest[start + PREFIX.len()..];
+        let Some(end) = after_prefix.find(SUFFIX) else {
+            return Err(format!("unterminated `{{secrets.` placeholder in: {text}"));
+        };
+        let name = &after_prefix[..end];
+        if !allowed.iter().any(|a| a == name) {
+            return Err(format!("secret `{name}` is not in `[ssh] allowed_secrets` — not permitted for ssh_exec placeholder substitution"));
+        }
+        let value = secrets.get(name).ok_or_else(|| format!("no secret named `{name}` in the vault"))?;
+        result.push_str(value);
+        rest = &after_prefix[end + SUFFIX.len()..];
+    }
+    result.push_str(rest);
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +138,36 @@ mod tests {
         // not silently accepted — config.toml is guest-readable
         assert!(resolve_placeholder(&secrets, "the-real-key").is_err());
         assert!(resolve_placeholder(&secrets, "").is_err());
+    }
+
+    #[test]
+    fn resolves_allowed_placeholder_inside_a_larger_command() {
+        let secrets = secrets_with("discord", "tok-123");
+        let allowed = vec!["discord".to_string()];
+        let out = resolve_placeholders_in(&secrets, "curl -H 'Authorization: Bot {secrets.discord}' https://x", &allowed).unwrap();
+        assert_eq!(out, "curl -H 'Authorization: Bot tok-123' https://x");
+    }
+
+    #[test]
+    fn rejects_placeholder_not_in_allowlist() {
+        let secrets = secrets_with("llm_api_key", "sk-real");
+        // present in the vault, but the caller only allowed "discord" —
+        // must not resolve, even though the secret genuinely exists
+        let allowed = vec!["discord".to_string()];
+        let err = resolve_placeholders_in(&secrets, "curl {secrets.llm_api_key}", &allowed).unwrap_err();
+        assert!(err.contains("llm_api_key"));
+    }
+
+    #[test]
+    fn rejects_unterminated_placeholder() {
+        let secrets = secrets_with("discord", "tok-123");
+        let allowed = vec!["discord".to_string()];
+        assert!(resolve_placeholders_in(&secrets, "curl {secrets.discord", &allowed).is_err());
+    }
+
+    #[test]
+    fn passes_through_text_with_no_placeholders() {
+        let secrets = Secrets::default();
+        assert_eq!(resolve_placeholders_in(&secrets, "curl https://example.com", &[]).unwrap(), "curl https://example.com");
     }
 }

@@ -346,11 +346,24 @@ pub struct SshConfig {
     /// every other syscall's output cap, so a chatty/looping remote command
     /// can't blow up the LLM context or the log file
     pub max_output_bytes: usize,
+    /// Names (not values) of vault secrets `ssh_exec` is allowed to
+    /// substitute a `{secrets.NAME}` placeholder for inside a `command`
+    /// string (`secrets::resolve_placeholders_in`) — empty by default,
+    /// meaning no secret is usable this way until explicitly named here.
+    /// Deliberately an allowlist, not "any secret in the vault": the fixed
+    /// SSH target keeps a resolved secret from being redirected to an
+    /// attacker's host the way `http_get` could, but the agent still
+    /// authors the *whole* command, and that target machine has its own
+    /// outbound network access — without this list, a prompt-injected
+    /// agent could put `{secrets.<llm-api-key-name>}` (or anything else in
+    /// the vault) into an `ssh_exec` command just as easily as the one
+    /// secret actually meant to be used this way.
+    pub allowed_secrets: Vec<String>,
 }
 
 impl Default for SshConfig {
     fn default() -> Self {
-        SshConfig { host: String::new(), port: 22, user: "root".to_string(), timeout_secs: 30, max_output_bytes: 3 * 1024 * 1024 }
+        SshConfig { host: String::new(), port: 22, user: "root".to_string(), timeout_secs: 30, max_output_bytes: 3 * 1024 * 1024, allowed_secrets: Vec::new() }
     }
 }
 

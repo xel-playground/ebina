@@ -14,6 +14,19 @@ use std::time::{Duration, Instant};
 /// outside agent_home (`secrets.toml` `ssh_key_path`, resolved host-side,
 /// the guest never sees the key itself or its passphrase).
 ///
+/// `command` may also reference `{secrets.NAME}` for any name listed in
+/// `[ssh] allowed_secrets` (`secrets::resolve_placeholders_in`) — resolved
+/// host-side before the command ever reaches the SSH channel, so the guest
+/// only ever writes the placeholder text, never the real value (e.g.
+/// authenticating a `curl` call to an admin API from a skill, without the
+/// agent itself handling that credential). The allowlist matters: the
+/// fixed destination here is what makes this safe at all (same property
+/// that makes `llm_call`'s api_key resolution safe, unlike `http_get`'s
+/// guest-chosen URL) — but the agent authors the *whole* command, and the
+/// target machine has its own outbound network access, so without the
+/// allowlist a prompt-injected agent could resolve *any* vault secret this
+/// way, not just the one actually meant to be usable here.
+///
 /// This is deliberately the one syscall in this codebase that hands the
 /// agent something close to a real shell — there's no bounded operation set
 /// like `db_exec`'s SQL authorizer or the (now-removed) `exec_wasm`'s wasm
@@ -43,13 +56,22 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
     };
     let source = req.get("_meta").cloned().unwrap_or(Value::Null);
 
+    // `command` (the original, unresolved text — still whatever placeholder
+    // the guest wrote, never the real secret) is what gets logged below,
+    // regardless of which branch runs — a resolved value must never reach
+    // `logs/ssh.jsonl`.
     let result = if state.config.ssh.host.is_empty() {
         Err(("not_configured", "no `[ssh]` host configured in config.toml — ssh_exec is disabled".to_string()))
     } else if let Some(key_path) = state.secrets.get("ssh_key_path").map(str::to_string) {
         let passphrase = state.secrets.get("ssh_key_passphrase").map(str::to_string);
         let cfg = state.config.ssh.clone();
-        let deadline = Instant::now() + Duration::from_secs(cfg.timeout_secs);
-        run_command(&cfg, &key_path, passphrase.as_deref(), command, deadline).map_err(|e| ("ssh_error", e))
+        match crate::secrets::resolve_placeholders_in(&state.secrets, command, &cfg.allowed_secrets) {
+            Ok(resolved_command) => {
+                let deadline = Instant::now() + Duration::from_secs(cfg.timeout_secs);
+                run_command(&cfg, &key_path, passphrase.as_deref(), &resolved_command, deadline).map_err(|e| ("ssh_error", e))
+            }
+            Err(e) => Err(("bad_secret_placeholder", e)),
+        }
     } else {
         Err(("not_configured", "no `ssh_key_path` secret in the vault — ssh_exec is disabled".to_string()))
     };
