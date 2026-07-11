@@ -96,6 +96,11 @@ pub fn run(trigger: &Value) {
 
     let mut summary = String::new();
     let mut last_input_tokens: Option<u64> = None;
+    // this *turn's* very first `llm_call`, before its own action loop below
+    // has added anything — see the write-site's comment (further down) for
+    // why this, not `last_input_tokens`, is what `chat.auto_compact_tokens`
+    // needs to be measured against.
+    let mut first_input_tokens: Option<u64> = None;
     let mut consecutive_llm_failures: u32 = 0;
     for turn in 0..MAX_TURNS {
         // tags every `syscall::call`/`perf::record` from here on with this
@@ -193,6 +198,7 @@ pub fn run(trigger: &Value) {
             .and_then(|u| u.get("input_tokens"))
             .and_then(|v| v.as_u64())
             .or(last_input_tokens);
+        first_input_tokens = first_input_tokens.or(last_input_tokens);
         let text = resp
             .get("result")
             .and_then(|r| r.get("text"))
@@ -548,8 +554,25 @@ pub fn run(trigger: &Value) {
     // gateway.rs `last_chat_context_tokens`). Keyed by `session_key` (webui
     // vs each Discord channel/DM, see gateway.rs `handle_chat_message`) so
     // they don't clobber each other's reading either.
+    //
+    // `first_input_tokens`, not `last_input_tokens`: this run's *own*
+    // action loop above (tool calls piling into `messages` turn over turn —
+    // several `write_file`/`ssh_exec`/scheduler edits in one reply, say)
+    // grows the *last* call's prompt size for reasons that have nothing to
+    // do with how big the *saved* `session.json` history actually is —
+    // that's `runtime.in_run_compact_tokens`'s job (mid-run compaction,
+    // above), a completely different concern. Using `last_input_tokens`
+    // here meant a single busy-but-short conversation could rack up 60k+
+    // tokens purely from its own tool round-trips and immediately trip
+    // `chat.auto_compact_tokens` (default 50,000), collapsing the whole
+    // session down to one terse summary line right after — from a human's
+    // perspective indistinguishable from "my message got replaced by a
+    // robotic paraphrase and the rest of my history vanished." The first
+    // call's prompt size (system prompt + the actual saved history, before
+    // this turn added anything of its own) is what genuinely reflects
+    // cross-turn growth.
     if trigger.get("type").and_then(|t| t.as_str()) == Some("message") {
-        if let Some(tokens) = last_input_tokens {
+        if let Some(tokens) = first_input_tokens {
             let session_key = trigger.get("session_key").and_then(|s| s.as_str()).unwrap_or("webui");
             let dir = format!("/logs/chat_sessions/{session_key}");
             let _ = fs::create_dir_all(&dir);
