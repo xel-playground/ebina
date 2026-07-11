@@ -1054,7 +1054,6 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String]) -> (String, String
     // `recent_log_entries` in its own `trigger_note` below — this would
     // just be a redundant, more-truncated view of the same data for that
     // one trigger type, so skip it there.
-    const STAGING_TAIL_ENTRIES: usize = 5;
     let staging_section = if trigger_type == Some("daily_maintenance") {
         String::new()
     } else {
@@ -1065,14 +1064,15 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String]) -> (String, String
         // gets excluded for those (correctly — they have no `history` to
         // already be showing this).
         let own_session_key = trigger.get("session_key").and_then(|s| s.as_str());
-        let staging = recent_staging_entries(STAGING_TAIL_ENTRIES, own_session_key);
+        let staging_count = cross_session_staging_entries_config();
+        let staging = recent_staging_entries(staging_count, own_session_key);
         if staging.is_empty() {
             String::new()
         } else {
             format!(
-                "## Recent activity across all sessions (last {STAGING_TAIL_ENTRIES}, cross-session short-term \
+                "## Recent activity across all sessions (last {staging_count}, cross-session short-term \
                  memory)\n\n\
-                 What's happened recently in *any* session/trigger — webui, Discord, cron — not just this one, \
+                 What's happened recently in *other* chat sessions — webui, Discord — not just this one, \
                  before the next daily_maintenance distills it into memory/notes/. For context, not something \
                  to reply to directly:\n\n{staging}\n\n"
             )
@@ -1115,6 +1115,12 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String]) -> (String, String
 /// would just be duplication, not new information. Filtered *before*
 /// counting toward `max_entries`, not after, so excluding a chatty own
 /// session doesn't silently starve this of entries from everywhere else.
+///
+/// Only ever considers `message`-trigger entries — `cron`/`scheduled_task`/
+/// `daily_maintenance` fire on their own schedule regardless of chat
+/// activity, and would otherwise just be routine-wake noise competing for
+/// the same `max_entries` slots as the actual "what did another chat just
+/// say" awareness this exists for.
 fn recent_staging_entries(max_entries: usize, exclude_session_key: Option<&str>) -> String {
     let today_day = (now_unix() / 86_400) as i64;
     let exclude_tag = exclude_session_key.map(|k| format!("[{k}]"));
@@ -1123,6 +1129,10 @@ fn recent_staging_entries(max_entries: usize, exclude_session_key: Option<&str>)
         let path = format!("{NOTES_DIR}/{}/log.md", crate::time::civil_from_days(day));
         if let Ok(text) = fs::read_to_string(&path) {
             for block in text.split("\n## run at ").filter(|b| !b.trim().is_empty()) {
+                let is_message_trigger = block.split_once("trigger: ").is_some_and(|(_, rest)| rest.starts_with("message"));
+                if !is_message_trigger {
+                    continue;
+                }
                 if let Some(tag) = &exclude_tag {
                     if block.contains(tag.as_str()) {
                         continue;
@@ -1140,6 +1150,38 @@ fn recent_staging_entries(max_entries: usize, exclude_session_key: Option<&str>)
     entries.sort_by_key(|(ts, _)| *ts);
     let start = entries.len().saturating_sub(max_entries);
     entries[start..].iter().map(|(_, b)| b.clone()).collect::<Vec<_>>().join("\n\n")
+}
+
+/// Crude scan of `/config.toml`'s `[chat]` section for
+/// `cross_session_staging_entries = N` — same reasoning as
+/// `memory::current_embed_model`: no toml parser in the guest, and the
+/// file's flat/known-shape enough that this is simpler than pulling one in.
+/// Falls back to `5` (matching `ChatConfig::default()`) if the key isn't
+/// present or doesn't parse — this value only ever takes effect once
+/// actually written to `config.toml`, the kernel-side default is just what
+/// ships/documents the setting.
+fn cross_session_staging_entries_config() -> usize {
+    const DEFAULT: usize = 5;
+    let config_text = fs::read_to_string("/config.toml").unwrap_or_default();
+    let mut in_chat_section = false;
+    for line in config_text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_chat_section = line == "[chat]";
+            continue;
+        }
+        if !in_chat_section {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("cross_session_staging_entries").map(str::trim_start) {
+            if let Some(value) = rest.strip_prefix('=') {
+                if let Ok(n) = value.trim().parse::<usize>() {
+                    return n;
+                }
+            }
+        }
+    }
+    DEFAULT
 }
 
 /// Collects every day-log entry with `ts` after `since_ts`, across however

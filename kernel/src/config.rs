@@ -321,11 +321,25 @@ pub struct ChatConfig {
     /// for Discord threads, which have no manual reset button — left alone
     /// they'd grow the context window forever.
     pub auto_compact_tokens: u64,
+    /// How many recent `message`-trigger runs from *other* sessions
+    /// (`agent_loop.rs`'s cross-session short-term memory, "## Recent
+    /// activity across all sessions") get surfaced in every non-
+    /// `daily_maintenance` run's system prompt. Deliberately `message`-only
+    /// — `cron`/`scheduled_task`/`daily_maintenance` entries would just be
+    /// routine-wake noise competing for the same slots, not the "what did
+    /// another chat just say" awareness this exists for. No toml parser in
+    /// the guest (`agent_loop.rs` crude-scans this same field out of
+    /// `/config.toml`'s `[chat]` section, same pattern as
+    /// `memory::current_embed_model`), so this value only takes effect
+    /// once actually written to `config.toml` — this struct's default is
+    /// just what ships/documents the setting, not what the guest falls
+    /// back to on its own (it has its own hardcoded 5).
+    pub cross_session_staging_entries: usize,
 }
 
 impl Default for ChatConfig {
     fn default() -> Self {
-        ChatConfig { auto_compact_tokens: 120_000 }
+        ChatConfig { auto_compact_tokens: 120_000, cross_session_staging_entries: 5 }
     }
 }
 
