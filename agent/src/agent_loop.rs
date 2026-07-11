@@ -1027,8 +1027,17 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String]) -> (String, String
          {tasks_text}\n\n"
     );
 
+    // volatile, not stable — changes every single run, unlike everything
+    // above it. Without this the model has no way to answer "what time is
+    // it" at all (there's no clock syscall, no ambient time source in a
+    // wasm sandbox) and either guesses or admits it doesn't know.
+    let now_ts = now_unix();
+    let current_time = format!("{} (unix {now_ts})", human_timestamp(now_ts));
+
     let volatile = format!(
-        "{recent_chat_section}\
+        "## Current time\n\n\
+         {current_time}\n\n\
+         {recent_chat_section}\
          ## Relevant memory for this run\n\n\
          Hybrid BM25 + vector search, best matches first:\n\n\
          {context}\n\n\
