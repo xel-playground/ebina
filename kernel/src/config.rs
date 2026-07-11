@@ -292,7 +292,7 @@ pub struct RuntimeConfig {
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
-        RuntimeConfig { epoch_timeout_secs: 30 * 60, in_run_compact_tokens: 10_000, cache_wasm_module: false }
+        RuntimeConfig { epoch_timeout_secs: 30 * 60, in_run_compact_tokens: 100_000, cache_wasm_module: false }
     }
 }
 
