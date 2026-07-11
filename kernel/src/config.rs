@@ -271,7 +271,10 @@ pub struct RuntimeConfig {
     /// frequent compaction calls (each one its own llm_call, plus repeated
     /// summarizing loses some fidelity in the tool-call trail — though the
     /// original task message is always preserved verbatim, see
-    /// `compact_run_messages`).
+    /// `compact_run_messages`). Lowered 100,000 → 60,000 (2026-07-12): the
+    /// session-level `chat.auto_compact_tokens` (120,000) rarely gets
+    /// crossed in practice, so this one was doing most of the real
+    /// compaction work and 100k left it firing later than useful.
     pub in_run_compact_tokens: u64,
     /// Test flag comparing two `wasm_path` loading strategies — `false`
     /// (default): every run compiles the wasm file fresh via
@@ -304,7 +307,7 @@ pub struct RuntimeConfig {
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
-        RuntimeConfig { epoch_timeout_secs: 30 * 60, in_run_compact_tokens: 100_000, cache_wasm_module: false, max_output_tokens: 16_000 }
+        RuntimeConfig { epoch_timeout_secs: 30 * 60, in_run_compact_tokens: 60_000, cache_wasm_module: false, max_output_tokens: 16_000 }
     }
 }
 
