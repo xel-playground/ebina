@@ -414,6 +414,29 @@ pub fn run(trigger: &Value) {
                 let result = syscall::call("search_web", &serde_json::json!({"query": query}));
                 push_tool_result(&mut messages, &result);
             }
+            Some("memory_search") => {
+                // `hybrid_search` otherwise only ever runs once, automatically,
+                // at the very top of a run, using the trigger text itself as
+                // the query (`run()`'s `retrieved`) — fixed the moment the run
+                // starts. This is the only way to issue a *different* query
+                // mid-run, once something that came up in the conversation
+                // makes it clear the original trigger text wasn't the right
+                // search term after all.
+                let query = action.get("query").and_then(|q| q.as_str()).unwrap_or("");
+                let top_k = action.get("top_k").and_then(Value::as_u64).map(|n| n as usize).unwrap_or(RETRIEVAL_TOP_K);
+                let result = if query.trim().is_empty() {
+                    serde_json::json!({"ok": false, "error": "memory_search requires a non-empty \"query\""})
+                } else {
+                    serde_json::json!({"ok": true, "results": memory::hybrid_search(query, top_k)})
+                };
+                push_tool_result(&mut messages, &result);
+            }
+            Some("remember") => {
+                let topic = action.get("topic").and_then(|t| t.as_str()).unwrap_or("");
+                let content = action.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                let result = remember_now(topic, content);
+                push_tool_result(&mut messages, &result);
+            }
             Some("ssh_exec") => {
                 let command = action.get("command").and_then(|c| c.as_str()).unwrap_or("");
                 let result = syscall::call("ssh_exec", &serde_json::json!({"command": command, "_meta": source_meta}));
@@ -992,6 +1015,20 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String]) -> (String, String
          information you don't already know (news, local businesses, prices, anything time-sensitive) \
          instead of guessing or refusing — then http_get a specific result's url if you need the full \
          page\n\
+         - `{{\"action\":\"memory_search\",\"query\":\"...\",\"top_k\":N}}` — searches your own \
+         `/memory/notes/` (hybrid BM25 + vector, same engine as the \"Relevant memory\" section above) \
+         with a query *you* choose, returns `{{\"results\":[\"...\"]}}`. The automatic retrieval above only \
+         ever ran once, at the very start of this run, using the trigger text itself as the query — use \
+         this mid-run once the conversation makes clear you need something that query didn't surface. \
+         `top_k` defaults to 5\n\
+         - `{{\"action\":\"remember\",\"topic\":\"...\",\"content\":\"...\"}}` — immediately appends \
+         `content` to `/memory/notes/{{topic}}.md`, without waiting for the next daily_maintenance cycle \
+         (up to 6h away) to distill it there. Use this for something that genuinely shouldn't wait — \
+         a fact the human just told you to remember right now, not something to reach for every turn (this \
+         turn's activity is already captured for free in today's log.md and gets folded in on its own \
+         eventually). `topic` is a bare name (no `/`), picks (or creates) which topic file it lands in — \
+         reuse an existing topic name (see files under `/memory/notes/` via `list_dir`) when one already \
+         fits, rather than fragmenting the same kind of fact across many near-duplicate topic files\n\
          - `{{\"action\":\"ssh_exec\",\"command\":\"...\"}}` — runs one command on the single fixed SSH \
          target set up in `config.toml`'s `[ssh]` section (you can't choose a different host); returns \
          `{{\"stdout\":\"...\",\"stderr\":\"...\",\"exit_code\":0,\"timed_out\":false}}`. Errors with \
@@ -1182,6 +1219,41 @@ fn cross_session_staging_entries_config() -> usize {
         }
     }
     DEFAULT
+}
+
+/// Explicit "remember this now" action — distinct from the passive path
+/// (today's `memory/notes/<date>/log.md` → `daily_maintenance` distills it
+/// into a curated `memory/notes/<topic>.md` up to 6h later). A live chat
+/// turn otherwise can't write to `memory/notes/` at all (`write_action_denial`
+/// scopes chat-turn writes to `/workspace/`) — this exists for a fact that
+/// genuinely shouldn't wait for the next maintenance cycle. Appends rather
+/// than overwrites: repeated `remember` calls into the same topic
+/// accumulate, they don't clobber whatever `daily_maintenance` (or an
+/// earlier `remember`) already wrote there. Picked up by the same
+/// end-of-run `reindex_all_notes` every run already does — no extra
+/// reindex needed here, `hybrid_search`/`memory_search` see it starting
+/// next run.
+fn remember_now(topic: &str, content: &str) -> Value {
+    if topic.trim().is_empty() || content.trim().is_empty() {
+        return serde_json::json!({"ok": false, "error": "remember requires a non-empty \"topic\" and \"content\""});
+    }
+    // `topic` is a bare filename stem, not a path — this sandbox's WASI
+    // preopen root is the *whole* agent_home, not just memory/notes/, so an
+    // unsanitized "../../SOUL" would let this overwrite something far more
+    // sensitive than a note.
+    if topic.contains('/') || topic.contains("..") {
+        return serde_json::json!({"ok": false, "error": "topic must be a bare name, no \"/\" or \"..\""});
+    }
+    let _ = fs::create_dir_all(NOTES_DIR);
+    let path = format!("{NOTES_DIR}/{topic}.md");
+    let entry = format!("\n{}\n", content.trim());
+    match fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(mut f) => match f.write_all(entry.as_bytes()) {
+            Ok(()) => serde_json::json!({"ok": true, "path": path}),
+            Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}),
+        },
+        Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}),
+    }
 }
 
 /// Collects every day-log entry with `ts` after `since_ts`, across however
