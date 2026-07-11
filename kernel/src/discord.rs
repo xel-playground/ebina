@@ -17,9 +17,11 @@ const MAX_DISCORD_LEN: usize = 2000;
 /// core. Only runs if a `discord_bot_token` secret is configured — no token,
 /// no Discord connection, gateway works exactly as before.
 ///
-/// Only replies to a DM or an @mention in a guild channel (not every
-/// message in every channel the bot can see — too noisy/expensive
-/// otherwise). Each DM/channel gets its own chat session
+/// Only replies to a DM *from the paired owner* or an @mention in a guild
+/// channel (not every message in every channel the bot can see — too
+/// noisy/expensive otherwise, and a DM from anyone else is silently
+/// ignored — 2026-07-12, previously any stranger's DM got a full reply in
+/// their own isolated session). Each DM/channel gets its own chat session
 /// (`discord-dm-<user>` / `discord-channel-<channel>`,
 /// `gateway::handle_chat_message`) so Discord conversations don't bleed
 /// into the webui's session or each other's.
@@ -125,6 +127,18 @@ impl EventHandler for Handler {
         }
         if !is_dm && !mentioned {
             return; // only reply to a DM or an explicit @mention (avoid replying to every message in a busy channel)
+        }
+        // A DM from anyone but the paired owner gets silently ignored, not
+        // just flagged as suspect after the fact — before this, `is_dm`
+        // alone was enough to get a full conversational reply from a
+        // complete stranger (their own isolated `discord-dm-<their-id>`
+        // session, but a real reply all the same). Falls through here for
+        // an unpaired vault too (`load_owner` returns `None`, which never
+        // equals `Some(id)`) — that's correct: before pairing, the only DM
+        // that should ever get a response is the exact rotating code,
+        // already handled above.
+        if is_dm && load_owner(&self.state.agent_home).as_deref() != Some(msg.author.id.to_string().as_str()) {
+            return;
         }
 
         let text = strip_mention(&msg.content, bot_id);
