@@ -387,7 +387,11 @@ pub fn run(trigger: &Value) {
             Some("chat_send") => {
                 let message = action.get("message").and_then(|m| m.as_str()).unwrap_or("");
                 let target = action.get("target").and_then(|t| t.as_str()).unwrap_or("webui");
-                let result = syscall::call("chat_send", &serde_json::json!({"message": message, "target": target}));
+                let mut req = serde_json::json!({"message": message, "target": target});
+                if let Some(channel_id) = action.get("channel_id") {
+                    req["channel_id"] = channel_id.clone();
+                }
+                let result = syscall::call("chat_send", &req);
                 push_tool_result(&mut messages, &result);
             }
             Some("http_get") => {
@@ -950,7 +954,10 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String]) -> String {
          use `done`'s `summary` instead, not this. `target` is `\"webui\"` (default, appends to the \
          browser Chat panel's session) or `\"discord\"` (DMs whichever Discord user has paired as owner — \
          errors with `not_paired` if nobody has yet; tell the human to check `GET /api/discord/pairing` \
-         for the code)\n\
+         for the code). With `target:\"discord\"`, add `\"channel_id\":\"...\"` to push to a specific \
+         guild channel instead of the owner's DM — use the numeric id from that channel's own \
+         `discord-channel-<id>` session key (visible in past conversation history from that channel) if \
+         you've talked there before; omit it to default to the owner's DM\n\
          - `{{\"action\":\"http_get\",\"url\":\"...\"}}` — GET only, no `method` field exists for this \
          action at all; a brand-new domain under tofu mode queues for a human's approval and comes back as \
          `pending_approval` — tell the user that instead of retrying immediately. An HTML response comes \

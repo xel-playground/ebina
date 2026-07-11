@@ -84,7 +84,7 @@
 | `db_exec` | `(sql, params) -> rows` | RAG 引擎,只有 `agent/src/memory.rs` 呼叫(hybrid_search/reindex),**LLM 沒有對應 action,完全碰不到**。原生 SQLite 開 `memory/index.db`(WAL mode,讓外部工具如 DB Browser 用唯讀/讀寫模式開著時不會跟 agent run 搶 lock),查詢逾時可調(預設 10s)。PRAGMA allowlist 曾漏放 `data_version`(FTS5 內部每次寫入 virtual table 都會查這個 pragma)——導致任何超過一段標題的筆記永遠只有第一段被索引,已修 |
 | `sleep_until` | `(timestamp)` | agent 宣告下次喚醒,結束本次執行 |
 | `notify` | `(message)` | 單向通知人類,寫 `logs/notifications.jsonl`,gateway Live Log 面板顯示;不會被人類看到當作聊天回覆 |
-| `chat_send` | `(message, target?)` | 主動推播一則訊息到真實聊天介面(webui 或 Discord),給背景喚醒(cron/daily_maintenance/scheduled_task)用,不是回覆用(那是 `done.summary`) |
+| `chat_send` | `(message, target?, channel_id?)` | 主動推播一則訊息到真實聊天介面(webui 或 Discord),給背景喚醒(cron/daily_maintenance/scheduled_task)用,不是回覆用(那是 `done.summary`)。`target:"discord"` 預設推給配對的 owner DM,帶 `channel_id`(2026-07-11 補做)可指定推到某個 guild 頻道,key 跟 incoming 訊息用的 `discord-channel-<id>` 一致 |
 | `http_get` | `(url) -> {status, body, total_bytes, cache_path}` | **GET-only**,request/action schema 裡沒有 `method` 欄位(結構性拿掉 POST,見 §4.6/§4.10)。Denylist 私網段防 SSRF;全量 egress log;`network.get_mode` 控管(open/tofu/allowlist);secret 佔位符注入(§4.8)。`body` 截斷在 `response_max_bytes`(預設 100,000 bytes),但完整內容另存 `workspace/.http_cache/<url-hash>.txt`(`cache_path` 回傳這個路徑),agent 可用 `read_file` 分頁讀過截斷點;cache 有 TTL 過期(`http_cache_ttl_secs`,預設 24h)+ LRU 依 mtime 驅逐(`http_cache_max_bytes`,預設 20MB) |
 | `search_web` | `(query) -> {results[]}` | tavily 或 self-host searxng,一般網頁搜尋 |
 | `ssh_exec` | `(command) -> {stdout, stderr, exit_code, timed_out}` | 見 §4.9——固定目標、無 pty、硬 wall-clock deadline、全量 audit log,是專案裡**唯一沒有事前審核的寫入能力** |

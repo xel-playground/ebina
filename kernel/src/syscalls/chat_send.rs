@@ -5,10 +5,11 @@ use serde_json::Value;
 use std::path::Path;
 use std::time::Duration;
 
-/// `chat_send(message, target?)` — proactively pushes one message into a
-/// real chat surface, for a background-triggered run (`cron`/
-/// `daily_maintenance`/`scheduled_task`) that has something worth telling
-/// the human, not a reply to a live message (that's `done`'s `summary`).
+/// `chat_send(message, target?, channel_id?)` — proactively pushes one
+/// message into a real chat surface, for a background-triggered run
+/// (`cron`/`daily_maintenance`/`scheduled_task`) that has something worth
+/// telling the human, not a reply to a live message (that's `done`'s
+/// `summary`).
 ///
 /// `target` is `"webui"` (default) or `"discord"` — either way this just
 /// appends one `assistant`-role turn to `chat_sessions/<key>/session.json`.
@@ -19,8 +20,16 @@ use std::time::Duration;
 /// turn and actually sends it through the live bot connection — this
 /// syscall runs synchronously inside the wasm sandbox and has no direct
 /// line to that async client, hence the file handoff rather than sending
-/// straight from here. Errors with `not_paired` if no Discord owner has
-/// paired yet (see `GET /api/discord/pairing`).
+/// straight from here.
+///
+/// `target: "discord"` defaults to the paired owner's DM (errors
+/// `not_paired` if nobody's paired yet, see `GET /api/discord/pairing`) —
+/// pass `channel_id` (the same id `discord-channel-<id>` sessions are
+/// already keyed by, see `discord.rs`'s incoming-message handler) to push
+/// to a specific guild channel instead. No extra gating beyond that: the
+/// Discord API itself already bounds this to channels the bot has actually
+/// been added to, same "containment is blast radius, not capability"
+/// reasoning `ssh_exec` documents.
 pub fn call(state: &mut AgentState, req: Value) -> Value {
     let Some(message) = req.get("message").and_then(|m| m.as_str()) else {
         return error_json("bad_request", "chat_send requires a string `message` field");
@@ -34,24 +43,39 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
         return error_json("bad_request", "chat_send's `message` must not be empty");
     }
     let session_key = match req.get("target").and_then(|t| t.as_str()).unwrap_or("webui") {
-        "discord" => {
-            let owner_path = state.agent_home.join("logs/discord_owner.json");
-            let Ok(text) = std::fs::read_to_string(&owner_path) else {
-                return error_json(
-                    "not_paired",
-                    "no Discord owner paired yet — tell the human to DM the bot the pairing code (GET /api/discord/pairing shows it)",
-                );
-            };
-            let Some(user_id) =
-                serde_json::from_str::<Value>(&text).ok().and_then(|v| v.get("user_id").and_then(|u| u.as_str()).map(str::to_string))
-            else {
-                return error_json("io_error", "discord_owner.json is malformed");
-            };
-            format!("discord-dm-{user_id}")
-        }
+        "discord" => match channel_id_str(req.get("channel_id")) {
+            Some(channel_id) => format!("discord-channel-{channel_id}"),
+            None => {
+                let owner_path = state.agent_home.join("logs/discord_owner.json");
+                let Ok(text) = std::fs::read_to_string(&owner_path) else {
+                    return error_json(
+                        "not_paired",
+                        "no Discord owner paired yet — tell the human to DM the bot the pairing code (GET /api/discord/pairing shows it)",
+                    );
+                };
+                let Some(user_id) =
+                    serde_json::from_str::<Value>(&text).ok().and_then(|v| v.get("user_id").and_then(|u| u.as_str()).map(str::to_string))
+                else {
+                    return error_json("io_error", "discord_owner.json is malformed");
+                };
+                format!("discord-dm-{user_id}")
+            }
+        },
         _ => "webui".to_string(),
     };
     append_assistant_turn(&state.agent_home, &session_key, message)
+}
+
+/// Accepts `channel_id` as either a JSON string or a number — Discord ids
+/// overflow `f64`'s exact-integer range, so a model emitting one as a raw
+/// JSON number risks silent precision loss; as a string it round-trips
+/// exactly. Support both since a model won't reliably know to quote it.
+fn channel_id_str(v: Option<&Value>) -> Option<String> {
+    match v {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    }
 }
 
 /// A `chat_send`'d turn has no natural preceding "user" turn to explain
