@@ -276,8 +276,12 @@ Separate from `daily_maintenance` and from `[chat] auto_compact_tokens`
 watches a single *run's own* `messages` array as it grows turn over turn
 (tool results piling up: a long `ssh_exec` exploration, several `http_get`s
 in one run). Once the last `llm_call`'s `input_tokens` crosses
-`runtime.in_run_compact_tokens` (default 150,000), everything except the
-system prompt, the very first task message (so the original ask survives —
+`runtime.in_run_compact_tokens` (default 10,000 — deliberately well under
+the model's real context limit, not just avoiding overflow: every internal
+tool-call iteration resends the *entire* growing `messages` array, so a
+high threshold lets one action-heavy turn rack up several expensive/slow
+large-context calls before ever compacting), everything except the system
+prompt, the very first task message (so the original ask survives —
 summarizing a summary of a summary drifts, but the root intent never
 should), and the 2 most recent messages gets summarized via one extra
 `llm_call` and spliced back in. Without this, a single long-running turn
