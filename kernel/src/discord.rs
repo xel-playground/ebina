@@ -112,6 +112,17 @@ impl EventHandler for Handler {
             return; // gateway not fully connected yet
         };
         let mentioned = msg.mentions.iter().any(|u| u.id == bot_id);
+        // Diagnostic for the "mention in a thread doesn't seem to register"
+        // report: this line fires for *every* non-bot guild message the
+        // gateway actually delivers to us, before the reply-gate below, so
+        // it tells apart two very different problems that look identical
+        // from Discord's side — the event never reaching the bot at all
+        // (nothing logged — likely a thread-membership/visibility gap on
+        // Discord's end) vs. the event arriving but `mentioned` coming back
+        // false (a real parsing bug on our end).
+        if !is_dm {
+            println!("[discord] message in channel {} (guild {:?}): mentioned={mentioned} mentions={:?}", msg.channel_id, msg.guild_id, msg.mentions.iter().map(|u| u.id).collect::<Vec<_>>());
+        }
         if !is_dm && !mentioned {
             return; // only reply to a DM or an explicit @mention (avoid replying to every message in a busy channel)
         }
