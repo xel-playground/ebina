@@ -404,6 +404,18 @@ http_per_domain_per_min = 10   # 對外禮貌,防同站連打被 ban IP
       這段 JSON 轉換邏輯。線上 provider 目前是 openai,吃不到 cache_control 這條路,但重排本身
       對任何 provider 都有效(至少同一 run 內的 action loop 多次 llm_call 共用同一份沒變的
       system_prompt,原本 provider 端能不能利用純看它自己實作)
+- [x] system prompt 順便加 `## Current time`(2026-07-11)——wasm sandbox 沒有時鐘來源,agent 被問
+      「現在幾點」只能猜或承認不知道。塞進 volatile 段最前面(`human_timestamp` + raw unix)
+- [x] **Discord 首則訊息永遠送不出去**(2026-07-11,真實案例抓到,不是稽核找的):新頻道第一次
+      對話,`discord.rs` `session_watch_loop` 第一次看到這個 session key 時,`user_turn`/
+      `assistant_turn` 已經被 `handle_chat_message` 一起寫進去了(`run_trigger` 跑完才批次
+      append)——loop 誤判成「重啟前的舊歷史」直接 baseline 跳過,回覆永遠不會送到 Discord,
+      但 `session.json` 裡看起來一切正常(所以症狀是「host 端資料正確,但 Discord 沒收到」)。
+      修法:`user_turn` 提前在 `run_trigger` 之前就單獨 lock-append 一次(session_watch_loop 只送
+      `assistant`-role,這個提前寫入本身不會被送出去,純粹用來讓 loop 有東西可以 baseline),
+      `assistant_turn` 維持跑完才 append,這樣 loop 看到的永遠是「先 1 筆後變 2 筆」的正常成長,
+      不會再把首次回覆誤判成舊歷史。用假 channel id 直接操作 `session.json` 兩階段寫入驗證過,
+      log 有印出 loop 確實嘗試送出(`Unknown Channel`,因為 channel id 是假的,但代表偵測到了)
 
 ### 未來糖果罐(延後)
 - [ ] **Agent 互通(A2A,actor model)**:設計已定——新 syscall `send_agent(target, msg)`,kernel **複製**訊息至對方 `inbox/from-<sender>/` 並喚醒;不共享任何目錄,Store 間零接觸;通訊拓撲在 kernel config 逐條宣告(capability),未宣告組合拒絕;訊息全經 kernel = 全量 A2A log,gateway 可視化對話圖。支援監督者模式、互相 review 等玩法;新 agent = 新資料夾 + 一行拓撲

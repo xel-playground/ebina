@@ -528,6 +528,28 @@ pub(crate) async fn handle_chat_message(state: Arc<AppState>, session_key: Strin
     let supports_vision = Config::load(&state.agent_home).map(|c| c.llm.supports_vision).unwrap_or(false);
     let history: Vec<Value> = session.iter().map(|t| turn_to_message(&state.agent_home, supports_vision, t)).collect();
 
+    // Persisted immediately, not batched with `assistant_turn` after
+    // `run_trigger` — for a session key nobody's ever written to before (a
+    // Discord channel's first-ever message), `discord.rs`'s
+    // `session_watch_loop` baselines on whatever it sees the *first* time
+    // it polls a new key (meant to skip replaying old history after a
+    // restart). If user+assistant landed together in one write, that first
+    // sighting already contains the never-sent assistant reply — the loop
+    // treats it as "old history" and silently swallows it instead of
+    // delivering it. Writing the user turn alone right away gives the loop
+    // something harmless to baseline on (it only ever sends `assistant`-
+    // role turns, so this is never itself delivered anywhere), so the
+    // assistant turn appended below after `run_trigger` is a genuine,
+    // detectable append.
+    {
+        let agent_home = state.agent_home.clone();
+        let key = session_key.clone();
+        let user_turn_for_save = user_turn.clone();
+        if let Ok(Err(e)) = tokio::task::spawn_blocking(move || append_turns_locked(&agent_home, &key, vec![user_turn_for_save])).await {
+            let _ = crate::logs::notify(&state.agent_home, &format!("failed to save this turn to session {session_key}: {e}"));
+        }
+    }
+
     let mut trigger = json!({"type": "message", "text": text, "history": history, "session_key": session_key});
     if let Some(c) = channel {
         trigger["channel"] = Value::String(c);
@@ -554,8 +576,10 @@ pub(crate) async fn handle_chat_message(state: Arc<AppState>, session_key: Strin
     // `outcome` by the time this resolves — so a lock failure here (rare:
     // only if `chat_send` or another turn on this session is somehow still
     // holding session.json.lock past its own 5s deadline) at least lands in
-    // Live Log instead of silently vanishing along with the turn itself
-    if let Ok(Err(e)) = tokio::task::spawn_blocking(move || append_turns_locked(&agent_home, &key_for_save, vec![user_turn, assistant_turn])).await {
+    // Live Log instead of silently vanishing along with the turn itself.
+    // Only `assistant_turn` here — `user_turn` was already persisted above,
+    // before `run_trigger`, see that comment for why.
+    if let Ok(Err(e)) = tokio::task::spawn_blocking(move || append_turns_locked(&agent_home, &key_for_save, vec![assistant_turn])).await {
         let _ = crate::logs::notify(&state.agent_home, &format!("failed to save this turn to session {session_key}: {e}"));
     }
 
