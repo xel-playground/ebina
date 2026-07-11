@@ -6,34 +6,44 @@ use reqwest::Url;
 use serde_json::Value;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 
-/// `http_get(url) -> {status, body}` — the only way an agent ever reaches
-/// the network for a plain read. No `method` field exists in this
-/// request/action shape at all — not just rejected, structurally absent —
-/// so there's nothing here to even try making a write with. Threat model
-/// per PROJECT.md 4.6 isn't "the agent is malicious", it's "the agent got
-/// tricked by page content it read" (prompt injection → exfiltration) plus
-/// plain SSRF, so the guard rails apply uniformly regardless of what the
-/// agent *meant* to do:
+/// `http_fetch(url, method?, headers?, body?) -> {status, body}` — the only
+/// way an agent ever reaches the network. `method` defaults to `"GET"` with
+/// no `headers`/`body`, which behaves *exactly* like the old GET-only
+/// `http_get` (same HTML-stripping/truncation/caching pipeline below).
+/// Threat model per PROJECT.md 4.6 isn't "the agent is malicious", it's
+/// "the agent got tricked by page content it read" (prompt injection →
+/// exfiltration) plus plain SSRF, so the guard rails apply uniformly
+/// regardless of what the agent *meant* to do, and regardless of method:
 ///
 /// 1. denylist private/loopback/link-local/metadata IPs, checked *after* DNS
 ///    resolution and pinned for the actual request (blocks rebinding)
 /// 2. full URL + byte count logged for every single request, allowed or not
 /// 3. gated by `network.get_mode` (open/tofu/allowlist)
 ///
-/// Writes (POST/PUT/etc) used to be supported here (as `http_fetch`)
-/// behind a human-approval grant queue (`grants.rs` `http_write`) —
-/// removed, and the syscall renamed `http_get` to make the removal
-/// structural rather than just enforced-at-runtime, once `ssh_exec` existed
-/// as an *ungated* way to do the exact same thing (`curl -X POST` on the
-/// configured SSH target). Keeping a pre-approval gate on writes through
-/// this syscall specifically stopped meaning anything once an equivalent
-/// capability existed elsewhere with no gate at all — it was friction, not
-/// containment, since anything that would route around the gate here could
-/// just use `ssh_exec` instead. `tofu_domain` (unrelated to writes) is
-/// unaffected.
+/// Writes (POST/PUT/etc) used to require a separate human-approval grant
+/// queue (`grants.rs` `http_write`) on top of the domain gate — removed
+/// once `ssh_exec` existed as an *ungated* way to do the exact same thing
+/// (`curl -X POST` on the configured SSH target); keeping a pre-approval
+/// gate on writes here specifically stopped meaning anything once an
+/// equivalent capability existed elsewhere with no gate at all. Same
+/// reasoning still applies now that writes are back: the domain gate below
+/// is the containment, not an extra write-specific approval step.
+/// `tofu_domain` grants (unrelated to writes) still work exactly as before.
+///
+/// `headers`/`body` may reference `{secrets.NAME}` — resolved host-side via
+/// `secrets::resolve_placeholders_in`, gated by `network.credentials`
+/// (`NAME` must be bound to the *exact* host this request's URL resolves
+/// to, a static human-edited list — see that struct's doc comment for why
+/// this can't be the same dynamic queue `tofu_domain` uses). The guest only
+/// ever sees the placeholder text, never the real value; `logs/egress.jsonl`
+/// logs the same unresolved text, never the substituted one.
 pub fn call(state: &mut AgentState, req: Value) -> Value {
     let source = req.get("_meta").cloned().unwrap_or(Value::Null);
     let url_str = req.get("url").and_then(|u| u.as_str()).unwrap_or("");
+    let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("GET").to_uppercase();
+    if !matches!(method.as_str(), "GET" | "POST" | "PUT" | "PATCH" | "DELETE") {
+        return error_json("bad_method", &format!("unsupported method: {method}"));
+    }
 
     if url_str.len() > state.config.network.url_max_len {
         return error_json("url_too_long", &format!("url exceeds configured max of {} chars", state.config.network.url_max_len));
@@ -50,13 +60,13 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
     }
 
     if !state.http_daily.has_headroom() {
-        let _ = crate::logs::notify(&state.agent_home, "http_get rejected: daily request cap exhausted");
+        let _ = crate::logs::notify(&state.agent_home, "http_fetch rejected: daily request cap exhausted");
         return error_json("daily_cap_exceeded", "daily_request_cap exhausted");
     }
     let limiters = crate::ratelimit::global(&state.config.ratelimit);
     if let Err(limited) = limiters.acquire_http() {
         if limited.sustained {
-            let _ = crate::logs::notify(&state.agent_home, "http_get sustained rate-limit hits — possible runaway loop");
+            let _ = crate::logs::notify(&state.agent_home, "http_fetch sustained rate-limit hits — possible runaway loop");
         }
         return rate_limited_json(&limited);
     }
@@ -72,16 +82,40 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
         }
         "tofu" => {
             if !grants::is_domain_approved(&state.agent_home, &host) {
-                return queue(state, url_str, &host);
+                return queue(state, &method, url_str, &host);
             }
         }
         _ => {} // open
     }
 
+    // Header/body secret substitution — only ever resolves a name bound to
+    // *this exact* host (`NetworkConfig::credentials`), never the guest's
+    // choice. Done before anything is sent, and fails closed: a bad/
+    // unbound placeholder means the request never goes out at all, rather
+    // than going out with the literal placeholder text still in it.
+    let allowed_secrets: Vec<String> =
+        state.config.network.credentials.iter().filter(|c| c.host == host).map(|c| c.secret.clone()).collect();
+    let raw_headers = req.get("headers").and_then(|h| h.as_object()).cloned().unwrap_or_default();
+    let mut resolved_headers: Vec<(String, String)> = Vec::with_capacity(raw_headers.len());
+    for (name, value) in &raw_headers {
+        let Some(raw) = value.as_str() else {
+            return error_json("bad_request", &format!("header {name} must be a string"));
+        };
+        match crate::secrets::resolve_placeholders_in(&state.secrets, raw, &allowed_secrets) {
+            Ok(resolved) => resolved_headers.push((name.clone(), resolved)),
+            Err(e) => return error_json("bad_secret_placeholder", &e),
+        }
+    }
+    let raw_body = req.get("body").and_then(|b| b.as_str()).unwrap_or("");
+    let resolved_body = match crate::secrets::resolve_placeholders_in(&state.secrets, raw_body, &allowed_secrets) {
+        Ok(b) => b,
+        Err(e) => return error_json("bad_secret_placeholder", &e),
+    };
+
     let ip = match resolve_and_check(&host) {
         Ok(ip) => ip,
         Err(e) => {
-            log_egress(state, url_str, &host, None, Some(&e), &source);
+            log_egress(state, &method, url_str, &host, None, Some(&e), &source);
             return error_json("denied_ip", &e);
         }
     };
@@ -91,11 +125,18 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
         Ok(c) => c,
         Err(e) => return error_json("network_error", &e.to_string()),
     };
-    let result = client.get(url.clone()).send();
+    let mut request = client.request(method.parse().expect("already validated against a fixed allow-list above"), url.clone());
+    for (name, value) in &resolved_headers {
+        request = request.header(name, value);
+    }
+    if !raw_body.is_empty() {
+        request = request.body(resolved_body);
+    }
+    let result = request.send();
     let response = match result {
         Ok(r) => r,
         Err(e) => {
-            log_egress(state, url_str, &host, None, Some(&e.to_string()), &source);
+            log_egress(state, &method, url_str, &host, None, Some(&e.to_string()), &source);
             return error_json("network_error", &e.to_string());
         }
     };
@@ -105,7 +146,7 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
     let redacted = redact_secrets(&state.secrets, &body_text);
     // logged against the actual bytes received over the wire, before any
     // stripping/truncation below touches what's handed back to the agent
-    log_egress(state, url_str, &host, Some(redacted.len()), None, &source);
+    log_egress(state, &method, url_str, &host, Some(redacted.len()), None, &source);
     let _ = state.http_daily.record(1);
 
     let content = if looks_like_html(content_type.as_deref(), &redacted) { strip_html_tags(&redacted) } else { redacted };
@@ -310,14 +351,16 @@ fn truncate_bytes(s: &str, max_bytes: usize) -> String {
 fn rate_limited_json(limited: &crate::ratelimit::RateLimited) -> Value {
     serde_json::json!({
         "ok": false,
-        "error": {"code": "rate_limited", "message": "http_get rate limit exceeded", "retry_after": limited.retry_after_secs}
+        "error": {"code": "rate_limited", "message": "http_fetch rate limit exceeded", "retry_after": limited.retry_after_secs}
     })
 }
 
-/// The only grant kind `http_get` ever queues is `"tofu_domain"` — writes
-/// (and their `"http_write"` grant kind) are gone, see module docs.
-fn queue(state: &AgentState, url: &str, host: &str) -> Value {
-    match grants::request_grant(&state.agent_home, "tofu_domain", "GET", url, host) {
+/// The only grant kind ever queued here is `"tofu_domain"` — approving one
+/// unlocks the whole domain permanently, for any method; there's no
+/// separate per-method grant (see module docs for why a write-specific gate
+/// stopped being real containment once `ssh_exec` existed).
+fn queue(state: &AgentState, method: &str, url: &str, host: &str) -> Value {
+    match grants::request_grant(&state.agent_home, "tofu_domain", method, url, host) {
         Ok(id) => serde_json::json!({
             "ok": false,
             "error": {"code": "pending_approval", "message": "waiting on gateway approval", "id": id}
@@ -358,11 +401,11 @@ fn is_denied(ip: &IpAddr) -> bool {
     }
 }
 
-fn log_egress(state: &AgentState, url: &str, domain: &str, bytes: Option<usize>, error: Option<&str>, source: &Value) {
+fn log_egress(state: &AgentState, method: &str, url: &str, domain: &str, bytes: Option<usize>, error: Option<&str>, source: &Value) {
     let _ = append_jsonl(
         &state.agent_home.join("logs/egress.jsonl"),
         &serde_json::json!({
-            "ts": now_unix_secs(), "method": "GET", "url": url, "domain": domain,
+            "ts": now_unix_secs(), "method": method, "url": url, "domain": domain,
             "bytes": bytes, "error": error, "source": source,
         }),
     );

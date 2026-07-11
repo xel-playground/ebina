@@ -208,6 +208,28 @@ pub struct NetworkConfig {
     /// explicit LRU list would be without the bookkeeping) get evicted
     /// first until back under budget.
     pub http_cache_max_bytes: u64,
+    /// Domain-bound secret bindings for `http_fetch` — a `{secrets.NAME}`
+    /// placeholder in a request's headers/body only ever resolves if `NAME`
+    /// is bound here to the *exact* host that request's URL resolved to
+    /// (`secrets::resolve_placeholders_in`, same allowlist-gated function
+    /// `ssh_exec` uses). Empty by default: no secret is usable this way
+    /// until explicitly bound.
+    ///
+    /// Deliberately static (human-edited `config.toml` only) rather than
+    /// anything the agent can request through `grants.rs`'s tofu queue —
+    /// that queue is fine for "can this agent read from this domain at
+    /// all", a low-stakes, often-routine approval; a domain+secret binding
+    /// is a materially different, higher-stakes grant (a live credential,
+    /// not just read access), and mixing the two into one approval flow
+    /// risks a human approving a credential-carrying request while thinking
+    /// it's just routine domain access.
+    pub credentials: Vec<NetworkCredential>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct NetworkCredential {
+    pub host: String,
+    pub secret: String,
 }
 
 impl Default for NetworkConfig {
@@ -220,6 +242,7 @@ impl Default for NetworkConfig {
             response_max_bytes: 100_000,
             http_cache_ttl_secs: 24 * 3600,
             http_cache_max_bytes: 20 * 1024 * 1024,
+            credentials: Vec::new(),
         }
     }
 }

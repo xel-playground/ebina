@@ -1,7 +1,7 @@
 pub mod chat_send;
 pub mod db_exec;
 pub mod embed;
-pub mod http_get;
+pub mod http_fetch;
 pub mod llm_call;
 pub mod notify;
 pub mod schedule_task;
@@ -21,7 +21,7 @@ pub fn dispatch(state: &mut AgentState, name: &str, req: Value) -> Value {
         "db_exec" => db_exec::call(state, req),
         "llm_call" => llm_call::call(state, req),
         "embed" => embed::call(state, req),
-        "http_get" => http_get::call(state, req),
+        "http_fetch" => http_fetch::call(state, req),
         "search_web" => search_web::call(state, req),
         "ssh_exec" => ssh_exec::call(state, req),
         "schedule_task" => schedule_task::call(state, req),

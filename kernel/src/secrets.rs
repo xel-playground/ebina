@@ -71,23 +71,29 @@ pub fn resolve_placeholder(secrets: &Secrets, spec: &str) -> Result<String, Stri
 
 /// Resolves every `{secrets.NAME}` occurrence *within* a larger string —
 /// unlike `resolve_placeholder`, which requires the whole field to be
-/// nothing but one placeholder — for a syscall like `ssh_exec` where a
-/// secret needs to be substituted into one piece of an otherwise
-/// guest-authored command (e.g. `curl -H "Authorization: Bot
-/// {secrets.discord_bot_token}" ...`). Errors, rather than leaving the
-/// literal placeholder text sitting in the command, the moment any named
-/// secret is missing, not in `allowed`, or a `{secrets.` is left
-/// unterminated.
+/// nothing but one placeholder — for a syscall like `ssh_exec` or
+/// `http_fetch` where a secret needs to be substituted into one piece of an
+/// otherwise guest-authored command/request (e.g. `curl -H "Authorization:
+/// Bot {secrets.discord_bot_token}" ...`, or an `http_fetch` header value).
+/// Errors, rather than leaving the literal placeholder text sitting in the
+/// request, the moment any named secret is missing, not in `allowed`, or a
+/// `{secrets.` is left unterminated.
 ///
 /// `allowed` is a deliberate allowlist, not "any secret in the vault" —
-/// even though `ssh_exec`'s destination is fixed (the same property that
-/// makes `llm_call`'s api_key resolution safe, unlike `http_get`'s
-/// arbitrary guest-chosen URL), the agent still authors the *whole*
-/// command, and the target machine has its own outbound network access.
-/// Without this list, a prompt-injected agent could put any other vault
-/// secret's placeholder — the LLM provider's api_key, `ssh_key_passphrase`
-/// — into an `ssh_exec` command just as easily as the one secret actually
-/// meant to be usable this way (see `SshConfig::allowed_secrets`).
+/// even when the destination is fixed (`ssh_exec`'s configured host, or
+/// `http_fetch`'s per-request host once matched against
+/// `NetworkConfig::credentials` — the same property that makes
+/// `llm_call`'s api_key resolution safe, unlike a guest-chosen URL with no
+/// such check), the agent still authors the rest of the request, and
+/// wherever it's going has its own outbound network access. Without this
+/// list, a prompt-injected agent could put any other vault secret's
+/// placeholder — the LLM provider's api_key, `ssh_key_passphrase` — in just
+/// as easily as the one secret actually meant to be usable this way. What
+/// `allowed` gets built *from* is entirely the caller's concern
+/// (`SshConfig::allowed_secrets` is one static list; `http_fetch` filters
+/// `NetworkConfig::credentials` down to just the current request's host) —
+/// this function only enforces whatever list it's handed, so its own error
+/// message deliberately doesn't name either caller's config section.
 pub fn resolve_placeholders_in(secrets: &Secrets, text: &str, allowed: &[String]) -> Result<String, String> {
     let mut result = String::with_capacity(text.len());
     let mut rest = text;
@@ -99,7 +105,7 @@ pub fn resolve_placeholders_in(secrets: &Secrets, text: &str, allowed: &[String]
         };
         let name = &after_prefix[..end];
         if !allowed.iter().any(|a| a == name) {
-            return Err(format!("secret `{name}` is not in `[ssh] allowed_secrets` — not permitted for ssh_exec placeholder substitution"));
+            return Err(format!("secret `{name}` is not permitted for placeholder substitution in this context"));
         }
         let value = secrets.get(name).ok_or_else(|| format!("no secret named `{name}` in the vault"))?;
         result.push_str(value);
