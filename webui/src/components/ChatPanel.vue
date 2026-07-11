@@ -245,7 +245,10 @@ onMounted(() => {
   refreshSession()
   reconcileWithServer()
   thinkingSource = eventSource('/thinking')
-  thinkingSource.onmessage = (e) => { thinkingText.value = e.data }
+  // keep the live trace pinned to the bottom as it streams in, same as a
+  // new chat message arriving — otherwise a long trace scrolls the visible
+  // area past whatever the human was reading and just keeps growing offscreen
+  thinkingSource.onmessage = (e) => { thinkingText.value = e.data; scrollToBottom() }
 })
 onUnmounted(() => {
   thinkingSource?.close()
