@@ -243,6 +243,35 @@ fn write_last_maintenance(agent_home: &Path, now: i64) {
     let _ = std::fs::write(path, now.to_string());
 }
 
+/// A session (webui or any Discord DM/channel) nobody's touched in over
+/// `idle_after` gets reset the same way `!reset`/the webui button would —
+/// unlike `maybe_auto_compact` (which only ever runs on the *next* turn a
+/// session gets, so a truly abandoned one never triggers it), this is
+/// piggybacked on the same 6h cadence `daily_maintenance` already ticks on
+/// rather than its own timer, so a conversation nobody's returned to
+/// doesn't just sit there accumulating context/tokens forever waiting for
+/// a turn that may never come. Checked independently of whether that
+/// run's own LLM call actually completes — this is a pure mechanical
+/// file-timestamp comparison, nothing to retry/back off on.
+async fn sweep_idle_sessions(state: &Arc<AppState>, idle_after: Duration) {
+    let sessions_dir = state.agent_home.join("logs/chat_sessions");
+    let Ok(entries) = std::fs::read_dir(&sessions_dir) else { return };
+    let now = crate::logs::now_unix_secs();
+    let idle_secs = idle_after.as_secs() as i64;
+    for entry in entries.flatten() {
+        let Some(key) = entry.file_name().to_str().map(str::to_string) else { continue };
+        let turns = load_session(&state.agent_home, &key);
+        // no turns at all — already empty/never used, nothing to reset
+        let Some(last_ts) = turns.last().map(|t| t.ts) else { continue };
+        if now - last_ts >= idle_secs {
+            let outcome = reset_session_key(state, &key).await;
+            if outcome.get("ok").and_then(Value::as_bool) == Some(true) {
+                let _ = crate::logs::notify(&state.agent_home, &format!("session {key} idle for over {}h — auto-reset", idle_secs / 3600));
+            }
+        }
+    }
+}
+
 async fn scheduler_loop(state: Arc<AppState>) {
     let mut last_daily_maintenance_attempt: Option<i64> = None;
     let mut last_handled_sleep_until: Option<i64> = None;
@@ -254,6 +283,7 @@ async fn scheduler_loop(state: Arc<AppState>) {
         let last_maintenance = read_last_maintenance(&state.agent_home);
         if now - last_maintenance >= MAINTENANCE_INTERVAL_SECS && last_daily_maintenance_attempt.is_none_or(|last| now - last >= 900) {
             last_daily_maintenance_attempt = Some(now);
+            sweep_idle_sessions(&state, Duration::from_secs(MAINTENANCE_INTERVAL_SECS as u64)).await;
             let outcome = run_scheduled(state.clone(), json!({"type": "daily_maintenance", "since_ts": last_maintenance})).await;
             // only advance the checkpoint on a real completion — `run()`'s
             // one hard-failure path (agent_loop.rs: an `llm_call` error
