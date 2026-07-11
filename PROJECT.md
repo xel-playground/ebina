@@ -416,6 +416,22 @@ http_per_domain_per_min = 10   # 對外禮貌,防同站連打被 ban IP
       `assistant_turn` 維持跑完才 append,這樣 loop 看到的永遠是「先 1 筆後變 2 筆」的正常成長,
       不會再把首次回覆誤判成舊歷史。用假 channel id 直接操作 `session.json` 兩階段寫入驗證過,
       log 有印出 loop 確實嘗試送出(`Unknown Channel`,因為 channel id 是假的,但代表偵測到了)
+- [x] **llm_call 卡進退化重複迴圈**(2026-07-11,同一天真實遇到兩次):kimi-k2.6 被超短低資訊量
+      訊息(「回 ok 就好」「測試測試」)觸發,reasoning stream 卡進自我強化的重複迴圈,狂噴模板化
+      垃圾(假造一堆 `/tmp/.build-*-update.sh` 腳本)幾千 token 不收斂,只能人工發現後手動
+      `/api/abort`。根因排查發現 `llm_call.rs` 完全沒送 `temperature`/`top_p`/repetition 相關
+      參數,連 `max_tokens` 都只有 anthropic 分支有預設(硬寫 1024),openai/ollama 完全沒有上限
+      ——理論上可以一路燒到 provider 自己的上限才停。修兩層:
+  - [x] `RuntimeConfig::max_output_tokens`(預設 16000,`logs/usage.jsonl` 目前觀察到的合法
+        output_tokens 最大值約 7950,留了充分空間)——`llm_call.rs` `call()` 統一塞進每個
+        provider 的請求(`max_tokens` 給 anthropic/openai-compatible,`options.num_predict`
+        給 ollama,欄位名不同得分開處理)
+  - [x] `RepeatGuard`(`llm_call.rs`)即時盯著 reasoning 跟正式回答兩條串流,一旦同一段約 32
+        bytes 的內容在鄰近範圍內重複滿 6 次就提前砍斷這次 `llm_call`,不用等 `max_tokens` 燒完
+        才停,回傳獨立的 `repetition_loop` 錯誤而不是把垃圾內容當正常輸出吞下去。3 個單元測試
+        鎖住邏輯,其中一個直接模擬真實案例的「固定模板+變動內填」模式——第一版用不重疊固定窗口
+        設計,被這個測試當場抓到會漏判(重複單位長度跟窗口沒對齊就永遠測不到),改成有界滑動搜尋
+        才過
 
 ### 未來糖果罐(延後)
 - [ ] **Agent 互通(A2A,actor model)**:設計已定——新 syscall `send_agent(target, msg)`,kernel **複製**訊息至對方 `inbox/from-<sender>/` 並喚醒;不共享任何目錄,Store 間零接觸;通訊拓撲在 kernel config 逐條宣告(capability),未宣告組合拒絕;訊息全經 kernel = 全量 A2A log,gateway 可視化對話圖。支援監督者模式、互相 review 等玩法;新 agent = 新資料夾 + 一行拓撲
