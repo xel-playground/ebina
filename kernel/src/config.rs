@@ -300,7 +300,7 @@ pub struct ChatConfig {
 
 impl Default for ChatConfig {
     fn default() -> Self {
-        ChatConfig { auto_compact_tokens: 50_000 }
+        ChatConfig { auto_compact_tokens: 120_000 }
     }
 }
 

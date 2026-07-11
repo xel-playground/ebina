@@ -598,5 +598,5 @@ threads with it. Long replies get split across multiple Discord messages
 mechanism as the two buttons on the webui Chat panel, just scoped to that
 one Discord session. A session also auto-compacts on its own once its
 context grows past `[chat] auto_compact_tokens` in `config.toml` (default
-50000) — mainly for Discord, since unlike webui there's no one watching a
+120000) — mainly for Discord, since unlike webui there's no one watching a
 context-window indicator to know when to hit the button.
