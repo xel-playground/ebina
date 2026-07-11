@@ -432,6 +432,36 @@ http_per_domain_per_min = 10   # 對外禮貌,防同站連打被 ban IP
         鎖住邏輯,其中一個直接模擬真實案例的「固定模板+變動內填」模式——第一版用不重疊固定窗口
         設計,被這個測試當場抓到會漏判(重複單位長度跟窗口沒對齊就永遠測不到),改成有界滑動搜尋
         才過
+- [x] `ssh_exec` 支援 allowlist 過的 `{secrets.NAME}` 代入 command(2026-07-12)——為了讓
+      「`ssh_exec` + skill」模式能做需要憑證的管理任務(例如 Discord REST API 管頻道/成員)而不用
+      把明文 secret 交給 guest。`[ssh] allowed_secrets` 白名單而非解析整個 vault——`ssh_exec`
+      目的地固定這點讓它跟 `llm_call` 的 api_key 解析一樣安全,但 agent 寫的是整條 command,
+      目標機器自己有對外網路,沒有白名單的話被 prompt injection 騙一樣能解出其他 secret(LLM
+      api_key、`ssh_key_passphrase`)。`logs/ssh.jsonl` 只記未解析的原始 command。4 個單元測試
+- [x] Discord 身分驗證補洞(2026-07-11/12,真實對話裡蝦奈自己講出這個缺口,主人確認方向後修)：
+  - [x] `sender_note`:host 端拿 `msg.author.id` 比對 `load_owner()`,把「這是不是配對的主人」
+        塞進 trigger,而不是讓 LLM 憑對話內容自己判斷——Discord 簽過名的 payload 騙不了,對話
+        內容可以
+  - [x] **DM 只回應配對 owner**:修之前 `is_dm` 本身就足夠拿到完整回覆,任何陌生人 DM 都會得到
+        回應(只是各自獨立 session,不會混進主人的對話)。寫的過程中自己抓到一個差點出包的邏輯
+        (`is_dm || load_owner()==...` 把「是 DM」跟「是主人」搞混),改成純粹 id 比對,不特判 DM
+- [x] 閒置 session 自動 reset(2026-07-12)——`maybe_auto_compact` 只在下一輪對話才會觸發,真的
+      被晾著沒人回的 session 永遠等不到那個「下一輪」。搭 `daily_maintenance` 同一個 6h tick
+      跑 `sweep_idle_sessions`,掃全部 session 的最後一筆 turn 時間,超過閾值就比照 `!reset`
+      整套(archive + 清空)處理掉,不開新 timer
+- [x] daily log 補 `session_key` 標記(2026-07-12)——`write_memory_note` 原本每個 `message`
+      trigger 都寫成一樣的「message — <text>」,`daily_maintenance` 分不出這句話是 webui、
+      哪個 DM、還是哪個 Discord 頻道講的,這是導致 Discord 記憶蒸餾很亂的真正原因(不是檢索問題,
+      是原始 log 沒標來源)。改成 `message [session_key] — <text>`,線上驗證過標記正確
+- [x] **跨 session 短期記憶(memory_staging)**(2026-07-11 設計、2026-07-12 實作)——照原設計:
+      不新增 staging 檔,直接複用 `memory/notes/<date>/log.md`,system prompt volatile 段新增
+      「## Recent activity across all sessions」,tail 最後 5 筆(非當天全讀,避免重演 480KB
+      log.md 炸 160k tokens 那次事故),`daily_maintenance` 本身跳過(它有更完整的
+      `recent_log_entries` delta)。用 `[session_key]` 標記過濾掉當前 session 自己的紀錄——
+      `history` 已經完整帶過了,再塞一次是純重複,而且要在計入 5 筆上限**之前**過濾,不然吵的
+      自家 session 會把真正跨 session 的東西擠掉。線上驗證:塞一筆假的其他 session 紀錄進
+      log.md,確認有出現在新區塊;同一 session 的 4 筆(含當下最新一筆)確認全被濾掉;對話面也
+      驗證過跨 3 則早期訊息的正確回憶
 
 ### 未來糖果罐(延後)
 - [ ] **Agent 互通(A2A,actor model)**:設計已定——新 syscall `send_agent(target, msg)`,kernel **複製**訊息至對方 `inbox/from-<sender>/` 並喚醒;不共享任何目錄,Store 間零接觸;通訊拓撲在 kernel config 逐條宣告(capability),未宣告組合拒絕;訊息全經 kernel = 全量 A2A log,gateway 可視化對話圖。支援監督者模式、互相 review 等玩法;新 agent = 新資料夾 + 一行拓撲
@@ -441,7 +471,6 @@ http_per_domain_per_min = 10   # 對外禮貌,防同站連打被 ban IP
   - [x] session compact/reset 泛化成 keyed(`gateway.rs` `compact_session_key`/`reset_session_key`,原本寫死 `"webui"`),webui 兩顆按鈕跟 Discord `!compact`/`!reset` 指令共用同一套;Discord 沒有前端按鈕可按,另外加一個 auto-compact:單一 session 的 `context_tokens` 超過 `config.toml` `[chat] auto_compact_tokens`(預設 50000)門檻,下次那個 session 一有新訊息就在背景自動 compact,不擋當次回覆。`session_watch_loop` 原本 `turns.len() <= last` 沒處理 session 被 compact/reset 縮短的情況,下次成長超過舊 `last` 會 slice 越界 panic——已修成偵測到變短就重新 baseline
 - [ ] Telegram adapter(接在 gateway 上,不動 kernel)——跟上面 Discord 同一套改法,概念已驗證過
 - [ ] python.wasm 作為標準工具(module precompile cache)——層次一自主開發:agent 寫 Python、exec_wasm 跑、迭代
-- [ ] 跨 session 短期記憶(2026-07-11 討論,目前無實際需求,純設計備忘):不新增 staging 檔,直接複用已有的 `memory/notes/<date>/log.md`(每個 run 自動寫,daily_maintenance 才讀)——讓一般 retrieval 也 tail 最近 N 筆(仿 `recent_chat_context` 的截斷做法,不要整天全讀,不然重演當初 480KB log.md 炸 160k tokens 那個事故)。原本這裡還提醒「要放 system prompt 最後面才不拖累 prefix cache」——那個排序問題已經在上面 prompt cache breakpoint 那筆修掉了(`{context}` 現在本來就在 stable 前綴之後),這筆之後如果要做,直接接在 volatile 那段裡即可,不用再另外想擺哪
 
 ### 里程碑
 - **M1**(P1 完):guest 經 syscall 完成一次 LLM 對話 + DB 寫入
