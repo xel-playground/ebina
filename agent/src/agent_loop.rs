@@ -1050,10 +1050,40 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String]) -> (String, String
     let now_ts = now_unix();
     let current_time = format!("{} (unix {now_ts})", human_timestamp(now_ts));
 
+    // `daily_maintenance` already gets the fuller delta-since-last-run via
+    // `recent_log_entries` in its own `trigger_note` below — this would
+    // just be a redundant, more-truncated view of the same data for that
+    // one trigger type, so skip it there.
+    const STAGING_TAIL_ENTRIES: usize = 5;
+    let staging_section = if trigger_type == Some("daily_maintenance") {
+        String::new()
+    } else {
+        // this session's own turns are already fully visible via `history`
+        // (a `message` trigger) — including them again here would just be
+        // duplication, not new cross-session information. `cron`/
+        // `scheduled_task` have no `session_key` of their own, so nothing
+        // gets excluded for those (correctly — they have no `history` to
+        // already be showing this).
+        let own_session_key = trigger.get("session_key").and_then(|s| s.as_str());
+        let staging = recent_staging_entries(STAGING_TAIL_ENTRIES, own_session_key);
+        if staging.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "## Recent activity across all sessions (last {STAGING_TAIL_ENTRIES}, cross-session short-term \
+                 memory)\n\n\
+                 What's happened recently in *any* session/trigger — webui, Discord, cron — not just this one, \
+                 before the next daily_maintenance distills it into memory/notes/. For context, not something \
+                 to reply to directly:\n\n{staging}\n\n"
+            )
+        }
+    };
+
     let volatile = format!(
         "## Current time\n\n\
          {current_time}\n\n\
          {recent_chat_section}\
+         {staging_section}\
          ## Relevant memory for this run\n\n\
          Hybrid BM25 + vector search, best matches first:\n\n\
          {context}\n\n\
@@ -1063,6 +1093,53 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String]) -> (String, String
     );
 
     (stable, volatile)
+}
+
+/// Cross-session short-term memory (PROJECT.md candy jar, 2026-07-11 design
+/// note, implemented 2026-07-12): the last `max_entries` runs across *every
+/// other* session/trigger — so e.g. a Discord message can know something
+/// that just happened in a webui chat, or a different Discord channel, a
+/// few minutes ago, without waiting for the next `daily_maintenance`
+/// distillation (up to 6h away). Deliberately reuses the existing
+/// `memory/notes/<date>/log.md` `write_memory_note` already writes on every
+/// run rather than a new staging file, and only ever tails a handful of
+/// entries, never a whole day — see `write_memory_note`'s doc comment for
+/// why a full-day read is dangerous (it once blew a single run to 160k
+/// input tokens). Scans backward at most a week before giving up — an agent
+/// idle for days just gets a shorter (or empty) section, not an
+/// ever-growing scan.
+///
+/// `exclude_session_key` drops any entry tagged `[that session]` (the tag
+/// `write_memory_note` adds) — a `message` trigger's own session is already
+/// fully visible via `history`, so re-showing its own recent turns here
+/// would just be duplication, not new information. Filtered *before*
+/// counting toward `max_entries`, not after, so excluding a chatty own
+/// session doesn't silently starve this of entries from everywhere else.
+fn recent_staging_entries(max_entries: usize, exclude_session_key: Option<&str>) -> String {
+    let today_day = (now_unix() / 86_400) as i64;
+    let exclude_tag = exclude_session_key.map(|k| format!("[{k}]"));
+    let mut entries: Vec<(u64, String)> = Vec::new();
+    for day in (today_day - 6..=today_day).rev() {
+        let path = format!("{NOTES_DIR}/{}/log.md", crate::time::civil_from_days(day));
+        if let Ok(text) = fs::read_to_string(&path) {
+            for block in text.split("\n## run at ").filter(|b| !b.trim().is_empty()) {
+                if let Some(tag) = &exclude_tag {
+                    if block.contains(tag.as_str()) {
+                        continue;
+                    }
+                }
+                if let Some(ts) = parse_block_ts(block) {
+                    entries.push((ts, format!("## run at {}", block.trim())));
+                }
+            }
+        }
+        if entries.len() >= max_entries {
+            break;
+        }
+    }
+    entries.sort_by_key(|(ts, _)| *ts);
+    let start = entries.len().saturating_sub(max_entries);
+    entries[start..].iter().map(|(_, b)| b.clone()).collect::<Vec<_>>().join("\n\n")
 }
 
 /// Collects every day-log entry with `ts` after `since_ts`, across however
