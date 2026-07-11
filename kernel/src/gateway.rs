@@ -516,7 +516,14 @@ const DEFAULT_SESSION_KEY: &str = "webui";
 // this before it reaches `save_session` below and silently drops the turn.
 // Borrowed params would tie the spawned future's lifetime to the (dropped)
 // caller's stack frame, so ownership has to move in.
-pub(crate) async fn handle_chat_message(state: Arc<AppState>, session_key: String, text: String, attachments: Vec<String>, channel: Option<String>) -> Value {
+pub(crate) async fn handle_chat_message(
+    state: Arc<AppState>,
+    session_key: String,
+    text: String,
+    attachments: Vec<String>,
+    channel: Option<String>,
+    sender_note: Option<String>,
+) -> Value {
     let mut session = load_session(&state.agent_home, &session_key);
     // an empty text block inside a multimodal content array (attachments
     // with no caption) trips the same "must not be empty" rejection the
@@ -553,6 +560,9 @@ pub(crate) async fn handle_chat_message(state: Arc<AppState>, session_key: Strin
     let mut trigger = json!({"type": "message", "text": text, "history": history, "session_key": session_key});
     if let Some(c) = channel {
         trigger["channel"] = Value::String(c);
+    }
+    if let Some(note) = sender_note {
+        trigger["sender_note"] = Value::String(note);
     }
     let outcome = run_trigger(state.clone(), trigger).await;
 
@@ -641,7 +651,7 @@ async fn post_message(State(state): State<Arc<AppState>>, Json(body): Json<Messa
     // `save_session` at the end of `handle_chat_message` instead of being
     // silently lost (the run itself always completed; only the session.json
     // write was getting cancelled along with the dropped HTTP response)
-    let handle = tokio::spawn(handle_chat_message(state, DEFAULT_SESSION_KEY.to_string(), body.text, body.attachments, None));
+    let handle = tokio::spawn(handle_chat_message(state, DEFAULT_SESSION_KEY.to_string(), body.text, body.attachments, None, None));
     match handle.await {
         Ok(outcome) => Json(outcome),
         Err(e) => Json(json!({"ok": false, "error": format!("run task panicked: {e}")})),

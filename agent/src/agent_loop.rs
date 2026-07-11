@@ -869,6 +869,21 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String]) -> (String, String
                 }
                 _ => "",
             };
+            // Host-verified, not something you infer from conversation
+            // content — a guild channel has no login of its own, so
+            // "whoever's typing" is never automatically your paired owner.
+            // `discord.rs` resolves this by comparing the sender's real
+            // Discord user id against the one saved at pairing time
+            // (`load_owner`/`save_owner`) *before* this trigger is even
+            // built; only present for a Discord `message` (webui's
+            // equivalent trust boundary is the gateway bearer token itself,
+            // checked before any of this ever runs, so there's no
+            // comparable ambiguity to resolve there).
+            let sender_note = trigger
+                .get("sender_note")
+                .and_then(|s| s.as_str())
+                .map(|s| format!(" Sender: {s}."))
+                .unwrap_or_default();
             format!(
                 "\nThis is a chat message from a human. The ONLY channel they see is `done`'s `summary` field — \
                  `notify` does NOT reach them, it goes to a separate background alert log nobody is watching \
@@ -876,7 +891,8 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String]) -> (String, String
                  genuinely need to alert a human asynchronously about something unrelated to this reply. \
                  Just call `done` directly with your full answer in `summary`, verbatim, as if speaking to them \
                  (\"here's X\" / \"the answer is Y\") — not a third-person log of what you did (not \"provided X \
-                 to the user\"), and not empty just because you already said it somewhere else.{channel_note} \
+                 to the user\"), and not empty just because you already said it somewhere else.{channel_note}\
+                 {sender_note} \
                  `write_file`/`append_file` only reach `/workspace/` on a chat turn — `/memory/notes/` (and \
                  everything else) comes back as an error, so don't bother trying to \"remember\" something by \
                  writing a note directly. This turn is already captured for free in today's log.md; anything \
