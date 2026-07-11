@@ -462,6 +462,18 @@ http_per_domain_per_min = 10   # 對外禮貌,防同站連打被 ban IP
       自家 session 會把真正跨 session 的東西擠掉。線上驗證:塞一筆假的其他 session 紀錄進
       log.md,確認有出現在新區塊;同一 session 的 4 筆(含當下最新一筆)確認全被濾掉;對話面也
       驗證過跨 3 則早期訊息的正確回憶
+  - [x] staging 只算 `message` trigger(排除 cron/scheduled_task/daily_maintenance 這些例行
+        喚醒的雜訊,不然會擠掉真正的跨 session 聊天內容),筆數改可設定
+        (`ChatConfig::cross_session_staging_entries`,預設 5,guest 端跟 `memory::
+        current_embed_model` 同款 crude scan `/config.toml`,不用 toml parser)
+- [x] 新增 `memory_search`/`remember` 兩個 action(2026-07-12)——`hybrid_search` 原本只在 run
+      開頭跑一次,用 trigger 文字當 query,中途想換個查詢沒辦法,`memory_search(query,top_k)`
+      補上這條路;`remember(topic,content)` 則是給「這件事不該等 daily_maintenance(最長 6h)
+      才記」的明確例外——聊天 turn 原本完全不能寫 `memory/notes/`(`write_action_denial` 只准
+      寫 `/workspace/`,故意逼寫入走蒸餾),這個開一條窄的、append-only、topic 名稱防路徑穿越
+      (`/`、`..` 擋掉)的正式管道。寫完不用額外 reindex,run 結束時本來就有的 `reindex_all_notes`
+      會撿到,下一輪 `hybrid_search`/`memory_search` 就查得到——線上驗證過 `remember` 寫完,
+      緊接著下一輪 `memory_search` 真的把它撈成第一筆結果
 
 ### 未來糖果罐(延後)
 - [ ] **Agent 互通(A2A,actor model)**:設計已定——新 syscall `send_agent(target, msg)`,kernel **複製**訊息至對方 `inbox/from-<sender>/` 並喚醒;不共享任何目錄,Store 間零接觸;通訊拓撲在 kernel config 逐條宣告(capability),未宣告組合拒絕;訊息全經 kernel = 全量 A2A log,gateway 可視化對話圖。支援監督者模式、互相 review 等玩法;新 agent = 新資料夾 + 一行拓撲
