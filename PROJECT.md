@@ -394,6 +394,16 @@ http_per_domain_per_min = 10   # 對外禮貌,防同站連打被 ban IP
         `pairing_seed()` 全新 agent-home 第一次呼叫的 TOCTOU(配對碼本來就不是安全邊界)
   - [x] 順便:`WasmRuntime`(Engine/Linker/Module 只建一次,只有 Store 需要每次 fresh)——跟這輪
         稽核同期但不是 race fix,是效能選項,`[runtime] cache_wasm_module`(預設 `false`),見 §4.2
+- [x] system prompt 加 Anthropic prompt cache breakpoint(2026-07-11)——`build_system_prompt`
+      拆成 `(stable, volatile)`:soul/config/Actions 文件/Paths 文件/skills/tasks 這些低頻變動的
+      放前段當穩定前綴,`{context}`(hybrid_search,每次 query 幾乎都不同)跟 `recent_chat`/trigger
+      這些高頻變動的挪到最後。system message 改送兩個 content block(第一個標 `cache: true`),
+      `llm_call.rs` `normalize_for_anthropic` 對 anthropic provider 轉成
+      `cache_control:{type:"ephemeral"}`;非 anthropic provider(目前線上用的 openai-compatible
+      Moonshot)靠新的 `collapse_content_blocks` 併回原本的單一字串,行為不變。3 個新單元測試鎖住
+      這段 JSON 轉換邏輯。線上 provider 目前是 openai,吃不到 cache_control 這條路,但重排本身
+      對任何 provider 都有效(至少同一 run 內的 action loop 多次 llm_call 共用同一份沒變的
+      system_prompt,原本 provider 端能不能利用純看它自己實作)
 
 ### 未來糖果罐(延後)
 - [ ] **Agent 互通(A2A,actor model)**:設計已定——新 syscall `send_agent(target, msg)`,kernel **複製**訊息至對方 `inbox/from-<sender>/` 並喚醒;不共享任何目錄,Store 間零接觸;通訊拓撲在 kernel config 逐條宣告(capability),未宣告組合拒絕;訊息全經 kernel = 全量 A2A log,gateway 可視化對話圖。支援監督者模式、互相 review 等玩法;新 agent = 新資料夾 + 一行拓撲
@@ -403,7 +413,7 @@ http_per_domain_per_min = 10   # 對外禮貌,防同站連打被 ban IP
   - [x] session compact/reset 泛化成 keyed(`gateway.rs` `compact_session_key`/`reset_session_key`,原本寫死 `"webui"`),webui 兩顆按鈕跟 Discord `!compact`/`!reset` 指令共用同一套;Discord 沒有前端按鈕可按,另外加一個 auto-compact:單一 session 的 `context_tokens` 超過 `config.toml` `[chat] auto_compact_tokens`(預設 50000)門檻,下次那個 session 一有新訊息就在背景自動 compact,不擋當次回覆。`session_watch_loop` 原本 `turns.len() <= last` 沒處理 session 被 compact/reset 縮短的情況,下次成長超過舊 `last` 會 slice 越界 panic——已修成偵測到變短就重新 baseline
 - [ ] Telegram adapter(接在 gateway 上,不動 kernel)——跟上面 Discord 同一套改法,概念已驗證過
 - [ ] python.wasm 作為標準工具(module precompile cache)——層次一自主開發:agent 寫 Python、exec_wasm 跑、迭代
-- [ ] 跨 session 短期記憶(2026-07-11 討論,目前無實際需求,純設計備忘):不新增 staging 檔,直接複用已有的 `memory/notes/<date>/log.md`(每個 run 自動寫,daily_maintenance 才讀)——讓一般 retrieval 也 tail 最近 N 筆(仿 `recent_chat_context` 的截斷做法,不要整天全讀,不然重演當初 480KB log.md 炸 160k tokens 那個事故),且塞在 system prompt **最後面**而非跟 `{context}` 一起擠在前面,避免這塊每輪都變的內容拖累 prefix cache——順便發現 `build_system_prompt` 現有的 `{context}`(RAG 結果)本來就放在前段,現況本來就沒吃到多少 prefix cache 好處,要做這個順便挪到最後面才有意義
+- [ ] 跨 session 短期記憶(2026-07-11 討論,目前無實際需求,純設計備忘):不新增 staging 檔,直接複用已有的 `memory/notes/<date>/log.md`(每個 run 自動寫,daily_maintenance 才讀)——讓一般 retrieval 也 tail 最近 N 筆(仿 `recent_chat_context` 的截斷做法,不要整天全讀,不然重演當初 480KB log.md 炸 160k tokens 那個事故)。原本這裡還提醒「要放 system prompt 最後面才不拖累 prefix cache」——那個排序問題已經在上面 prompt cache breakpoint 那筆修掉了(`{context}` 現在本來就在 stable 前綴之後),這筆之後如果要做,直接接在 volatile 那段裡即可,不用再另外想擺哪
 
 ### 里程碑
 - **M1**(P1 完):guest 經 syscall 完成一次 LLM 對話 + DB 寫入

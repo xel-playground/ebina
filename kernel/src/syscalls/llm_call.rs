@@ -223,6 +223,8 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
     }
     if provider == "anthropic" {
         normalize_for_anthropic(&mut body);
+    } else {
+        collapse_content_blocks(&mut body);
     }
 
     let client = reqwest::blocking::Client::new();
@@ -566,9 +568,98 @@ fn normalize_for_anthropic(body: &mut Value) {
     };
     if messages.first().and_then(|m| m.get("role")).and_then(|r| r.as_str()) == Some("system") {
         let system_msg = messages.remove(0);
-        if let Some(content) = system_msg.get("content").and_then(|c| c.as_str()) {
-            map.insert("system".to_string(), Value::String(content.to_string()));
-        }
+        let system_value = match system_msg.get("content") {
+            // legacy/other-provider shape: one plain string, no cache split
+            Some(Value::String(s)) => Value::String(s.clone()),
+            // `agent_loop.rs` build_system_prompt's stable/volatile split —
+            // each block optionally carries `cache: true`, translated here
+            // into Anthropic's own `cache_control: {type: "ephemeral"}` so
+            // the stable half (soul/config/actions doc/skills/tasks) gets
+            // reused server-side across runs instead of being recomputed
+            // (and re-billed at full price) on every single call just
+            // because the volatile half — recent chat / retrieved memory /
+            // the trigger — changed underneath it.
+            Some(Value::Array(blocks)) => Value::Array(
+                blocks
+                    .iter()
+                    .filter_map(|b| {
+                        let text = b.get("text").and_then(|t| t.as_str())?;
+                        let mut block = serde_json::json!({"type": "text", "text": text});
+                        if b.get("cache").and_then(|c| c.as_bool()) == Some(true) {
+                            block["cache_control"] = serde_json::json!({"type": "ephemeral"});
+                        }
+                        Some(block)
+                    })
+                    .collect(),
+            ),
+            _ => return,
+        };
+        map.insert("system".to_string(), system_value);
+    }
+}
+
+/// Non-Anthropic providers (openai/ollama) don't understand the `cache`
+/// hint on a system content block — collapses `agent_loop.rs`'s stable/
+/// volatile split back into the one plain string those APIs expect, same
+/// as before per-provider prompt caching existed.
+fn collapse_content_blocks(body: &mut Value) {
+    let Value::Object(map) = body else { return };
+    let Some(Value::Array(messages)) = map.get_mut("messages") else { return };
+    for msg in messages.iter_mut() {
+        let Some(Value::Array(blocks)) = msg.get("content").cloned() else { continue };
+        let joined: String = blocks.iter().filter_map(|b| b.get("text").and_then(|t| t.as_str())).collect();
+        msg["content"] = Value::String(joined);
+    }
+}
+
+#[cfg(test)]
+mod cache_block_tests {
+    use super::*;
+
+    #[test]
+    fn normalize_for_anthropic_splits_cache_block() {
+        let mut body = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": [
+                    {"type": "text", "text": "stable", "cache": true},
+                    {"type": "text", "text": "volatile"}
+                ]},
+                {"role": "user", "content": "hi"}
+            ]
+        });
+        normalize_for_anthropic(&mut body);
+        let system = &body["system"];
+        assert_eq!(system[0]["text"], "stable");
+        assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(system[1]["text"], "volatile");
+        assert!(system[1].get("cache_control").is_none());
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn normalize_for_anthropic_keeps_plain_string_system() {
+        let mut body = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "plain"},
+                {"role": "user", "content": "hi"}
+            ]
+        });
+        normalize_for_anthropic(&mut body);
+        assert_eq!(body["system"], "plain");
+    }
+
+    #[test]
+    fn collapse_content_blocks_joins_text_for_non_anthropic() {
+        let mut body = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": [
+                    {"type": "text", "text": "stable", "cache": true},
+                    {"type": "text", "text": "volatile"}
+                ]}
+            ]
+        });
+        collapse_content_blocks(&mut body);
+        assert_eq!(body["messages"][0]["content"], "stablevolatile");
     }
 }
 
