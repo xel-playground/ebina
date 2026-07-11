@@ -288,11 +288,23 @@ pub struct RuntimeConfig {
     /// one. Only `Store` ever needs to be fresh per run regardless of this
     /// flag (see `lib.rs`'s `run_agent_with_runtime`).
     pub cache_wasm_module: bool,
+    /// Hard cap on one `llm_call`'s own completion length (`max_tokens` for
+    /// anthropic/openai-compatible, `options.num_predict` for ollama) —
+    /// without *some* cap, a model stuck in an autoregressive repetition
+    /// loop (a real, observed failure: kimi-k2.6 generating the same
+    /// templated garbage thousands of tokens on end, triggered by nothing
+    /// more than a short low-content message) has no natural stop signal
+    /// and runs until the provider's own — usually much larger — limit,
+    /// burning budget and wall-clock time before an operator notices and
+    /// hits abort. `16_000` is comfortably above every legitimate
+    /// `output_tokens` seen in `logs/usage.jsonl` so far (observed max
+    /// ~7,950, p95 ~1,135) with real headroom, not a tight squeeze.
+    pub max_output_tokens: u64,
 }
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
-        RuntimeConfig { epoch_timeout_secs: 30 * 60, in_run_compact_tokens: 100_000, cache_wasm_module: false }
+        RuntimeConfig { epoch_timeout_secs: 30 * 60, in_run_compact_tokens: 100_000, cache_wasm_module: false, max_output_tokens: 16_000 }
     }
 }
 

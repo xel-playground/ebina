@@ -220,6 +220,18 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
             // final usage-only chunk when this is explicitly requested
             map.insert("stream_options".to_string(), serde_json::json!({"include_usage": true}));
         }
+        // see `RuntimeConfig::max_output_tokens` — bounds a runaway
+        // generation regardless of provider; ollama's native API doesn't
+        // recognize `max_tokens` at all (`options.num_predict` instead), so
+        // it needs its own field
+        if provider == "ollama" {
+            map.entry("options").or_insert_with(|| serde_json::json!({}));
+            if let Some(options) = map.get_mut("options").and_then(|o| o.as_object_mut()) {
+                options.entry("num_predict").or_insert_with(|| Value::from(state.config.runtime.max_output_tokens));
+            }
+        } else {
+            map.entry("max_tokens").or_insert_with(|| Value::from(state.config.runtime.max_output_tokens));
+        }
     }
     if provider == "anthropic" {
         normalize_for_anthropic(&mut body);
@@ -282,6 +294,79 @@ fn abort_flag_path(agent_home: &Path, source: &Value) -> PathBuf {
     agent_home.join("logs/chat_sessions").join(key).join("abort_requested")
 }
 
+/// Cheap, provider-agnostic guard against a model looping on the same text
+/// forever — a real autoregressive-decoding failure mode caught live: a
+/// short, low-content trigger ("測試測試") sent kimi-k2.6's `reasoning_content`
+/// into thousands of tokens of a templated garbage script, never converging
+/// on a real action. `RuntimeConfig::max_output_tokens` bounds the worst
+/// case, but that still means burning tens of seconds and a five-figure
+/// token bill before the provider's own limit kicks in — this catches it
+/// far earlier.
+///
+/// Works purely on bytes, never re-slicing into `&str` — this stream is
+/// mostly Chinese, and a naive `&buf[a..b]` on a `String` panics the moment
+/// a boundary lands mid-character. Every `NEEDLE_LEN` bytes of growth, takes
+/// the most recent `NEEDLE_LEN` bytes and counts how many times that exact
+/// run appears within the last `SEARCH_WINDOW` bytes (bounded, not the
+/// whole response — a real *loop* repeats close together, not once near the
+/// start and once now); `THRESHOLD` exact repeats of the same `NEEDLE_LEN`
+/// bytes essentially never happens in legitimate prose/code, so this has no
+/// realistic false-positive path. An earlier version chunked into
+/// *non-overlapping* fixed windows instead of searching — cheaper, but
+/// wrong: whether a repeated unit's own length happens to stay in phase
+/// with the window boundary is pure luck, and a unit whose length doesn't
+/// evenly divide the window size can repeat indefinitely without any two
+/// windows ever landing on the same bytes (caught by this file's own
+/// `ignores_varying_template`-style tests before this ever shipped).
+struct RepeatGuard {
+    buf: Vec<u8>,
+}
+
+impl RepeatGuard {
+    // real observed incident's fixed (non-varying) template runs were only
+    // ~44-45 bytes long — a needle any longer than that would straddle into
+    // the part that changes each iteration and never match verbatim twice
+    const NEEDLE_LEN: usize = 32;
+    const SEARCH_WINDOW: usize = 4_000;
+    const THRESHOLD: usize = 6;
+    // candidate needle end-positions are sampled every `STRIDE` bytes
+    // across whatever's newly arrived, not just at the very end of the
+    // chunk — a chunk boundary lining up with the *end* of one loop
+    // iteration (as real streaming deltas often do, one iteration per
+    // chunk) would otherwise mean the trailing needle always straddles
+    // into that iteration's varying part and never repeats verbatim, even
+    // though a fixed run earlier in that same chunk plainly did
+    const STRIDE: usize = 8;
+
+    fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    /// Feed newly-arrived text in; returns true the moment some `NEEDLE_LEN`
+    /// window ending within the newly-arrived text has recurred
+    /// `THRESHOLD` times nearby — caller should stop consuming the stream
+    /// immediately rather than let it keep running.
+    fn push(&mut self, chunk: &str) -> bool {
+        let old_len = self.buf.len();
+        self.buf.extend_from_slice(chunk.as_bytes());
+        let new_len = self.buf.len();
+        if new_len < Self::NEEDLE_LEN * Self::THRESHOLD {
+            return false;
+        }
+        let mut pos = old_len.max(Self::NEEDLE_LEN);
+        while pos <= new_len {
+            let needle = &self.buf[pos - Self::NEEDLE_LEN..pos];
+            let search_from = pos.saturating_sub(Self::SEARCH_WINDOW);
+            let haystack = &self.buf[search_from..new_len];
+            if haystack.windows(Self::NEEDLE_LEN).filter(|w| *w == needle).count() >= Self::THRESHOLD {
+                return true;
+            }
+            pos += Self::STRIDE;
+        }
+        false
+    }
+}
+
 /// Reads Ollama's NDJSON stream (one `{"message":{"content","thinking"},...}`
 /// object per line, deltas rather than cumulative text) line by line —
 /// `reqwest::blocking::Response` implements `Read`, so this is plain
@@ -306,6 +391,9 @@ fn handle_ollama_stream(state: &mut AgentState, body: Value, response: reqwest::
     let mut input_tokens = 0u64;
     let mut output_tokens = 0u64;
     let mut aborted = false;
+    let mut content_guard = RepeatGuard::new();
+    let mut thinking_guard = RepeatGuard::new();
+    let mut stuck = false;
 
     for line in BufReader::new(response).lines() {
         let Ok(line) = line else { break };
@@ -320,9 +408,11 @@ fn handle_ollama_stream(state: &mut AgentState, body: Value, response: reqwest::
             last_message = msg.clone();
             if let Some(c) = msg.get("content").and_then(|v| v.as_str()) {
                 full_content.push_str(c);
+                stuck |= content_guard.push(c);
             }
             if let Some(t) = msg.get("thinking").and_then(|v| v.as_str()) {
                 full_thinking.push_str(t);
+                stuck |= thinking_guard.push(t);
                 if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&think_path) {
                     use std::io::Write as _;
                     let _ = f.write_all(t.as_bytes());
@@ -337,6 +427,10 @@ fn handle_ollama_stream(state: &mut AgentState, body: Value, response: reqwest::
         if abort_path.exists() {
             let _ = std::fs::remove_file(&abort_path);
             aborted = true;
+            break;
+        }
+        if stuck {
+            let _ = crate::logs::notify(&state.agent_home, "llm_call cut short: model appears stuck repeating itself");
             break;
         }
     }
@@ -360,13 +454,16 @@ fn handle_ollama_stream(state: &mut AgentState, body: Value, response: reqwest::
         &body,
         &serde_json::json!({
             "message": {"content": text, "thinking": full_thinking},
-            "prompt_eval_count": input_tokens, "eval_count": output_tokens, "aborted": aborted,
+            "prompt_eval_count": input_tokens, "eval_count": output_tokens, "aborted": aborted || stuck,
         }),
         source,
     );
 
     if aborted {
         return error_json("aborted", "generation cancelled by operator");
+    }
+    if stuck {
+        return error_json("repetition_loop", "model appears stuck repeating itself — generation was cut short automatically");
     }
 
     record_usage(state, input_tokens, output_tokens, source);
@@ -396,6 +493,9 @@ fn handle_openai_stream(state: &mut AgentState, body: Value, response: reqwest::
     let mut input_tokens = 0u64;
     let mut output_tokens = 0u64;
     let mut aborted = false;
+    let mut content_guard = RepeatGuard::new();
+    let mut thinking_guard = RepeatGuard::new();
+    let mut stuck = false;
 
     for line in BufReader::new(response).lines() {
         let Ok(line) = line else { break };
@@ -408,9 +508,11 @@ fn handle_openai_stream(state: &mut AgentState, body: Value, response: reqwest::
         if let Some(delta) = chunk.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first()).and_then(|c| c.get("delta")) {
             if let Some(c) = delta.get("content").and_then(|v| v.as_str()) {
                 full_content.push_str(c);
+                stuck |= content_guard.push(c);
             }
             if let Some(t) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
                 full_thinking.push_str(t);
+                stuck |= thinking_guard.push(t);
                 if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&think_path) {
                     use std::io::Write as _;
                     let _ = f.write_all(t.as_bytes());
@@ -427,6 +529,10 @@ fn handle_openai_stream(state: &mut AgentState, body: Value, response: reqwest::
             aborted = true;
             break;
         }
+        if stuck {
+            let _ = crate::logs::notify(&state.agent_home, "llm_call cut short: model appears stuck repeating itself");
+            break;
+        }
     }
 
     write_transcript(
@@ -435,13 +541,16 @@ fn handle_openai_stream(state: &mut AgentState, body: Value, response: reqwest::
         &serde_json::json!({
             "choices": [{"message": {"content": full_content, "reasoning_content": full_thinking}}],
             "usage": {"prompt_tokens": input_tokens, "completion_tokens": output_tokens},
-            "aborted": aborted,
+            "aborted": aborted || stuck,
         }),
         source,
     );
 
     if aborted {
         return error_json("aborted", "generation cancelled by operator");
+    }
+    if stuck {
+        return error_json("repetition_loop", "model appears stuck repeating itself — generation was cut short automatically");
     }
 
     record_usage(state, input_tokens, output_tokens, source);
@@ -471,6 +580,9 @@ fn handle_anthropic_stream(state: &mut AgentState, body: Value, response: reqwes
     let mut input_tokens = 0u64;
     let mut output_tokens = 0u64;
     let mut aborted = false;
+    let mut content_guard = RepeatGuard::new();
+    let mut thinking_guard = RepeatGuard::new();
+    let mut stuck = false;
 
     for line in BufReader::new(response).lines() {
         let Ok(line) = line else { break };
@@ -490,9 +602,11 @@ fn handle_anthropic_stream(state: &mut AgentState, body: Value, response: reqwes
                 if let Some(delta) = chunk.get("delta") {
                     if let Some(t) = delta.get("text").and_then(|v| v.as_str()) {
                         full_content.push_str(t);
+                        stuck |= content_guard.push(t);
                     }
                     if let Some(t) = delta.get("thinking").and_then(|v| v.as_str()) {
                         full_thinking.push_str(t);
+                        stuck |= thinking_guard.push(t);
                         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&think_path) {
                             use std::io::Write as _;
                             let _ = f.write_all(t.as_bytes());
@@ -511,6 +625,10 @@ fn handle_anthropic_stream(state: &mut AgentState, body: Value, response: reqwes
             aborted = true;
             break;
         }
+        if stuck {
+            let _ = crate::logs::notify(&state.agent_home, "llm_call cut short: model appears stuck repeating itself");
+            break;
+        }
     }
 
     write_transcript(
@@ -520,13 +638,16 @@ fn handle_anthropic_stream(state: &mut AgentState, body: Value, response: reqwes
             "content": [{"type": "text", "text": full_content}],
             "thinking": full_thinking,
             "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
-            "aborted": aborted,
+            "aborted": aborted || stuck,
         }),
         source,
     );
 
     if aborted {
         return error_json("aborted", "generation cancelled by operator");
+    }
+    if stuck {
+        return error_json("repetition_loop", "model appears stuck repeating itself — generation was cut short automatically");
     }
 
     record_usage(state, input_tokens, output_tokens, source);
@@ -555,8 +676,9 @@ fn record_usage(state: &mut AgentState, input_tokens: u64, output_tokens: u64, s
 }
 
 /// Anthropic's Messages API wants `system` as a top-level string, not a
-/// `role: "system"` entry in `messages`, and requires `max_tokens`. This
-/// keeps the guest's request shape identical across providers.
+/// `role: "system"` entry in `messages`. `max_tokens` is already set by
+/// `call()` (`RuntimeConfig::max_output_tokens`) before this runs — the
+/// `or_insert` below is just a defensive fallback, not the real default.
 fn normalize_for_anthropic(body: &mut Value) {
     let Value::Object(map) = body else { return };
     map.entry("max_tokens").or_insert(Value::from(1024));
@@ -609,6 +731,63 @@ fn collapse_content_blocks(body: &mut Value) {
         let Some(Value::Array(blocks)) = msg.get("content").cloned() else { continue };
         let joined: String = blocks.iter().filter_map(|b| b.get("text").and_then(|t| t.as_str())).collect();
         msg["content"] = Value::String(joined);
+    }
+}
+
+#[cfg(test)]
+mod repeat_guard_tests {
+    use super::*;
+
+    #[test]
+    fn detects_exact_repetition() {
+        let mut guard = RepeatGuard::new();
+        let chunk = "chmod +x /tmp/.build-thing-update.sh\n"; // 38 bytes, close to WINDOW
+        let mut stuck = false;
+        for _ in 0..20 {
+            stuck |= guard.push(chunk);
+        }
+        assert!(stuck, "20 exact repeats of the same chunk should trip the guard");
+    }
+
+    #[test]
+    fn ignores_varying_template() {
+        // mirrors the real incident: fixed text either side of a varying
+        // package name — some 40-byte window should still land entirely
+        // inside one of the long fixed runs and repeat identically
+        let mut guard = RepeatGuard::new();
+        let names = ["coreutils", "util-linux", "systemd", "kmod", "e2fsprogs", "xfsprogs", "btrfs-progs", "dosfstools", "exfatprogs", "f2fs-tools"];
+        let mut stuck = false;
+        for name in names {
+            let chunk = format!("chmod +x /tmp/.build-{name}-update.sh\n    # execute it\n    /tmp/.build-{name}-update.sh &\nfi\nEOF\n");
+            stuck |= guard.push(&chunk);
+        }
+        assert!(stuck, "the fixed portions of a templated loop should still trip the guard even with varying infill");
+    }
+
+    #[test]
+    fn does_not_trip_on_diverse_text() {
+        // deliberately no shared fixed template this time (a fixed prefix/
+        // suffix around a varying number, like real legitimate output
+        // rarely produces but the earlier test's loop pathology exactly
+        // does, would defeat the point of this test)
+        let sentences = [
+            "The quarterly report shows revenue up twelve percent year over year.",
+            "Meeting notes: discussed the new deployment pipeline and rollback plan.",
+            "I checked the logs and found nothing unusual in the last hour.",
+            "Let's schedule the retro for Thursday afternoon if that works.",
+            "The database migration completed without any errors this time.",
+            "Customer feedback mentioned slow load times on the settings page.",
+            "We should probably refactor that module before adding more features.",
+            "Weather forecast says rain tomorrow, might affect the outdoor event.",
+            "The API rate limit was hit twice during the load test yesterday.",
+            "Someone left a comment on the PR asking about the edge case handling.",
+        ];
+        let mut guard = RepeatGuard::new();
+        let mut stuck = false;
+        for s in sentences {
+            stuck |= guard.push(s);
+        }
+        assert!(!stuck, "diverse, non-repeating text should never trip the guard");
     }
 }
 
