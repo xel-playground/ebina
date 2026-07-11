@@ -403,6 +403,7 @@ http_per_domain_per_min = 10   # 對外禮貌,防同站連打被 ban IP
   - [x] session compact/reset 泛化成 keyed(`gateway.rs` `compact_session_key`/`reset_session_key`,原本寫死 `"webui"`),webui 兩顆按鈕跟 Discord `!compact`/`!reset` 指令共用同一套;Discord 沒有前端按鈕可按,另外加一個 auto-compact:單一 session 的 `context_tokens` 超過 `config.toml` `[chat] auto_compact_tokens`(預設 50000)門檻,下次那個 session 一有新訊息就在背景自動 compact,不擋當次回覆。`session_watch_loop` 原本 `turns.len() <= last` 沒處理 session 被 compact/reset 縮短的情況,下次成長超過舊 `last` 會 slice 越界 panic——已修成偵測到變短就重新 baseline
 - [ ] Telegram adapter(接在 gateway 上,不動 kernel)——跟上面 Discord 同一套改法,概念已驗證過
 - [ ] python.wasm 作為標準工具(module precompile cache)——層次一自主開發:agent 寫 Python、exec_wasm 跑、迭代
+- [ ] 跨 session 短期記憶(2026-07-11 討論,目前無實際需求,純設計備忘):不新增 staging 檔,直接複用已有的 `memory/notes/<date>/log.md`(每個 run 自動寫,daily_maintenance 才讀)——讓一般 retrieval 也 tail 最近 N 筆(仿 `recent_chat_context` 的截斷做法,不要整天全讀,不然重演當初 480KB log.md 炸 160k tokens 那個事故),且塞在 system prompt **最後面**而非跟 `{context}` 一起擠在前面,避免這塊每輪都變的內容拖累 prefix cache——順便發現 `build_system_prompt` 現有的 `{context}`(RAG 結果)本來就放在前段,現況本來就沒吃到多少 prefix cache 好處,要做這個順便挪到最後面才有意義
 
 ### 里程碑
 - **M1**(P1 完):guest 經 syscall 完成一次 LLM 對話 + DB 寫入
