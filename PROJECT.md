@@ -537,6 +537,16 @@ http_per_domain_per_min = 10   # 對外禮貌,防同站連打被 ban IP
       那會重演 log.md 爆 160k tokens 那次的風險,範圍讓 agent 自己用 list_dir/read_file 控制。
       43 個 kernel test 全過(agent-only 改動,kernel 沒動),線上部署健康度確認過,但實際效果要等
       下一次 daily_maintenance 自然的 6h 週期才看得到
+- [x] **`memory_staging` 補 sender 標記,補回一個漏掉的攻擊面**(2026-07-12):`write_memory_note`
+      早就有標 `session_key`,但沒標 sender——「Recent activity across all sessions」那個跨
+      session staging 區塊讀的就是這些 log 行,沒標 sender 的話,某頻道陌生人講的話出現在另一個
+      頻道的 staging 裡,一樣看不出是誰講的,跟 `SessionTurn::sender` 修的是同一種問題,只是換一層
+      出現。修法:`handle_chat_message` 把跟 `SessionTurn::sender` 同一份 short label 塞進
+      `trigger.sender_label`,`write_memory_note` 照 `session_key` 的方式再標一次。順手把
+      「workspace 是短期記憶」這件事寫進 `## Paths and files`,不是新開 action——能力
+      (`write_file`/`append_file`)本來就有,缺的是讓 agent 知道這個定位,不是缺能力。43 個
+      kernel test 全過,線上驗證新 log 行同時有 `[webui]` 跟 `[webui (id webui-owner, owner)]`
+      兩個標記
 
 ### 未來糖果罐(延後)
 - [ ] **Agent 互通(A2A,actor model)**:設計已定——新 syscall `send_agent(target, msg)`,kernel **複製**訊息至對方 `inbox/from-<sender>/` 並喚醒;不共享任何目錄,Store 間零接觸;通訊拓撲在 kernel config 逐條宣告(capability),未宣告組合拒絕;訊息全經 kernel = 全量 A2A log,gateway 可視化對話圖。支援監督者模式、互相 review 等玩法;新 agent = 新資料夾 + 一行拓撲
