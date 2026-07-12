@@ -883,14 +883,15 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String]) -> (String, String
                  consolidation every 6h. Only what's new since the last run:\n\n{delta}\n\n\
                  Distill anything worth keeping into memory/notes/ (write_file — merge duplicates, prune what's \
                  stale) — quickly, don't try to be exhaustive, there isn't much new in an hour. Also check \
-                 /workspace/ yourself (list_dir, then read_file anything that looks like a standalone \
-                 note/reminder — the log delta above only tells you a file like that *exists*, not what's \
-                 actually in it). Split what you find into two kinds, don't conflate them: a durable fact \
+                 /workspace/memory/ yourself (list_dir, then read_file anything in there — the log delta above \
+                 only tells you a file like that *exists*, not what's actually in it; that's the one place \
+                 short-term notes/reminders are expected to live, so that's all you need to check, not all of \
+                 /workspace/). Split what you find into two kinds, don't conflate them: a durable fact \
                  (something true going forward — a preference, a decision, how something works) belongs in \
                  memory/notes/; a pending action item that only a human can actually do (uploading an image, \
                  clicking a button somewhere) isn't a fact to memorize, it stays exactly where it is in \
-                 /workspace/ and gets called out in this report's own \"needs attention\" section instead — \
-                 don't write a todo into memory/notes/ just because it showed up during this pass. Once a \
+                 /workspace/memory/ and gets called out in this report's own \"needs attention\" section instead \
+                 — don't write a todo into memory/notes/ just because it showed up during this pass. Once a \
                  workspace note's *facts* have been folded into memory/notes/ and nothing pending is left in it, \
                  delete_path it — leaving it behind means the same content gets re-noticed and re-considered \
                  every future cycle for no reason. Then write_file a report to \
@@ -1089,6 +1090,9 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String]) -> (String, String
          - Memory notes live under `/memory/notes/` — timeless facts go in their own topic file (markdown, \
          one topic per file); the automatic per-run log lives at `/memory/notes/<YYYY-MM-DD>/log.md` and \
          is written for you.\n\
+         - `/workspace/memory/` is where short-term notes/reminders you want folded into memory/notes/ later \
+         belong — that's the only place the hourly daily_maintenance pass checks, so a note left loose \
+         elsewhere under /workspace/ won't get picked up.\n\
          - Skills live under `/memory/skills/<name>.md`.\n\
          - Scheduled tasks live under `/scheduler/<id>.json` (one file per task, same as skills) — you can \
          read_file one directly too, but use update_task/delete_task so cron gets re-validated.\n\
