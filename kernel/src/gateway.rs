@@ -690,6 +690,16 @@ pub(crate) async fn handle_chat_message(
         ));
         trigger["sender_is_owner"] = Value::Bool(s.is_owner);
     }
+    // Same short label as `SessionTurn::sender` — `write_memory_note`
+    // (agent_loop.rs) tags its daily log.md entry with this, so the
+    // cross-session "Recent activity" staging section (which reads that
+    // same log) can show who said what across *different* sessions, not
+    // just within one. Without it, staging had the identical
+    // sender-conflation gap `SessionTurn::sender` was built to close —
+    // just one hop further out.
+    if let Some(label) = &user_turn.sender {
+        trigger["sender_label"] = Value::String(label.clone());
+    }
     let outcome = run_trigger(state.clone(), trigger).await;
 
     let mut reply = outcome.get("result").and_then(|r| r.get("summary")).and_then(|s| s.as_str()).unwrap_or("").to_string();

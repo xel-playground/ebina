@@ -1070,6 +1070,13 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String]) -> (String, String
          - `{{\"action\":\"done\",\"summary\":\"...\"}}` — ends this run, `summary` is saved to memory\n\n\
          ## Paths and files\n\n\
          Paths are absolute from your root, e.g. `/workspace/notes.txt`.\n\n\
+         - `/workspace/` doubles as your short-term memory / inbox, not just scratch space for the task at \
+         hand — jot a reminder or note there any time something's worth keeping track of but doesn't need to \
+         be a permanent fact yet (e.g. `reminders.md`). `daily_maintenance` checks it every 6h: a durable \
+         fact gets folded into `/memory/notes/`, a pending action item only a human can actually do stays put \
+         and gets called out to them instead. Nothing here reads `/workspace/` automatically between runs the \
+         way it does `/memory/notes/` — a note only gets acted on once `daily_maintenance` (or you yourself) \
+         actually reads it.\n\
          - Memory notes live under `/memory/notes/` — timeless facts go in their own topic file (markdown, \
          one topic per file); the automatic per-run log lives at `/memory/notes/<YYYY-MM-DD>/log.md` and \
          is written for you.\n\
@@ -1351,10 +1358,18 @@ fn write_memory_note(trigger: &Value, summary: &str) {
     // making Discord memory distill so poorly: not a retrieval problem,
     // a missing attribution problem in the raw log this gets distilled from.
     let session_note = trigger.get("session_key").and_then(|s| s.as_str()).map(|s| format!(" [{s}]")).unwrap_or_default();
+    // Same reasoning, one hop further out: `recent_staging_entries`
+    // (cross-session short-term memory) reads these same log lines to show
+    // *other* sessions what just happened elsewhere — without a sender
+    // tag here too, a stranger's message in one Discord channel would show
+    // up unattributed in a different channel's staging section, the exact
+    // sender-conflation gap `SessionTurn::sender` closed for in-session
+    // history, just recreated one layer out.
+    let sender_note = trigger.get("sender_label").and_then(|s| s.as_str()).map(|s| format!(" [{s}]")).unwrap_or_default();
     let trigger_line = if trigger_text.is_empty() {
-        format!("{trigger_type}{session_note}")
+        format!("{trigger_type}{session_note}{sender_note}")
     } else {
-        format!("{trigger_type}{session_note} — {}", truncate_chars(trigger_text, TRACE_FIELD_MAX_CHARS))
+        format!("{trigger_type}{session_note}{sender_note} — {}", truncate_chars(trigger_text, TRACE_FIELD_MAX_CHARS))
     };
 
     // `(ts=N)` alongside the human-readable timestamp — `recent_log_entries`
