@@ -271,26 +271,46 @@ avatar-reminder incident in PROJECT.md), reviewing only what's new since
 its own last successful run (`since_ts`, tracked in
 `memory/maintenance_reports/.last_run` — a run that hard-aborts does *not*
 advance this, so a transient failure can't silently skip a whole window),
-also checking `/workspace/` itself for standalone notes/reminders (the log
-delta alone only says one *exists*, not what's in it — durable facts go
-into the curated notes above, a pending human-only action item stays in
-`/workspace/` and gets called out in the report instead, and a fully-
-distilled note gets `delete_path`'d so it isn't re-considered forever). One
-report per run lands in `memory/maintenance_reports/<date>_<HHMM>.md`.
+also checking `/workspace/memory/` — the designated spot for short-term
+notes/reminders, not the whole `/workspace/` tree — for standalone notes
+(the log delta alone only says one *exists*, not what's in it — durable
+facts go into the curated notes above, a pending human-only action item
+stays in `/workspace/memory/` and gets called out in the report instead,
+and a fully-distilled note gets `delete_path`'d so it isn't re-considered
+forever). One report per run lands in
+`memory/maintenance_reports/hourly/<date>_<HHMM>.md`.
+
+Both this tier and `maintenance_summary` below only actually fire at
+minute 13 of the hour, not on the hour — offset away from the `:00` mark a
+lot of other cron-style jobs cluster on. Both are also gated by a
+host-side, no-LLM pre-check first: if there's nothing new in the log delta
+and nothing changed under `/workspace/memory/` (for `daily_maintenance`) or
+no new hourly reports since the last summary (for `maintenance_summary`),
+the LLM call is skipped entirely — the checkpoint still advances, since the
+check itself is as complete a review of that window as a real run would
+have given, just without paying for one that would only come back saying
+"nothing new".
 
 A separate `maintenance_summary` wake runs every 6h (its own checkpoint,
 `memory/maintenance_reports/.last_summary_run`) — the deeper pass the
 hourly one deliberately skips: reviews the reports written since the last
-summary, merges/dedupes anything that ended up fragmented across several
-of them, and is where a "needs attention" item that's shown up 3+ times
-running with nothing changing is supposed to actually `chat_send` the
-human instead of just getting silently re-mentioned. This is also when
+summary under `memory/maintenance_reports/hourly/`, merges/dedupes
+anything that ended up fragmented across several of them, and is where a
+"needs attention" item that's shown up 3+ times running with nothing
+changing is supposed to actually `chat_send` the human instead of just
+getting silently re-mentioned. Its own consolidated report lands in
+`memory/maintenance_reports/summary/<date>_<HHMM>.md`. This is also when
 `sweep_idle_sessions` (resetting a conversation nobody's touched in 6h)
 runs, and a host-side, no-LLM sanity check: did `memory/notes/` actually
-get any git commits in the last 6h, or is `daily_maintenance` just
-self-reporting distillation without anything landing on disk? `notify()`
-if not — silence isn't proof of a bug on its own, but it's a discrepancy
-worth surfacing rather than only ever trusting a run's own word for it.
+get any git commits in the last 6h despite real new activity in that
+window, or is `daily_maintenance` just self-reporting distillation without
+anything landing on disk? `notify()` if so — a genuinely quiet window with
+no activity at all is expected to produce no commits and isn't checked;
+this is only about a window that had something to react to and still
+didn't write anything, a discrepancy worth surfacing rather than only ever
+trusting a run's own word for it. Both `sweep_idle_sessions` and this check
+always run on this tier's own 6h cadence regardless of whether the
+summary's own LLM pass above got skipped.
 
 ### Mid-run compaction (`runtime.in_run_compact_tokens`)
 

@@ -895,7 +895,7 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String]) -> (String, String
                  workspace note's *facts* have been folded into memory/notes/ and nothing pending is left in it, \
                  delete_path it — leaving it behind means the same content gets re-noticed and re-considered \
                  every future cycle for no reason. Then write_file a report to \
-                 /memory/maintenance_reports/{}.md summarizing what you did before calling done.\n",
+                 /memory/maintenance_reports/hourly/{}.md summarizing what you did before calling done.\n",
                 crate::time::maintenance_run_id(now_unix())
             )
         }
@@ -903,14 +903,14 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String]) -> (String, String
             let since_ts = trigger.get("since_ts").and_then(Value::as_u64).unwrap_or(0);
             format!(
                 "\nThis is a maintenance_summary run (every 6h) — the deeper pass the hourly daily_maintenance \
-                 one deliberately skips. list_dir /memory/maintenance_reports/ and read_file the ones written \
-                 since {} (roughly the last 6 hourly passes). Use them to: merge/dedupe anything in \
+                 one deliberately skips. list_dir /memory/maintenance_reports/hourly/ and read_file the ones \
+                 written since {} (roughly the last 6 hourly passes). Use them to: merge/dedupe anything in \
                  memory/notes/ that ended up fragmented or contradictory across several of those hourly passes; \
                  and — the part that actually matters here — if the same \"needs attention\" item (a pending \
                  human-only action) has shown up across 3 or more of those reports with nothing changing, stop \
                  just re-noting it and actually chat_send the human about it instead. A report nobody reads \
                  isn't an escalation, it's a place things go to be silently repeated forever. Write a \
-                 consolidated /memory/maintenance_reports/{}_summary.md when done, then call done.\n",
+                 consolidated /memory/maintenance_reports/summary/{}.md when done, then call done.\n",
                 if since_ts == 0 { "the beginning".to_string() } else { human_timestamp(since_ts) },
                 crate::time::maintenance_run_id(now_unix())
             )

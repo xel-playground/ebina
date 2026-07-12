@@ -419,18 +419,14 @@ fn workspace_memory_has_new_files(agent_home: &Path, since_ts: i64) -> bool {
     })
 }
 
-/// Whether `memory/maintenance_reports/` has any `daily_maintenance` report
-/// written since `since_ts` — excludes the checkpoint dotfiles and this
-/// function's own tier's `*_summary.md` output, only the hourly reports
-/// count as new material for `maintenance_summary` to merge/escalate from.
+/// Whether `memory/maintenance_reports/hourly/` has any `daily_maintenance`
+/// report written since `since_ts` — that's the only material
+/// `maintenance_summary` merges/escalates from; its own output lives in the
+/// separate `memory/maintenance_reports/summary/` folder, see
+/// `agent_loop.rs`'s trigger_note for both.
 fn has_new_maintenance_reports(agent_home: &Path, since_ts: i64) -> bool {
-    let Ok(entries) = std::fs::read_dir(agent_home.join("memory/maintenance_reports")) else { return false };
+    let Ok(entries) = std::fs::read_dir(agent_home.join("memory/maintenance_reports/hourly")) else { return false };
     entries.flatten().any(|e| {
-        let name = e.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with('.') || name.ends_with("_summary.md") {
-            return false;
-        }
         e.metadata()
             .and_then(|m| m.modified())
             .ok()
@@ -1232,26 +1228,33 @@ fn collect_notes(dir: &Path, base: &Path) -> Vec<Value> {
     out
 }
 
-/// one report per maintenance run (every 6h, not once/day — see
-/// `scheduler_loop`) — `date` is the filename stem, e.g. `"2026-07-05_1830"`.
-/// `.last_run` (the checkpoint marker, no `.md` extension) is filtered out
-/// by the extension check below, same directory or not.
+/// One report per maintenance run — `hourly/` (`daily_maintenance`, every
+/// 1h) and `summary/` (`maintenance_summary`, every 6h) are separate
+/// subfolders now (2026-07-12), not one flat directory distinguished only
+/// by a `_summary` filename suffix. `date` is `"<kind>/<filename stem>"`
+/// (e.g. `"hourly/2026-07-05_1830"`) — the kind prefix keeps the two tiers'
+/// keys unique even on the rare tick where both fire with the same
+/// `maintenance_run_id`, at the cost of sorting the two tiers as separate
+/// newest-first blocks rather than fully interleaved by time; `.last_run`/
+/// `.last_summary_run` (checkpoint markers, no `.md` extension) are filtered
+/// out by the extension check regardless.
 async fn get_reports(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let dir = state.agent_home.join("memory/maintenance_reports");
     let mut reports = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&dir) {
+    for kind in ["hourly", "summary"] {
+        let dir = state.agent_home.join("memory/maintenance_reports").join(kind);
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("md") {
                 continue;
             }
-            let Some(date) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
             if let Ok(content) = std::fs::read_to_string(&path) {
-                reports.push(json!({"date": date, "content": content}));
+                reports.push(json!({"date": format!("{kind}/{stem}"), "kind": kind, "content": content}));
             }
         }
     }
-    reports.sort_by(|a, b| b["date"].as_str().cmp(&a["date"].as_str())); // newest first
+    reports.sort_by(|a, b| b["date"].as_str().cmp(&a["date"].as_str())); // newest first (within each kind block)
     Json(json!({"reports": reports}))
 }
 
