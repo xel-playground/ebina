@@ -497,6 +497,18 @@ http_per_domain_per_min = 10   # 對外禮貌,防同站連打被 ban IP
         `discord_bot_token` 測試,確認 `bad_secret_placeholder` 正確擋下、請求根本沒送出。
         37 個 kernel test 全過(`http_get_*` 系列改名 `http_fetch_*`,「method 欄位被忽略」
         那個測試改寫成「method 真的會送出」,新增一個 unbound secret 拒絕測試)
+- [x] **`scheduled_task` 失敗自動重試**(2026-07-12,真實事故):早安任務準時 10:00(TW)觸發,
+      但 Moonshot API 連續 3 次回 400 content_filter,run abort,`mark_run` 照樣記錄跑過——下一次
+      機會要等明天同一時間,中間完全沒有補救機制。這次是 agent 自己在後續一次自主 cron 巡檢時,
+      翻自己的 log 發現早報沒送出去,手動重跑 + `chat_send` 補發,14:32(TW)才真正送達主人——
+      純粹運氣好,不是設計好的機制。修法:`scheduler_loop` 比照 `daily_maintenance` 既有的
+      900 秒 backoff 重試模式,加 `task_retry_state`(記憶體內,per task id 的
+      `(last_attempt_ts, consecutive_failures)`,跟 `last_daily_maintenance_attempt` 同款,
+      重啟就重置,不落地),失敗後 900 秒重試,最多 3 次,超過才乖乖等 cron 字串下一次自然匹配。
+      順手把 `daily_maintenance`/`scheduled_task` 共用的「run 是否 abort」判斷抽成
+      `outcome_aborted`(原本兩處各寫一份重複邏輯),`scheduled_task_should_run` 抽成純函式——
+      900 秒 backoff 沒辦法在這個 session 裡真的等 15 分鐘線上驗證,改用 6 個單元測試鎖住
+      due_now/due_retry/retry 上限/backoff 時機這些邏輯,43 個 kernel test 全過
 
 ### 未來糖果罐(延後)
 - [ ] **Agent 互通(A2A,actor model)**:設計已定——新 syscall `send_agent(target, msg)`,kernel **複製**訊息至對方 `inbox/from-<sender>/` 並喚醒;不共享任何目錄,Store 間零接觸;通訊拓撲在 kernel config 逐條宣告(capability),未宣告組合拒絕;訊息全經 kernel = 全量 A2A log,gateway 可視化對話圖。支援監督者模式、互相 review 等玩法;新 agent = 新資料夾 + 一行拓撲
