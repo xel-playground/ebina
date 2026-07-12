@@ -228,7 +228,10 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
 ///   reminder got rediscovered and reported on for over a day, never
 ///   distilled, never escalated). Shrinking the light pass to 1h reduces
 ///   how long anything sits unprocessed; see `maintenance_summary` below
-///   for what replaced the escalation half of the old 6h job.
+///   for what replaced the escalation half of the old 6h job. Both tiers
+///   are additionally gated by `MAINTENANCE_WALL_CLOCK_SPEC` to only ever
+///   actually fire at minute 13 of the hour, not on the hour — see that
+///   const's doc comment.
 /// - `maintenance_summary`, every `MAINTENANCE_SUMMARY_INTERVAL_SECS` (6h,
 ///   its own separate checkpoint) — a deeper pass the light hourly one
 ///   deliberately doesn't do: reviews the maintenance reports written since
@@ -262,6 +265,15 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
 ///   it forever.
 const MAINTENANCE_INTERVAL_SECS: i64 = 3600;
 const MAINTENANCE_SUMMARY_INTERVAL_SECS: i64 = 6 * 3600;
+/// Both maintenance tiers only actually fire at minute 13 of the hour, never
+/// on the hour itself — deliberately offset from the common `:00` mark other
+/// cron-style jobs tend to cluster on (e.g. `morning_report`'s `0 2 * * *`),
+/// so a maintenance run's LLM call doesn't contend with them for the same
+/// wall-clock instant. Checked with the same hand-rolled matcher
+/// `scheduled_task`'s cron strings use (`cron::matches`) — the interval
+/// checks above already gate *whether* a run is due; this just constrains
+/// *when within the hour* a due run is allowed to actually execute.
+const MAINTENANCE_WALL_CLOCK_SPEC: &str = "13 * * * *";
 /// Same 15-minute backoff `daily_maintenance` already retries a failed run
 /// on — see `scheduler_loop`'s doc comment.
 const SCHEDULED_TASK_RETRY_BACKOFF_SECS: i64 = 900;
@@ -404,7 +416,10 @@ async fn scheduler_loop(state: Arc<AppState>) {
         state.sweep_idle_locks().await;
 
         let last_maintenance = read_last_maintenance(&state.agent_home);
-        if now - last_maintenance >= MAINTENANCE_INTERVAL_SECS && last_daily_maintenance_attempt.is_none_or(|last| now - last >= 900) {
+        if now - last_maintenance >= MAINTENANCE_INTERVAL_SECS
+            && crate::cron::matches(MAINTENANCE_WALL_CLOCK_SPEC, now)
+            && last_daily_maintenance_attempt.is_none_or(|last| now - last >= 900)
+        {
             last_daily_maintenance_attempt = Some(now);
             let outcome = run_scheduled(state.clone(), json!({"type": "daily_maintenance", "since_ts": last_maintenance})).await;
             // only advance the checkpoint on a real completion — `run()`'s
@@ -422,7 +437,10 @@ async fn scheduler_loop(state: Arc<AppState>) {
         }
 
         let last_summary = read_last_maintenance_summary(&state.agent_home);
-        if now - last_summary >= MAINTENANCE_SUMMARY_INTERVAL_SECS && last_maintenance_summary_attempt.is_none_or(|last| now - last >= 900) {
+        if now - last_summary >= MAINTENANCE_SUMMARY_INTERVAL_SECS
+            && crate::cron::matches(MAINTENANCE_WALL_CLOCK_SPEC, now)
+            && last_maintenance_summary_attempt.is_none_or(|last| now - last >= 900)
+        {
             last_maintenance_summary_attempt = Some(now);
             sweep_idle_sessions(&state, Duration::from_secs(MAINTENANCE_SUMMARY_INTERVAL_SECS as u64)).await;
             verify_recent_distillation(&state.agent_home, MAINTENANCE_SUMMARY_INTERVAL_SECS);
