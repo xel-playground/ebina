@@ -348,14 +348,20 @@ fn write_last_maintenance_summary(agent_home: &Path, now: i64) {
 /// Pure host-side check, no LLM involved — `memory/notes/` should show at
 /// least one real git commit within `window_secs` if the hourly
 /// `daily_maintenance` passes during that window are actually distilling
-/// anything, not just self-reporting that they did. Silence isn't proof of
-/// a bug on its own (a genuinely quiet window with nothing worth
-/// remembering is possible) — this just makes the discrepancy visible via
-/// `notify()` instead of only ever trusting a run's own word for it.
+/// anything, not just self-reporting that they did. Gated on
+/// `has_new_log_entries` first: a genuinely quiet window (nothing logged at
+/// all — `daily_maintenance` itself would have skipped it, see
+/// `scheduler_loop`) produces no commits for a completely unremarkable
+/// reason, not a bug; only worth a `notify()` if there *was* something to
+/// react to and nothing landed on disk anyway.
 fn verify_recent_distillation(agent_home: &Path, window_secs: i64) {
     let git_dir = crate::autocommit::git_dir_path(agent_home);
     if !git_dir.exists() {
         return; // no git history yet at all — nothing to check
+    }
+    let since_ts = crate::logs::now_unix_secs() - window_secs;
+    if !has_new_log_entries(agent_home, since_ts) {
+        return;
     }
     let since = format!("{window_secs} seconds ago");
     let output = std::process::Command::new("git")
@@ -366,12 +372,71 @@ fn verify_recent_distillation(agent_home: &Path, window_secs: i64) {
         let _ = crate::logs::notify(
             agent_home,
             &format!(
-                "distillation check: memory/notes/ has had no git commits in the last {}h despite {} hourly daily_maintenance passes in that window — it may not actually be writing anything",
+                "distillation check: memory/notes/ has had no git commits in the last {}h despite new activity logged in that window — daily_maintenance may not actually be writing anything",
                 window_secs / 3600,
-                window_secs / MAINTENANCE_INTERVAL_SECS
             ),
         );
     }
+}
+
+/// Host-side mirror of `agent_loop.rs`'s `recent_log_entries` — same day-log
+/// files, same `(ts=N)` block markers — but boolean-only. Lets
+/// `scheduler_loop` decide *whether* a `daily_maintenance` run has anything
+/// to review at all before paying for the LLM call that would otherwise
+/// just come back saying "nothing new since the last maintenance run".
+fn has_new_log_entries(agent_home: &Path, since_ts: i64) -> bool {
+    let today_day = crate::logs::now_unix_secs() / 86_400;
+    let since_day = if since_ts <= 0 { today_day } else { since_ts / 86_400 };
+    for day in since_day..=today_day {
+        let path = agent_home.join("memory/notes").join(crate::logs::civil_from_days(day)).join("log.md");
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        for block in text.split("\n## run at ") {
+            let Some(start) = block.find("(ts=") else { continue };
+            let rest = &block[start + 4..];
+            let Some(end) = rest.find(')') else { continue };
+            if rest[..end].parse::<i64>().is_ok_and(|ts| ts > since_ts) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether anything under `/workspace/memory/` (the designated short-term
+/// notes/reminders staging spot — see `agent_loop.rs`'s prompt) has changed
+/// since `since_ts`. Combined with `has_new_log_entries`, gates whether a
+/// due `daily_maintenance` run actually has work to do — a pending item
+/// nobody's touched since last time (e.g. a still-unresolved "needs
+/// attention" reminder) shouldn't force another LLM pass on its own.
+fn workspace_memory_has_new_files(agent_home: &Path, since_ts: i64) -> bool {
+    let Ok(entries) = std::fs::read_dir(agent_home.join("workspace/memory")) else { return false };
+    entries.flatten().any(|e| {
+        e.metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .is_some_and(|d| d.as_secs() as i64 > since_ts)
+    })
+}
+
+/// Whether `memory/maintenance_reports/` has any `daily_maintenance` report
+/// written since `since_ts` — excludes the checkpoint dotfiles and this
+/// function's own tier's `*_summary.md` output, only the hourly reports
+/// count as new material for `maintenance_summary` to merge/escalate from.
+fn has_new_maintenance_reports(agent_home: &Path, since_ts: i64) -> bool {
+    let Ok(entries) = std::fs::read_dir(agent_home.join("memory/maintenance_reports")) else { return false };
+    entries.flatten().any(|e| {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') || name.ends_with("_summary.md") {
+            return false;
+        }
+        e.metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .is_some_and(|d| d.as_secs() as i64 > since_ts)
+    })
 }
 
 /// A session (webui or any Discord DM/channel) nobody's touched in over
@@ -421,18 +486,27 @@ async fn scheduler_loop(state: Arc<AppState>) {
             && last_daily_maintenance_attempt.is_none_or(|last| now - last >= 900)
         {
             last_daily_maintenance_attempt = Some(now);
-            let outcome = run_scheduled(state.clone(), json!({"type": "daily_maintenance", "since_ts": last_maintenance})).await;
-            // only advance the checkpoint on a real completion — `run()`'s
-            // one hard-failure path (agent_loop.rs: an `llm_call` error
-            // aborts the whole run) still reports a `summary`, just one
-            // starting with "run aborted". Advancing on that would silently
-            // skip whatever happened in `[last_maintenance, now)` forever:
-            // the next run's `since_ts` moves past it with nothing ever
-            // having actually reviewed that window (this is exactly what
-            // happened during the 2026-07-08 Moonshot API outage — a failed
-            // run's checkpoint write ate a whole window's worth of activity).
-            if !outcome_aborted(&outcome) {
+            if !has_new_log_entries(&state.agent_home, last_maintenance) && !workspace_memory_has_new_files(&state.agent_home, last_maintenance) {
+                // nothing logged and nothing changed under workspace/memory/
+                // since last time — an LLM pass here would just come back
+                // saying so. The check itself *is* a full, deterministic
+                // review of [last_maintenance, now), so it's safe to advance
+                // the checkpoint same as a real completed run would.
                 write_last_maintenance(&state.agent_home, now);
+            } else {
+                let outcome = run_scheduled(state.clone(), json!({"type": "daily_maintenance", "since_ts": last_maintenance})).await;
+                // only advance the checkpoint on a real completion — `run()`'s
+                // one hard-failure path (agent_loop.rs: an `llm_call` error
+                // aborts the whole run) still reports a `summary`, just one
+                // starting with "run aborted". Advancing on that would silently
+                // skip whatever happened in `[last_maintenance, now)` forever:
+                // the next run's `since_ts` moves past it with nothing ever
+                // having actually reviewed that window (this is exactly what
+                // happened during the 2026-07-08 Moonshot API outage — a failed
+                // run's checkpoint write ate a whole window's worth of activity).
+                if !outcome_aborted(&outcome) {
+                    write_last_maintenance(&state.agent_home, now);
+                }
             }
         }
 
@@ -442,11 +516,23 @@ async fn scheduler_loop(state: Arc<AppState>) {
             && last_maintenance_summary_attempt.is_none_or(|last| now - last >= 900)
         {
             last_maintenance_summary_attempt = Some(now);
+            // host-only, cheap — run regardless of whether there's a
+            // summary LLM pass to do below (idle-session sweeping and the
+            // distillation sanity check aren't about *this* tier's own
+            // output)
             sweep_idle_sessions(&state, Duration::from_secs(MAINTENANCE_SUMMARY_INTERVAL_SECS as u64)).await;
             verify_recent_distillation(&state.agent_home, MAINTENANCE_SUMMARY_INTERVAL_SECS);
-            let outcome = run_scheduled(state.clone(), json!({"type": "maintenance_summary", "since_ts": last_summary})).await;
-            if !outcome_aborted(&outcome) {
+            if !has_new_maintenance_reports(&state.agent_home, last_summary) {
+                // no hourly reports since last summary — likely every hour
+                // in this window was itself skipped for lack of activity;
+                // nothing to merge or escalate from, so this counts as a
+                // full review of [last_summary, now) same as a real run.
                 write_last_maintenance_summary(&state.agent_home, now);
+            } else {
+                let outcome = run_scheduled(state.clone(), json!({"type": "maintenance_summary", "since_ts": last_summary})).await;
+                if !outcome_aborted(&outcome) {
+                    write_last_maintenance_summary(&state.agent_home, now);
+                }
             }
         }
 

@@ -24,8 +24,11 @@ pub fn today_utc() -> String {
 }
 
 // days-since-epoch -> proleptic Gregorian date, Howard Hinnant's algorithm
-// (std has no chrono; this avoids pulling in a date crate for one field)
-fn civil_from_days(z: i64) -> String {
+// (std has no chrono; this avoids pulling in a date crate for one field).
+// `pub(crate)` — `gateway.rs`'s maintenance skip-checks need to build the
+// same `memory/notes/<day>/log.md` paths `agent_loop.rs` writes, for an
+// arbitrary day in a range, not just today's.
+pub(crate) fn civil_from_days(z: i64) -> String {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = (z - era * 146_097) as u64;
