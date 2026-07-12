@@ -509,6 +509,22 @@ http_per_domain_per_min = 10   # 對外禮貌,防同站連打被 ban IP
       `outcome_aborted`(原本兩處各寫一份重複邏輯),`scheduled_task_should_run` 抽成純函式——
       900 秒 backoff 沒辦法在這個 session 裡真的等 15 分鐘線上驗證,改用 6 個單元測試鎖住
       due_now/due_retry/retry 上限/backoff 時機這些邏輯,43 個 kernel test 全過
+- [x] **`SessionTurn` 補 sender 標記,修多人頻道混淆**(2026-07-12,真實事故,比同日稍早那次
+      sender_note 還要更深一層的根因):Discord **頻道** session 是所有發話者共用同一個
+      session_key,但 `SessionTurn` 從來沒記過「這輪是誰講的」——只有**當下這一輪**的 trigger
+      帶 `sender_note`/`sender_is_owner`,history 裡過去每一輪全部匿名。真實案例:主人在同個
+      頻道連續講了好幾輪設定 skill 的事,另一位成員接著問一句，模型直接拿主人剛建立的 context
+      回答陌生人;被主人質問時甚至還很篤定回「整段對話都是你在跟我說話」——因為它自己也看不出
+      history 裡哪一輪是誰講的,不是嘴硬,是真的沒有這個資訊。
+      修法:`SessionTurn` 加 `sender: Option<String>` 欄位(存 `"name (id, owner/not owner)"`
+      短標籤),`turn_to_message` 把這個標籤當成 `[label] ` 前綴,套用在**每一輪**歷史紀錄上,
+      不只是最新一輪。新增 `MessageSender` struct 統一 webui/Discord 兩邊的欄位——webui 給固定的
+      `id: "webui-owner"`(bearer token 已經確認是本人,不用 `None`,讓每一輪標記方式一致,不要
+      Discord 有標、webui 沒標);Discord 的 id 用 `discord-<user id>` 命名空間前綴,兩邊 id
+      永遠不會撞。sender_note 的措辭跟 wording 也統一收斂到 `handle_chat_message` 一個地方組,
+      不再讓 `discord.rs` 自己組一份、容易兩邊漂移。43 個 kernel test 全過,線上驗證：舊 session
+      (沒有這個欄位)照樣正常讀取(`#[serde(default)]`),新的一輪正確存下標籤,送給 LLM 的
+      history 上新一輪有 `[webui (id webui-owner, owner)]` 前綴,舊的那輪維持無標記
 
 ### 未來糖果罐(延後)
 - [ ] **Agent 互通(A2A,actor model)**:設計已定——新 syscall `send_agent(target, msg)`,kernel **複製**訊息至對方 `inbox/from-<sender>/` 並喚醒;不共享任何目錄,Store 間零接觸;通訊拓撲在 kernel config 逐條宣告(capability),未宣告組合拒絕;訊息全經 kernel = 全量 A2A log,gateway 可視化對話圖。支援監督者模式、互相 review 等玩法;新 agent = 新資料夾 + 一行拓撲
