@@ -882,8 +882,18 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String]) -> (String, String
                  the last run, not the whole day. You don't need to read_file the day's log.md yourself; below \
                  is everything logged since {}:\n\n{delta}\n\n\
                  Distill anything worth keeping into memory/notes/ (write_file — merge duplicates, prune what's \
-                 stale), then write_file a report to /memory/maintenance_reports/{}.md summarizing what you did \
-                 before calling done.\n",
+                 stale). Also check /workspace/ yourself (list_dir, then read_file anything that looks like a \
+                 standalone note/reminder — the log delta above only tells you a file like that *exists*, not \
+                 what's actually in it). Split what you find into two kinds, don't conflate them: a durable fact \
+                 (something true going forward — a preference, a decision, how something works) belongs in \
+                 memory/notes/; a pending action item that only a human can actually do (uploading an image, \
+                 clicking a button somewhere) isn't a fact to memorize, it stays exactly where it is in \
+                 /workspace/ and gets called out in this report's own \"needs attention\" section instead — \
+                 don't write a todo into memory/notes/ just because it showed up during this pass. Once a \
+                 workspace note's *facts* have been folded into memory/notes/ and nothing pending is left in it, \
+                 delete_path it — leaving it behind means the same content gets re-noticed and re-considered \
+                 every future cycle for no reason. Then write_file a report to \
+                 /memory/maintenance_reports/{}.md summarizing what you did before calling done.\n",
                 if since_ts == 0 { "the beginning".to_string() } else { human_timestamp(since_ts) },
                 crate::time::maintenance_run_id(now_unix())
             )
