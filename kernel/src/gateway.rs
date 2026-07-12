@@ -224,8 +224,57 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
 /// - one `scheduled_task` wake per enabled, cron-matching entry under
 ///   `crate::scheduler_tasks` — user/agent-defined jobs (`data_path` points
 ///   the woken session at its own instructions), independent of the two
-///   built-in wakes above
+///   built-in wakes above. A run that aborts (an `llm_call` failure chain —
+///   see the 2026-07-12 Moonshot content-filter incident, a morning-report
+///   task that silently missed its one daily fire and only got noticed
+///   because the agent happened to catch it on its own during a later
+///   `cron` wake) gets retried on the same
+///   `SCHEDULED_TASK_RETRY_BACKOFF_SECS` in-memory backoff `daily_maintenance`
+///   already uses, up to `SCHEDULED_TASK_MAX_RETRIES` times, rather than
+///   waiting for the cron string's next natural match (which could be a
+///   full day away for a once-daily task) — tracked in-memory only
+///   (`task_retry_state`), same as `last_daily_maintenance_attempt`, so a
+///   kernel restart resets any in-flight retry streak rather than persisting
+///   it forever.
 const MAINTENANCE_INTERVAL_SECS: i64 = 6 * 3600;
+/// Same 15-minute backoff `daily_maintenance` already retries a failed run
+/// on — see `scheduler_loop`'s doc comment.
+const SCHEDULED_TASK_RETRY_BACKOFF_SECS: i64 = 900;
+/// After this many consecutive failed attempts at the same due occurrence,
+/// stop retrying and wait for the cron string's next natural match instead
+/// — an indefinitely-retrying task (e.g. a persistent provider-side content
+/// filter rejection that isn't going to resolve itself within the hour)
+/// would otherwise burn `llm_call` attempts and budget forever.
+const SCHEDULED_TASK_MAX_RETRIES: u32 = 3;
+
+/// `run_trigger`'s outcome shape: `{"ok":true,"result":{"summary":..},...}`
+/// on a completed run, `{"ok":false,"error":..}` only on a panic/spawn
+/// failure — a plain `llm_call` failure chain (`agent_loop.rs` aborts the
+/// whole run rather than continuing with a broken turn) still comes back
+/// `ok:true` with `result.summary` starting `"run aborted"`, so both need
+/// checking to catch every way a self-driven run can fail to actually
+/// finish its job. Shared by `daily_maintenance` (skip advancing its
+/// checkpoint) and `scheduled_task` (retry) — same failure shape, two
+/// different recoveries.
+fn outcome_aborted(outcome: &Value) -> bool {
+    !outcome.get("ok").and_then(Value::as_bool).unwrap_or(false)
+        || outcome.get("result").and_then(|r| r.get("summary")).and_then(Value::as_str).is_some_and(|s| s.starts_with("run aborted"))
+}
+
+/// Pure decision logic for whether `scheduler_loop` should run a
+/// `scheduled_task` this tick — split out from the loop itself so the
+/// backoff/retry-cap math is unit-testable without waiting on real
+/// wall-clock time through the actual 30s-tick loop (`SCHEDULED_TASK_
+/// RETRY_BACKOFF_SECS` is 15 minutes). `retry_state` is `(last_attempt_ts,
+/// consecutive_failures)` for this task id, if any attempt has happened
+/// yet.
+fn scheduled_task_should_run(due_now: bool, retry_state: Option<(i64, u32)>, now: i64) -> bool {
+    if due_now {
+        return true;
+    }
+    retry_state
+        .is_some_and(|(last_attempt, failures)| failures > 0 && failures <= SCHEDULED_TASK_MAX_RETRIES && now - last_attempt >= SCHEDULED_TASK_RETRY_BACKOFF_SECS)
+}
 
 fn last_maintenance_marker_path(agent_home: &Path) -> PathBuf {
     agent_home.join("memory/maintenance_reports/.last_run")
@@ -275,6 +324,9 @@ async fn sweep_idle_sessions(state: &Arc<AppState>, idle_after: Duration) {
 async fn scheduler_loop(state: Arc<AppState>) {
     let mut last_daily_maintenance_attempt: Option<i64> = None;
     let mut last_handled_sleep_until: Option<i64> = None;
+    // (last_attempt_ts, consecutive_failures) per task id — see this fn's
+    // doc comment and `SCHEDULED_TASK_RETRY_BACKOFF_SECS`/`_MAX_RETRIES`
+    let mut task_retry_state: std::collections::HashMap<String, (i64, u32)> = std::collections::HashMap::new();
     loop {
         tokio::time::sleep(Duration::from_secs(30)).await;
         let now = crate::logs::now_unix_secs();
@@ -294,13 +346,7 @@ async fn scheduler_loop(state: Arc<AppState>) {
             // having actually reviewed that window (this is exactly what
             // happened during the 2026-07-08 Moonshot API outage — a failed
             // run's checkpoint write ate a 6h window's worth of activity).
-            // run_trigger's outcome shape: {"ok":true,"result":{"summary":..},...}
-            // on a completed run, {"ok":false,"error":..} only on a
-            // panic/spawn failure — a plain llm_call abort still comes back
-            // `ok:true` with `result.summary` starting "run aborted"
-            let aborted = !outcome.get("ok").and_then(Value::as_bool).unwrap_or(false)
-                || outcome.get("result").and_then(|r| r.get("summary")).and_then(Value::as_str).is_some_and(|s| s.starts_with("run aborted"));
-            if !aborted {
+            if !outcome_aborted(&outcome) {
                 write_last_maintenance(&state.agent_home, now);
             }
         }
@@ -317,16 +363,22 @@ async fn scheduler_loop(state: Arc<AppState>) {
         }
 
         for task in crate::scheduler_tasks::load_tasks(&state.agent_home) {
-            if !task.enabled || !crate::cron::matches(&task.cron, now) {
+            if !task.enabled {
                 continue;
             }
             // one fire per matching minute — a tick every 30s would
             // otherwise double-fire any spec that matches for a whole minute
-            if task.last_run.is_some_and(|last| last / 60 == now / 60) {
+            let due_now = crate::cron::matches(&task.cron, now) && !task.last_run.is_some_and(|last| last / 60 == now / 60);
+            let retry_state = task_retry_state.get(&task.id).copied();
+            if !scheduled_task_should_run(due_now, retry_state, now) {
                 continue;
             }
-            crate::scheduler_tasks::mark_run(&state.agent_home, &task.id, now);
-            run_scheduled(state.clone(), json!({"type": "scheduled_task", "task_id": task.id, "data_path": task.data_path})).await;
+            if due_now {
+                crate::scheduler_tasks::mark_run(&state.agent_home, &task.id, now);
+            }
+            let outcome = run_scheduled(state.clone(), json!({"type": "scheduled_task", "task_id": task.id, "data_path": task.data_path})).await;
+            let failures = if outcome_aborted(&outcome) { retry_state.map(|(_, f)| f + 1).unwrap_or(1) } else { 0 };
+            task_retry_state.insert(task.id.clone(), (now, failures));
         }
     }
 }
@@ -1567,4 +1619,49 @@ fn logs_stream(path: PathBuf) -> impl Stream<Item = Result<Event, Infallible>> {
             }
         }
     })
+}
+
+#[cfg(test)]
+mod scheduled_task_retry_tests {
+    use super::*;
+
+    #[test]
+    fn runs_when_due_now_regardless_of_retry_state() {
+        assert!(scheduled_task_should_run(true, None, 1_000));
+        assert!(scheduled_task_should_run(true, Some((999, SCHEDULED_TASK_MAX_RETRIES + 5)), 1_000));
+    }
+
+    #[test]
+    fn does_not_run_when_not_due_and_no_prior_failure() {
+        assert!(!scheduled_task_should_run(false, None, 1_000));
+        assert!(!scheduled_task_should_run(false, Some((900, 0)), 1_000));
+    }
+
+    #[test]
+    fn retries_once_backoff_has_elapsed() {
+        let last_attempt = 1_000;
+        let now = last_attempt + SCHEDULED_TASK_RETRY_BACKOFF_SECS;
+        assert!(scheduled_task_should_run(false, Some((last_attempt, 1)), now));
+    }
+
+    #[test]
+    fn does_not_retry_before_backoff_elapses() {
+        let last_attempt = 1_000;
+        let now = last_attempt + SCHEDULED_TASK_RETRY_BACKOFF_SECS - 1;
+        assert!(!scheduled_task_should_run(false, Some((last_attempt, 1)), now));
+    }
+
+    #[test]
+    fn stops_retrying_once_max_retries_exceeded() {
+        let last_attempt = 1_000;
+        let now = last_attempt + SCHEDULED_TASK_RETRY_BACKOFF_SECS;
+        assert!(!scheduled_task_should_run(false, Some((last_attempt, SCHEDULED_TASK_MAX_RETRIES + 1)), now));
+    }
+
+    #[test]
+    fn outcome_aborted_detects_both_failure_shapes() {
+        assert!(outcome_aborted(&serde_json::json!({"ok": false, "error": "spawn failed"})));
+        assert!(outcome_aborted(&serde_json::json!({"ok": true, "result": {"summary": "run aborted: llm_call failed 3x in a row"}})));
+        assert!(!outcome_aborted(&serde_json::json!({"ok": true, "result": {"summary": "did the thing successfully"}})));
+    }
 }
