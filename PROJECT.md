@@ -525,6 +525,18 @@ http_per_domain_per_min = 10   # 對外禮貌,防同站連打被 ban IP
       不再讓 `discord.rs` 自己組一份、容易兩邊漂移。43 個 kernel test 全過,線上驗證：舊 session
       (沒有這個欄位)照樣正常讀取(`#[serde(default)]`),新的一輪正確存下標籤,送給 LLM 的
       history 上新一輪有 `[webui (id webui-owner, owner)]` 前綴,舊的那輪維持無標記
+- [x] **daily_maintenance 補查 workspace 筆記,分清楚事實跟待辦**(2026-07-12,真實案例):
+      maintenance report 每次都正確重新提到「reminders.md 有一項:Discord bot 上頭像」,代表它
+      真的有讀那個檔案,但從來沒把任何東西蒸餾進 `memory/notes/`——因為那是一件只有人類能做的待辦
+      (上傳圖片),不是該記住的事實,但 prompt 從沒教過它「這兩種東西要分開處理」,也沒叫它主動去
+      查 workspace(log delta 只會提到「有這個檔案」,不會給內容)。修法:trigger_note 加三件事——
+      (1) 自己 `list_dir`/`read_file` 檢查 workspace,不要只看 log delta 提到「有檔案」就算了
+      (2) 事實寫 memory/notes/,待辦(只有人類能做的動作)留在原地、寫進 report 的「需關注」段,
+      不要混進 memory/notes/ (3) 一份筆記的事實蒸餾完、沒有待辦殘留了,`delete_path` 掉,不然
+      同一份內容會被每個週期重新注意、重新考慮一次,沒意義。刻意不做 host 端整包掃描塞進 prompt——
+      那會重演 log.md 爆 160k tokens 那次的風險,範圍讓 agent 自己用 list_dir/read_file 控制。
+      43 個 kernel test 全過(agent-only 改動,kernel 沒動),線上部署健康度確認過,但實際效果要等
+      下一次 daily_maintenance 自然的 6h 週期才看得到
 
 ### 未來糖果罐(延後)
 - [ ] **Agent 互通(A2A,actor model)**:設計已定——新 syscall `send_agent(target, msg)`,kernel **複製**訊息至對方 `inbox/from-<sender>/` 並喚醒;不共享任何目錄,Store 間零接觸;通訊拓撲在 kernel config 逐條宣告(capability),未宣告組合拒絕;訊息全經 kernel = 全量 A2A log,gateway 可視化對話圖。支援監督者模式、互相 review 等玩法;新 agent = 新資料夾 + 一行拓撲
