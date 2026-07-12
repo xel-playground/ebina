@@ -322,6 +322,51 @@ fn scheduled_task_should_run(due_now: bool, retry_state: Option<(i64, u32)>, now
         .is_some_and(|(last_attempt, failures)| failures > 0 && failures <= SCHEDULED_TASK_MAX_RETRIES && now - last_attempt >= SCHEDULED_TASK_RETRY_BACKOFF_SECS)
 }
 
+fn scheduler_tick_marker_path(agent_home: &Path) -> PathBuf {
+    agent_home.join("scheduler/.last_tick")
+}
+
+/// 0 is the sentinel for "this scheduler has never ticked before" — the
+/// caller treats that as "no backfill, just establish a baseline", not
+/// "everything since the Unix epoch is a gap" (unlike `read_last_maintenance`,
+/// where 0 deliberately *does* mean "review everything so far").
+fn read_scheduler_last_tick(agent_home: &Path) -> i64 {
+    std::fs::read_to_string(scheduler_tick_marker_path(agent_home)).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
+}
+
+fn write_scheduler_last_tick(agent_home: &Path, now: i64) {
+    let path = scheduler_tick_marker_path(agent_home);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, now.to_string());
+}
+
+/// Whether `cron_spec` matched at least one whole minute strictly between
+/// `gap_start` and `now`'s own current minute (which `due_now` already
+/// covers, at the call site — not this function's job). In the ordinary
+/// case `gap_start` is ~30s ago (last tick) and this loop finds nothing;
+/// it only matters after a real gap — kernel downtime spanning a restart,
+/// or (before 2026-07-12's `tokio::spawn` fix) the tick loop itself stuck
+/// inside a long `.await` — during which `scheduled_task`'s own `due_now`
+/// check, tied to *this* tick's current minute alone, never got a chance to
+/// see an exact-minute cron match that fell inside the gap and is gone
+/// forever once the minute passes. Fires the task once to catch up rather
+/// than once per missed minute in the gap — a long outage spanning several
+/// of a daily task's matching minutes should bring it current, not replay
+/// a backlog of stale runs.
+fn missed_in_gap(cron_spec: &str, gap_start: i64, now: i64) -> bool {
+    let mut t = gap_start + 60;
+    let cutoff = now - 60; // this tick's own current minute is due_now's job, not this
+    while t < cutoff {
+        if crate::cron::matches(cron_spec, t) {
+            return true;
+        }
+        t += 60;
+    }
+    false
+}
+
 fn last_maintenance_marker_path(agent_home: &Path) -> PathBuf {
     agent_home.join("memory/maintenance_reports/.last_run")
 }
@@ -493,10 +538,19 @@ async fn scheduler_loop(state: Arc<AppState>) {
     // deduped by `last_handled_sleep_until` before it ever spawns.
     let daily_maintenance_running = Arc::new(AtomicBool::new(false));
     let maintenance_summary_running = Arc::new(AtomicBool::new(false));
+    // Persisted (not a local `Option`) — a plain local would reset to "no
+    // gap" on every kernel restart, exactly the case (downtime spanning an
+    // exact-minute cron match) this is meant to catch. 0 sentinel means
+    // "never ticked before" — see `read_scheduler_last_tick`'s doc comment.
+    let mut scheduler_last_tick = read_scheduler_last_tick(&state.agent_home);
     loop {
         tokio::time::sleep(Duration::from_secs(30)).await;
         let now = crate::logs::now_unix_secs();
         state.sweep_idle_locks().await;
+
+        let gap_start = if scheduler_last_tick == 0 { now } else { scheduler_last_tick };
+        write_scheduler_last_tick(&state.agent_home, now);
+        scheduler_last_tick = now;
 
         let last_maintenance = read_last_maintenance(&state.agent_home);
         if now - last_maintenance >= MAINTENANCE_INTERVAL_SECS
@@ -605,11 +659,17 @@ async fn scheduler_loop(state: Arc<AppState>) {
             // one fire per matching minute — a tick every 30s would
             // otherwise double-fire any spec that matches for a whole minute
             let due_now = crate::cron::matches(&task.cron, now) && !task.last_run.is_some_and(|last| last / 60 == now / 60);
+            // caught up separately from `due_now` — a gap since the last
+            // tick (kernel downtime, or a stuck loop before 2026-07-12's
+            // spawn fix) can mean this exact minute isn't the one that
+            // matched, the match already happened somewhere inside the gap
+            // and would otherwise be gone forever. See `missed_in_gap`.
+            let missed = !due_now && missed_in_gap(&task.cron, gap_start, now);
             let retry_state = { task_retry_state.lock().await.get(&task.id).copied() };
-            if !scheduled_task_should_run(due_now, retry_state, now) {
+            if !scheduled_task_should_run(due_now || missed, retry_state, now) {
                 continue;
             }
-            if due_now {
+            if due_now || missed {
                 crate::scheduler_tasks::mark_run(&state.agent_home, &task.id, now);
             }
             // spawned, not awaited — same reasoning as daily_maintenance
@@ -2005,5 +2065,46 @@ mod scheduled_task_retry_tests {
         assert!(outcome_aborted(&serde_json::json!({"ok": false, "error": "spawn failed"})));
         assert!(outcome_aborted(&serde_json::json!({"ok": true, "result": {"summary": "run aborted: llm_call failed 3x in a row"}})));
         assert!(!outcome_aborted(&serde_json::json!({"ok": true, "result": {"summary": "did the thing successfully"}})));
+    }
+}
+
+#[cfg(test)]
+mod missed_in_gap_tests {
+    use super::*;
+
+    // 2026-07-06 09:00:00 UTC — same reference instant `cron.rs`'s own
+    // tests use, minute 0 so it never accidentally matches "17 9 * * *"
+    // itself
+    const NINE_AM: i64 = 1_783_328_400;
+    const SPEC: &str = "17 9 * * *"; // rss_tech_report's real cron
+
+    #[test]
+    fn catches_an_exact_minute_that_fell_inside_the_gap() {
+        let gap_start = NINE_AM; // 09:00:00
+        let now = NINE_AM + 20 * 60; // 09:20:00 — 09:17 is strictly inside
+        assert!(missed_in_gap(SPEC, gap_start, now));
+    }
+
+    #[test]
+    fn no_match_found_when_the_gap_never_touches_the_matching_minute() {
+        let gap_start = NINE_AM; // 09:00:00
+        let now = NINE_AM + 5 * 60; // 09:05:00 — well before 09:17
+        assert!(!missed_in_gap(SPEC, gap_start, now));
+    }
+
+    #[test]
+    fn ordinary_30s_tick_gap_never_false_positives() {
+        let gap_start = NINE_AM + 17 * 60; // last tick was exactly at 09:17
+        let now = gap_start + 30; // this tick, 30s later
+        assert!(!missed_in_gap(SPEC, gap_start, now));
+    }
+
+    #[test]
+    fn does_not_count_the_current_tick_s_own_minute() {
+        // 09:17 falls in [now-60, now) — that's due_now's job, not this
+        // function's; missed_in_gap must not double-report it.
+        let gap_start = NINE_AM; // 09:00:00
+        let now = NINE_AM + 17 * 60 + 30; // 09:17:30, mid-way through minute 17
+        assert!(!missed_in_gap(SPEC, gap_start, now));
     }
 }
