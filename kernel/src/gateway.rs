@@ -605,6 +605,17 @@ pub(crate) async fn handle_chat_message(
     attachments: Vec<String>,
     channel: Option<String>,
     sender_note: Option<String>,
+    // Machine-readable counterpart to `sender_note` — that string is only
+    // ever advisory (the model reads it and may simply not comply, as a
+    // real incident showed: a non-owner's guild @mention got answered with
+    // the owner's personal trip-planning reminders anyway). This bool lets
+    // `agent_loop.rs` deterministically strip retrieved-memory content out
+    // of the prompt entirely for a confirmed non-owner sender, instead of
+    // just asking the model nicely not to share it. `None` means "no
+    // untrusted external sender to gate on" (webui — already gated by the
+    // bearer token itself before this ever runs), not "unknown, deny by
+    // default" — only Discord ever sets this.
+    sender_is_owner: Option<bool>,
 ) -> Value {
     let mut session = load_session(&state.agent_home, &session_key);
     // an empty text block inside a multimodal content array (attachments
@@ -645,6 +656,9 @@ pub(crate) async fn handle_chat_message(
     }
     if let Some(note) = sender_note {
         trigger["sender_note"] = Value::String(note);
+    }
+    if let Some(is_owner) = sender_is_owner {
+        trigger["sender_is_owner"] = Value::Bool(is_owner);
     }
     let outcome = run_trigger(state.clone(), trigger).await;
 
@@ -733,7 +747,7 @@ async fn post_message(State(state): State<Arc<AppState>>, Json(body): Json<Messa
     // `save_session` at the end of `handle_chat_message` instead of being
     // silently lost (the run itself always completed; only the session.json
     // write was getting cancelled along with the dropped HTTP response)
-    let handle = tokio::spawn(handle_chat_message(state, DEFAULT_SESSION_KEY.to_string(), body.text, body.attachments, None, None));
+    let handle = tokio::spawn(handle_chat_message(state, DEFAULT_SESSION_KEY.to_string(), body.text, body.attachments, None, None, None));
     match handle.await {
         Ok(outcome) => Json(outcome),
         Err(e) => Json(json!({"ok": false, "error": format!("run task panicked: {e}")})),
