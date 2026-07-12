@@ -878,13 +878,14 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String]) -> (String, String
             let since_ts = trigger.get("since_ts").and_then(Value::as_u64).unwrap_or(0);
             let delta = recent_log_entries(since_ts);
             format!(
-                "\nThis is a daily_maintenance run (PROJECT.md 4.3), on a 6-hour cycle — only what's new since \
-                 the last run, not the whole day. You don't need to read_file the day's log.md yourself; below \
-                 is everything logged since {}:\n\n{delta}\n\n\
+                "\nThis is a daily_maintenance run (PROJECT.md 4.3) — despite the name, a *light*, frequent \
+                 pass (hourly) now, not a deep review; a separate maintenance_summary run handles \
+                 consolidation every 6h. Only what's new since the last run:\n\n{delta}\n\n\
                  Distill anything worth keeping into memory/notes/ (write_file — merge duplicates, prune what's \
-                 stale). Also check /workspace/ yourself (list_dir, then read_file anything that looks like a \
-                 standalone note/reminder — the log delta above only tells you a file like that *exists*, not \
-                 what's actually in it). Split what you find into two kinds, don't conflate them: a durable fact \
+                 stale) — quickly, don't try to be exhaustive, there isn't much new in an hour. Also check \
+                 /workspace/ yourself (list_dir, then read_file anything that looks like a standalone \
+                 note/reminder — the log delta above only tells you a file like that *exists*, not what's \
+                 actually in it). Split what you find into two kinds, don't conflate them: a durable fact \
                  (something true going forward — a preference, a decision, how something works) belongs in \
                  memory/notes/; a pending action item that only a human can actually do (uploading an image, \
                  clicking a button somewhere) isn't a fact to memorize, it stays exactly where it is in \
@@ -894,6 +895,21 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String]) -> (String, String
                  delete_path it — leaving it behind means the same content gets re-noticed and re-considered \
                  every future cycle for no reason. Then write_file a report to \
                  /memory/maintenance_reports/{}.md summarizing what you did before calling done.\n",
+                crate::time::maintenance_run_id(now_unix())
+            )
+        }
+        Some("maintenance_summary") => {
+            let since_ts = trigger.get("since_ts").and_then(Value::as_u64).unwrap_or(0);
+            format!(
+                "\nThis is a maintenance_summary run (every 6h) — the deeper pass the hourly daily_maintenance \
+                 one deliberately skips. list_dir /memory/maintenance_reports/ and read_file the ones written \
+                 since {} (roughly the last 6 hourly passes). Use them to: merge/dedupe anything in \
+                 memory/notes/ that ended up fragmented or contradictory across several of those hourly passes; \
+                 and — the part that actually matters here — if the same \"needs attention\" item (a pending \
+                 human-only action) has shown up across 3 or more of those reports with nothing changing, stop \
+                 just re-noting it and actually chat_send the human about it instead. A report nobody reads \
+                 isn't an escalation, it's a place things go to be silently repeated forever. Write a \
+                 consolidated /memory/maintenance_reports/{}_summary.md when done, then call done.\n",
                 if since_ts == 0 { "the beginning".to_string() } else { human_timestamp(since_ts) },
                 crate::time::maintenance_run_id(now_unix())
             )
@@ -1070,13 +1086,6 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String]) -> (String, String
          - `{{\"action\":\"done\",\"summary\":\"...\"}}` — ends this run, `summary` is saved to memory\n\n\
          ## Paths and files\n\n\
          Paths are absolute from your root, e.g. `/workspace/notes.txt`.\n\n\
-         - `/workspace/` doubles as your short-term memory / inbox, not just scratch space for the task at \
-         hand — jot a reminder or note there any time something's worth keeping track of but doesn't need to \
-         be a permanent fact yet (e.g. `reminders.md`). `daily_maintenance` checks it every 6h: a durable \
-         fact gets folded into `/memory/notes/`, a pending action item only a human can actually do stays put \
-         and gets called out to them instead. Nothing here reads `/workspace/` automatically between runs the \
-         way it does `/memory/notes/` — a note only gets acted on once `daily_maintenance` (or you yourself) \
-         actually reads it.\n\
          - Memory notes live under `/memory/notes/` — timeless facts go in their own topic file (markdown, \
          one topic per file); the automatic per-run log lives at `/memory/notes/<YYYY-MM-DD>/log.md` and \
          is written for you.\n\
@@ -1108,8 +1117,9 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String]) -> (String, String
     // `daily_maintenance` already gets the fuller delta-since-last-run via
     // `recent_log_entries` in its own `trigger_note` below — this would
     // just be a redundant, more-truncated view of the same data for that
-    // one trigger type, so skip it there.
-    let staging_section = if trigger_type == Some("daily_maintenance") {
+    // one trigger type, so skip it there. `maintenance_summary` reviews
+    // maintenance reports directly, same reasoning.
+    let staging_section = if matches!(trigger_type, Some("daily_maintenance") | Some("maintenance_summary")) {
         String::new()
     } else {
         // this session's own turns are already fully visible via `history`

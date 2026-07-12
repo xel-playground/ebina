@@ -112,8 +112,10 @@ fn untrack_private_dir(agent_home: &Path, git_dir: &Path) -> anyhow::Result<()> 
 
 /// `<parent of agent_home>/.git` — a sibling of agent_home, not a child of
 /// it (same convention as `secrets_path` in lib.rs), just using the
-/// conventional dotfile name instead of a derived one.
-fn git_dir_path(agent_home: &Path) -> PathBuf {
+/// conventional dotfile name instead of a derived one. `pub(crate)` —
+/// `gateway.rs`'s distillation-verification check needs this same path to
+/// query commit history against, not just this module's own commits.
+pub(crate) fn git_dir_path(agent_home: &Path) -> PathBuf {
     agent_home.parent().map(|p| p.join(".git")).unwrap_or_else(|| PathBuf::from(".git"))
 }
 

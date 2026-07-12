@@ -264,12 +264,33 @@ Two layers, deliberately kept separate:
   entries drowned out anything actually relevant.
 
 `daily_maintenance` is what bridges the two: a built-in self-driven wake,
-now on a 6-hour cycle (not once/day), reviewing only what's new since its
-own last successful run (`since_ts`, tracked in
+on an hourly cycle (2026-07-12: shrunk from 6h — a fact could sit unfolded
+for up to 6h, and worse, a "needs attention" item that wasn't acted on just
+got silently re-noted every cycle after with nothing escalating; see the
+avatar-reminder incident in PROJECT.md), reviewing only what's new since
+its own last successful run (`since_ts`, tracked in
 `memory/maintenance_reports/.last_run` — a run that hard-aborts does *not*
-advance this, so a transient failure can't silently skip a whole window)
-and distilling anything worth keeping into the curated notes above. One
+advance this, so a transient failure can't silently skip a whole window),
+also checking `/workspace/` itself for standalone notes/reminders (the log
+delta alone only says one *exists*, not what's in it — durable facts go
+into the curated notes above, a pending human-only action item stays in
+`/workspace/` and gets called out in the report instead, and a fully-
+distilled note gets `delete_path`'d so it isn't re-considered forever). One
 report per run lands in `memory/maintenance_reports/<date>_<HHMM>.md`.
+
+A separate `maintenance_summary` wake runs every 6h (its own checkpoint,
+`memory/maintenance_reports/.last_summary_run`) — the deeper pass the
+hourly one deliberately skips: reviews the reports written since the last
+summary, merges/dedupes anything that ended up fragmented across several
+of them, and is where a "needs attention" item that's shown up 3+ times
+running with nothing changing is supposed to actually `chat_send` the
+human instead of just getting silently re-mentioned. This is also when
+`sweep_idle_sessions` (resetting a conversation nobody's touched in 6h)
+runs, and a host-side, no-LLM sanity check: did `memory/notes/` actually
+get any git commits in the last 6h, or is `daily_maintenance` just
+self-reporting distillation without anything landing on disk? `notify()`
+if not — silence isn't proof of a bug on its own, but it's a discrepancy
+worth surfacing rather than only ever trusting a run's own word for it.
 
 ### Mid-run compaction (`runtime.in_run_compact_tokens`)
 

@@ -208,18 +208,42 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
 
 /// PROJECT.md 4.5: "tokio loop,管 next-wake + daily_maintenance cron" — until
 /// now nothing drove this; the agent only ever ran in response to a human
-/// hitting `/api/message` or `/api/wake`. Ticks every 30s and fires two
-/// kinds of self-driven wake, neither carrying chat `history` (so each is
+/// hitting `/api/message` or `/api/wake`. Ticks every 30s and fires several
+/// kinds of self-driven wake, none carrying chat `history` (so each is
 /// structurally a fresh session — `agent_loop.rs` only continues a
 /// conversation when `trigger.history` is present):
 ///
-/// - `daily_maintenance`, every `MAINTENANCE_INTERVAL_SECS` (6h) since the
-///   last one, tracked by `last_maintenance_marker_path` rather than "does
-///   today's report exist" — running 4x/day needs its own persisted
-///   checkpoint since a bare day-existence check would only ever fire once
-///   per calendar day. `since_ts` (the checkpoint being advanced) rides
-///   along in the trigger so the agent only reviews what's new since then
-///   (`agent_loop.rs`'s `recent_log_entries`), not the whole day.
+/// - `daily_maintenance`, every `MAINTENANCE_INTERVAL_SECS` (1h — despite
+///   the name, a deliberately *light*, frequent pass now, not a deep
+///   review) since the last one, tracked by `last_maintenance_marker_path`
+///   rather than "does today's report exist" — a bare day-existence check
+///   would only ever fire once per calendar day. `since_ts` (the checkpoint
+///   being advanced) rides along in the trigger so the agent only reviews
+///   what's new since then (`agent_loop.rs`'s `recent_log_entries`), not
+///   everything. 2026-07-12: this used to be the *only* distillation pass,
+///   at 6h — a fact could sit unfolded into memory/notes/ for up to 6h, and
+///   worse, a fact that got noted as "needs attention" one cycle but wasn't
+///   acted on just got silently re-noted every cycle after with nothing
+///   ever escalating (a real incident: a "please update the bot's avatar"
+///   reminder got rediscovered and reported on for over a day, never
+///   distilled, never escalated). Shrinking the light pass to 1h reduces
+///   how long anything sits unprocessed; see `maintenance_summary` below
+///   for what replaced the escalation half of the old 6h job.
+/// - `maintenance_summary`, every `MAINTENANCE_SUMMARY_INTERVAL_SECS` (6h,
+///   its own separate checkpoint) — a deeper pass the light hourly one
+///   deliberately doesn't do: reviews the maintenance reports written since
+///   the last summary, merges/dedupes anything that ended up fragmented
+///   across several hourly passes, and is where a repeatedly-unresolved
+///   "needs attention" item is supposed to actually escalate (`chat_send`)
+///   instead of just getting silently re-mentioned forever. Also where
+///   `sweep_idle_sessions` and `verify_recent_distillation` (a host-side,
+///   no-LLM sanity check — did `memory/notes/` actually get any git commits
+///   in the last window, or is `daily_maintenance` just claiming to
+///   distill things without anything really landing on disk) run — both
+///   were tied to the old 6h cadence and would otherwise have started
+///   firing every 1h once the light pass shrank, which is wrong for both
+///   (an idle-session threshold of 1h is far too aggressive, and there's
+///   no point re-checking git history that fast).
 /// - `cron`, once the agent's own last-requested `sleep_until` has passed
 /// - one `scheduled_task` wake per enabled, cron-matching entry under
 ///   `crate::scheduler_tasks` — user/agent-defined jobs (`data_path` points
@@ -236,7 +260,8 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
 ///   (`task_retry_state`), same as `last_daily_maintenance_attempt`, so a
 ///   kernel restart resets any in-flight retry streak rather than persisting
 ///   it forever.
-const MAINTENANCE_INTERVAL_SECS: i64 = 6 * 3600;
+const MAINTENANCE_INTERVAL_SECS: i64 = 3600;
+const MAINTENANCE_SUMMARY_INTERVAL_SECS: i64 = 6 * 3600;
 /// Same 15-minute backoff `daily_maintenance` already retries a failed run
 /// on — see `scheduler_loop`'s doc comment.
 const SCHEDULED_TASK_RETRY_BACKOFF_SECS: i64 = 900;
@@ -292,6 +317,51 @@ fn write_last_maintenance(agent_home: &Path, now: i64) {
     let _ = std::fs::write(path, now.to_string());
 }
 
+fn last_maintenance_summary_marker_path(agent_home: &Path) -> PathBuf {
+    agent_home.join("memory/maintenance_reports/.last_summary_run")
+}
+
+fn read_last_maintenance_summary(agent_home: &Path) -> i64 {
+    std::fs::read_to_string(last_maintenance_summary_marker_path(agent_home)).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
+}
+
+fn write_last_maintenance_summary(agent_home: &Path, now: i64) {
+    let path = last_maintenance_summary_marker_path(agent_home);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, now.to_string());
+}
+
+/// Pure host-side check, no LLM involved — `memory/notes/` should show at
+/// least one real git commit within `window_secs` if the hourly
+/// `daily_maintenance` passes during that window are actually distilling
+/// anything, not just self-reporting that they did. Silence isn't proof of
+/// a bug on its own (a genuinely quiet window with nothing worth
+/// remembering is possible) — this just makes the discrepancy visible via
+/// `notify()` instead of only ever trusting a run's own word for it.
+fn verify_recent_distillation(agent_home: &Path, window_secs: i64) {
+    let git_dir = crate::autocommit::git_dir_path(agent_home);
+    if !git_dir.exists() {
+        return; // no git history yet at all — nothing to check
+    }
+    let since = format!("{window_secs} seconds ago");
+    let output = std::process::Command::new("git")
+        .args(["--git-dir", &git_dir.to_string_lossy(), "--work-tree", &agent_home.to_string_lossy(), "log", "--since", &since, "--oneline", "--", "memory/notes"])
+        .output();
+    let has_commits = output.map(|o| o.status.success() && !o.stdout.is_empty()).unwrap_or(false);
+    if !has_commits {
+        let _ = crate::logs::notify(
+            agent_home,
+            &format!(
+                "distillation check: memory/notes/ has had no git commits in the last {}h despite {} hourly daily_maintenance passes in that window — it may not actually be writing anything",
+                window_secs / 3600,
+                window_secs / MAINTENANCE_INTERVAL_SECS
+            ),
+        );
+    }
+}
+
 /// A session (webui or any Discord DM/channel) nobody's touched in over
 /// `idle_after` gets reset the same way `!reset`/the webui button would —
 /// unlike `maybe_auto_compact` (which only ever runs on the *next* turn a
@@ -323,6 +393,7 @@ async fn sweep_idle_sessions(state: &Arc<AppState>, idle_after: Duration) {
 
 async fn scheduler_loop(state: Arc<AppState>) {
     let mut last_daily_maintenance_attempt: Option<i64> = None;
+    let mut last_maintenance_summary_attempt: Option<i64> = None;
     let mut last_handled_sleep_until: Option<i64> = None;
     // (last_attempt_ts, consecutive_failures) per task id — see this fn's
     // doc comment and `SCHEDULED_TASK_RETRY_BACKOFF_SECS`/`_MAX_RETRIES`
@@ -335,7 +406,6 @@ async fn scheduler_loop(state: Arc<AppState>) {
         let last_maintenance = read_last_maintenance(&state.agent_home);
         if now - last_maintenance >= MAINTENANCE_INTERVAL_SECS && last_daily_maintenance_attempt.is_none_or(|last| now - last >= 900) {
             last_daily_maintenance_attempt = Some(now);
-            sweep_idle_sessions(&state, Duration::from_secs(MAINTENANCE_INTERVAL_SECS as u64)).await;
             let outcome = run_scheduled(state.clone(), json!({"type": "daily_maintenance", "since_ts": last_maintenance})).await;
             // only advance the checkpoint on a real completion — `run()`'s
             // one hard-failure path (agent_loop.rs: an `llm_call` error
@@ -345,9 +415,20 @@ async fn scheduler_loop(state: Arc<AppState>) {
             // the next run's `since_ts` moves past it with nothing ever
             // having actually reviewed that window (this is exactly what
             // happened during the 2026-07-08 Moonshot API outage — a failed
-            // run's checkpoint write ate a 6h window's worth of activity).
+            // run's checkpoint write ate a whole window's worth of activity).
             if !outcome_aborted(&outcome) {
                 write_last_maintenance(&state.agent_home, now);
+            }
+        }
+
+        let last_summary = read_last_maintenance_summary(&state.agent_home);
+        if now - last_summary >= MAINTENANCE_SUMMARY_INTERVAL_SECS && last_maintenance_summary_attempt.is_none_or(|last| now - last >= 900) {
+            last_maintenance_summary_attempt = Some(now);
+            sweep_idle_sessions(&state, Duration::from_secs(MAINTENANCE_SUMMARY_INTERVAL_SECS as u64)).await;
+            verify_recent_distillation(&state.agent_home, MAINTENANCE_SUMMARY_INTERVAL_SECS);
+            let outcome = run_scheduled(state.clone(), json!({"type": "maintenance_summary", "since_ts": last_summary})).await;
+            if !outcome_aborted(&outcome) {
+                write_last_maintenance_summary(&state.agent_home, now);
             }
         }
 

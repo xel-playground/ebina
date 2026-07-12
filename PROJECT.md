@@ -126,16 +126,20 @@ memory/
   notes/<date>/log.md           # 每次 run 的原始日誌,絕不進索引(見下)
   index.db                      # SQLite(WAL mode):chunks + FTS5(BM25)+ 向量
   maintenance_reports/
-    <date>_<HHMM>.md            # 每次 daily_maintenance 一份報告
-    .last_run                   # 上次成功 run 的 unix timestamp(since_ts 檢查點)
+    <date>_<HHMM>.md            # 每次 daily_maintenance(每小時)一份報告
+    <date>_<HHMM>_summary.md    # 每次 maintenance_summary(每 6 小時)一份合併報告
+    .last_run                   # daily_maintenance 上次成功 run 的 unix timestamp
+    .last_summary_run           # maintenance_summary 上次成功 run 的 unix timestamp
 ```
 - **讀路徑**:hybrid 檢索——FTS5 BM25 + 向量 top-N → RRF → top-k 進 prompt。**每個 turn 都重新做**,不是只在 `run()` 開頭:第 0 turn 用開場那次(trigger 原文當 query),第 1 turn 起改用「剛剛那個 tool result 的內容」當 query 重新檢索,結果附加到那個 tool result 訊息尾巴(不新增訊息,避免破壞 user/assistant 嚴格交替)。長對話(例如多輪 `ssh_exec` 探索)話題跑掉時,記憶會跟著更新,不會整個 run 都用開場那批舊結果。只有 `memory/notes/*.md`(頂層檔案)會被索引——`notes/<date>/log.md` 這種日誌子目錄故意排除,曾經全部索引過,結果一個已經修正的舊事實因為被逐字引用在某次對話裡,永久卡在檢索結果裡
-- **寫路徑,現在是 6 小時循環的 `daily_maintenance`(不是每日一次)**:
-  1. 只看自己上次成功執行之後新增的 log(`since_ts`,存在 `.last_run`)——run 失敗(`run aborted: ...`)不會推進這個 checkpoint,單次失敗不會讓一整個時間窗被跳過沒審到
-  2. 蒸餾新增內容 → `notes/`(這是**唯一**允許直接 `write_file`/`append_file` 進 curated notes 的 trigger type,見 §4.2)
-  3. content hash 增量:只 re-chunk + re-embed 變動檔
-  4. LLM 自主整理:合併重複、過期降級為摘要、修剪 log
-  5. 產出 `maintenance_reports/<date>_<HHMM>.md`(gateway 可看,一天可能不只一份)
+- **寫路徑,兩層(2026-07-12 從單一 6h 循環拆開)**:
+  - `daily_maintenance`(每 1 小時,輕量):
+    1. 只看自己上次成功執行之後新增的 log(`since_ts`,存在 `.last_run`)——run 失敗(`run aborted: ...`)不會推進這個 checkpoint,單次失敗不會讓一整個時間窗被跳過沒審到
+    2. 順便自己 `list_dir`/`read_file` 檢查 `/workspace/` 有沒有筆記類檔案(log delta 只會提到「有這個檔案」,不會給內容)——事實蒸餾進 `notes/`,只有人類能做的待辦留在原地、寫進 report 的「需關注」段,蒸餾完的筆記 `delete_path` 掉,不然每次都重新注意到同一份
+    3. 蒸餾新增內容 → `notes/`(這是**唯一**允許直接 `write_file`/`append_file` 進 curated notes 的 trigger type,見 §4.2)
+    4. content hash 增量:只 re-chunk + re-embed 變動檔
+    5. 產出 `maintenance_reports/<date>_<HHMM>.md`
+  - `maintenance_summary`(每 6 小時,較重):讀過去 6 次左右的 hourly report,合併重複、解決衝突;同一項「需關注」的待辦連續出現 3 次以上都沒變化,主動 `chat_send` 通知主人,不要只是在 report 裡再提一次沒人看。順便跑 `sweep_idle_sessions`(閒置 session 自動 reset,原本綁在 6h daily_maintenance 上,daily_maintenance 縮成 1h 後這個閾值也要跟著搬過來,不然變成「閒置超過 1 小時就洗掉」太激進)跟 `verify_recent_distillation`——純 host 端、不用 LLM,查 `memory/notes/` 過去 6 小時 git commit 歷史,daily_maintenance 明明跑了 6 次卻完全沒有異動就 `notify()`,不是靠信任它自己講「我蒸餾了」
 - Schema:`chunks(source_path, content_hash, text, embedding BLOB, embed_model)`;`embed_model` 不符 → 自動全庫重嵌。**曾經有個真的發生過的 bug**:`db_exec` 的 authorizer PRAGMA allowlist 漏放 `data_version`(FTS5 每次寫入 virtual table 內部都會查這個),導致任何超過一段標題的筆記,`chunks_fts` 那半只有第一段插得進去,其餘靜默失敗——已修
 - 向量檢索先用 host 端 sqlite-vec(原生編譯無壓力);筆數少時 BLOB + 暴力 cosine 也行
 
@@ -543,10 +547,31 @@ http_per_domain_per_min = 10   # 對外禮貌,防同站連打被 ban IP
       頻道的 staging 裡,一樣看不出是誰講的,跟 `SessionTurn::sender` 修的是同一種問題,只是換一層
       出現。修法:`handle_chat_message` 把跟 `SessionTurn::sender` 同一份 short label 塞進
       `trigger.sender_label`,`write_memory_note` 照 `session_key` 的方式再標一次。順手把
-      「workspace 是短期記憶」這件事寫進 `## Paths and files`,不是新開 action——能力
-      (`write_file`/`append_file`)本來就有,缺的是讓 agent 知道這個定位,不是缺能力。43 個
-      kernel test 全過,線上驗證新 log 行同時有 `[webui]` 跟 `[webui (id webui-owner, owner)]`
-      兩個標記
+      「workspace 是短期記憶」這件事寫進 `## Paths and files`(~~後來覺得不需要,同日稍晚撤掉,
+      見下面 daily_maintenance 兩層那筆~~)。43 個 kernel test 全過,線上驗證新 log 行同時有
+      `[webui]` 跟 `[webui (id webui-owner, owner)]` 兩個標記
+- [x] **`daily_maintenance` 拆成兩層(1h 輕量 + 6h 彙整),解決「失憶」**(2026-07-12,一整天討論
+      收斂的結論):根因不是檢索不到、不是跨 session 沒機制,是**蒸餾這一關本身不可靠又沒人驗證**
+      ——6 小時一個大批次,東西容易被埋掉或無限期延後(頭像提醒那個案例:同一件事被連續好幾次巡檢
+      重新發現、從沒真正處理,report 自稱蒸餾了,實際上 `memory/notes/` 根本沒改過,而且沒人查過
+      這個落差)。討論過 `note_to_self` 掛在 `done` 上零延遲捕捉、host 端驗證蒸餾真的發生,最後
+      收斂成主人提的方案:
+  - [x] `daily_maintenance` 頻率 6h→1h,改成刻意輕量的頻繁通過——只看 `since_ts` delta,快速蒸餾,
+        不用每次都仔細到底(留給下面的彙整)
+  - [x] 新增 `maintenance_summary` trigger,獨立 6h 週期(獨立 checkpoint
+        `.last_summary_run`)——讀過去約 6 次 hourly report,合併/去重跨報告的碎片內容,同一項
+        「需關注」連續出現 3 次以上沒變化就主動 `chat_send`,不再讓它只是被動一直重複記錄
+  - [x] `sweep_idle_sessions`/`verify_recent_distillation` 從 daily_maintenance 搬到
+        `maintenance_summary` 上——這兩個原本綁 6h daily_maintenance 的 tick,daily_maintenance
+        縮成 1h 後如果不搬,閒置 session 變成 1 小時就被洗掉,太激進
+  - [x] 新增 `verify_recent_distillation`(`gateway.rs`)——純 host 端、不用 LLM,查
+        `memory/notes/` 這條路徑在外部 git-dir 裡最近 6 小時有沒有真的被 commit 過,沒有就
+        `notify()`。`autocommit::git_dir_path` 從 private 改 `pub(crate)` 給這裡重用同一個路徑
+  - [x] 撤掉同日稍早加的「workspace 是短期記憶」那句 prompt 文字——主人覺得不需要,拿掉
+  - [x] `staging_section` 的跳過條件、`recent_staging_entries` 的 message-only 過濾都同步涵蓋
+        新的 `maintenance_summary` trigger type
+  - [x] 43 個 kernel test 全過,線上部署後兩個 trigger 幾乎立刻各自的 checkpoint 都是 0(從沒跑
+        過),驗證兩個都能正確觸發跑起來
 
 ### 未來糖果罐(延後)
 - [ ] **Agent 互通(A2A,actor model)**:設計已定——新 syscall `send_agent(target, msg)`,kernel **複製**訊息至對方 `inbox/from-<sender>/` 並喚醒;不共享任何目錄,Store 間零接觸;通訊拓撲在 kernel config 逐條宣告(capability),未宣告組合拒絕;訊息全經 kernel = 全量 A2A log,gateway 可視化對話圖。支援監督者模式、互相 review 等玩法;新 agent = 新資料夾 + 一行拓撲
