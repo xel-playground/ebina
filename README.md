@@ -111,6 +111,20 @@ took a real audit to get right — a background trigger's `chat_send`
 live conversation's own end-of-turn save and silently erase either side;
 fixed by having the conversation's own save always reload fresh immediately
 before writing rather than trust a snapshot taken before the run started.
+
+That concurrency was only real in theory until 2026-07-12, though:
+`scheduler_loop`'s 30s tick used to `.await` every fired trigger inline, one
+after another, in a single sequential loop body — a multi-minute
+`daily_maintenance` LLM call blocked the same tick from ever reaching that
+tick's `scheduled_task` due-check, so an exact-minute cron task (e.g.
+`rss_tech_report`'s `17 9 * * *`) due a few minutes later could silently
+miss its entire day with no error at all. Found because a user-configured
+task actually missed a day in production. Fixed by having the tick loop
+`tokio::spawn` each fired trigger instead of awaiting it — `daily_maintenance`
+and `maintenance_summary` each keep an `AtomicBool` guard so only one of the
+same tier is ever in flight (the one invariant that still needs enforcing;
+everything else was already documented as safe to run concurrently, just
+never actually exploited).
 `POST /api/abort?session=<key>` (the webui's Stop button, defaulting to the
 webui session) is cooperative: it sets a flag `llm_call` checks between
 streamed chunks, scoped per session so aborting one doesn't touch another

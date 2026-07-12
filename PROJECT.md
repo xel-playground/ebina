@@ -575,6 +575,27 @@ http_per_domain_per_min = 10   # 對外禮貌,防同站連打被 ban IP
         新的 `maintenance_summary` trigger type
   - [x] 43 個 kernel test 全過,線上部署後兩個 trigger 幾乎立刻各自的 checkpoint 都是 0(從沒跑
         過),驗證兩個都能正確觸發跑起來
+- [x] **`scheduler_loop` 從循序 `.await` 改成 `tokio::spawn`,修「精確時刻 cron 被 maintenance
+      擋住漏跑」的 bug**(2026-07-12,主人回報「科技報 scheduler 連續兩天沒給」發現的):
+      `scheduler_loop` 表面上一個 30s tick 依序檢查 daily_maintenance → maintenance_summary →
+      cron self-wake → 每個 `scheduled_task`,全部寫在同一個迴圈本體裡直接 `.await`——`AppState`
+      的 doc comment 早就講「背景 trigger 彼此完全並行、安全」,但實作從沒真的利用這件事:一次
+      daily_maintenance 的 LLM call 實測要跑好幾分鐘,整條 tick 就卡在那個 `.await` 上,同一個
+      tick 裡排在後面的 `rss_tech_report`(cron `17 9 * * *`,精確卡 09:17 那一分鐘)檢查完全沒
+      機會執行到——`due_now` 的判斷等到 maintenance 跑完才被檢查,那時 09:17 那一分鐘早就過了,
+      永遠不會補跑,沒有任何錯誤訊息,靜默漏掉一整天。而且當天稍早才把兩層 maintenance 都釘死在
+      `:13` fire(離 `:17` 只差 4 分鐘),等於把這個原本偶發的碰撞變成幾乎每天都會發生——是這次
+      改動自己放大的問題。
+  - [x] daily_maintenance/maintenance_summary/cron self-wake/每個 scheduled_task 的實際執行
+        都改成 `tokio::spawn`,tick 迴圈本身只負責判斷「該不該跑」跟丟出背景 task,不再被任何一
+        個 LLM call 卡住
+  - [x] daily_maintenance/maintenance_summary 各自加一個 `AtomicBool` in-flight guard,保留
+        「同層永遠只有一個在跑」這個既有不變量(`AppState` doc comment 原本就要求這件事);
+        `task_retry_state` 從迴圈區域變數改成 `Arc<Mutex<...>>`,讓 spawn 出去的每個
+        scheduled_task 都能各自回寫重試計數,不用等其他 task 跑完
+  - [x] 43 個 kernel test 全過;線上手動 `/api/wake` 補跑當天漏掉的 `rss_tech_report`,
+        `performance.jsonl` 確認只有一次 `chat_send`(沒有重複推播),`rss_report_status.md` 已
+        補記
 
 ### 未來糖果罐(延後)
 - [ ] **Agent 互通(A2A,actor model)**:設計已定——新 syscall `send_agent(target, msg)`,kernel **複製**訊息至對方 `inbox/from-<sender>/` 並喚醒;不共享任何目錄,Store 間零接觸;通訊拓撲在 kernel config 逐條宣告(capability),未宣告組合拒絕;訊息全經 kernel = 全量 A2A log,gateway 可視化對話圖。支援監督者模式、互相 review 等玩法;新 agent = 新資料夾 + 一行拓撲

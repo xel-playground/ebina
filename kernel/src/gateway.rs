@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -76,9 +77,17 @@ pub(crate) struct AppState {
     /// directories no longer overlap between trigger types (see
     /// `agent_loop.rs`'s `write_action_denial`): a `message` run can only
     /// touch `/workspace/`, curated `memory/notes/` is `daily_maintenance`-
-    /// only, and only one `daily_maintenance` is ever in flight at a time
-    /// (the scheduler's own 6h-cycle gating). The residual risk this
-    /// doesn't close — two *background* runs (e.g. two different
+    /// only, and only one `daily_maintenance` (same for `maintenance_summary`)
+    /// is ever in flight at a time (an `AtomicBool` guard in `scheduler_loop`,
+    /// not just gating — 2026-07-12: `scheduler_loop` used to `.await` each
+    /// fired trigger inline, one giant sequential loop body, which
+    /// accidentally *serialized* everything this comment already claimed was
+    /// safe to run concurrently; a multi-minute `daily_maintenance` LLM call
+    /// blocked the same tick's `scheduled_task` due-check from ever running,
+    /// silently missing an exact-minute cron task's whole day with no error.
+    /// `tokio::spawn` now actually exploits the concurrency this comment
+    /// describes instead of only asserting it's safe). The residual risk
+    /// this doesn't close — two *background* runs (e.g. two different
     /// `scheduled_task`s, or a `scheduled_task` racing `daily_maintenance`)
     /// hitting `.git/index.lock` on autocommit at once, or both touching
     /// some workspace file the human configured them to share — is accepted
@@ -469,8 +478,21 @@ async fn scheduler_loop(state: Arc<AppState>) {
     let mut last_maintenance_summary_attempt: Option<i64> = None;
     let mut last_handled_sleep_until: Option<i64> = None;
     // (last_attempt_ts, consecutive_failures) per task id — see this fn's
-    // doc comment and `SCHEDULED_TASK_RETRY_BACKOFF_SECS`/`_MAX_RETRIES`
-    let mut task_retry_state: std::collections::HashMap<String, (i64, u32)> = std::collections::HashMap::new();
+    // doc comment and `SCHEDULED_TASK_RETRY_BACKOFF_SECS`/`_MAX_RETRIES`.
+    // Behind a `Mutex` now, not a plain local — spawned task runs (below)
+    // update it from outside this loop's own stack frame.
+    let task_retry_state: Arc<tokio::sync::Mutex<std::collections::HashMap<String, (i64, u32)>>> = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    // Guards against a *second* daily_maintenance/maintenance_summary spawn
+    // starting while one of the same tier is still running — the one
+    // invariant `AppState`'s own doc comment on background-trigger
+    // concurrency still requires ("only one daily_maintenance is ever in
+    // flight at a time"). Nothing analogous is needed for scheduled_task or
+    // the cron self-wake below: two different scheduled_tasks (or a
+    // scheduled_task racing daily_maintenance) running concurrently is an
+    // already-accepted risk (same doc comment), and the cron self-wake is
+    // deduped by `last_handled_sleep_until` before it ever spawns.
+    let daily_maintenance_running = Arc::new(AtomicBool::new(false));
+    let maintenance_summary_running = Arc::new(AtomicBool::new(false));
     loop {
         tokio::time::sleep(Duration::from_secs(30)).await;
         let now = crate::logs::now_unix_secs();
@@ -480,6 +502,7 @@ async fn scheduler_loop(state: Arc<AppState>) {
         if now - last_maintenance >= MAINTENANCE_INTERVAL_SECS
             && crate::cron::matches(MAINTENANCE_WALL_CLOCK_SPEC, now)
             && last_daily_maintenance_attempt.is_none_or(|last| now - last >= 900)
+            && !daily_maintenance_running.load(Ordering::SeqCst)
         {
             last_daily_maintenance_attempt = Some(now);
             if !has_new_log_entries(&state.agent_home, last_maintenance) && !workspace_memory_has_new_files(&state.agent_home, last_maintenance) {
@@ -490,19 +513,39 @@ async fn scheduler_loop(state: Arc<AppState>) {
                 // the checkpoint same as a real completed run would.
                 write_last_maintenance(&state.agent_home, now);
             } else {
-                let outcome = run_scheduled(state.clone(), json!({"type": "daily_maintenance", "since_ts": last_maintenance})).await;
-                // only advance the checkpoint on a real completion — `run()`'s
-                // one hard-failure path (agent_loop.rs: an `llm_call` error
-                // aborts the whole run) still reports a `summary`, just one
-                // starting with "run aborted". Advancing on that would silently
-                // skip whatever happened in `[last_maintenance, now)` forever:
-                // the next run's `since_ts` moves past it with nothing ever
-                // having actually reviewed that window (this is exactly what
-                // happened during the 2026-07-08 Moonshot API outage — a failed
-                // run's checkpoint write ate a whole window's worth of activity).
-                if !outcome_aborted(&outcome) {
-                    write_last_maintenance(&state.agent_home, now);
-                }
+                // `tokio::spawn`, not `.await` — a real LLM-driven pass here
+                // has taken several minutes in practice, and this loop is
+                // the *only* place a `scheduled_task`'s exact-minute cron
+                // match gets checked. Blocking the whole tick loop on this
+                // await meant an exact-minute task (e.g. `rss_tech_report`
+                // at `17 9 * * *`) due a few minutes after this fires could
+                // silently miss its entire day — the loop simply never got
+                // back around to checking it until the minute had passed,
+                // no error, no retry, nothing (the 2026-07-12 incident this
+                // comment is about). `AppState`'s own doc comment already
+                // documents background triggers as safe to run fully
+                // concurrently with everything else; this just actually
+                // exploits that instead of accidentally serializing on the
+                // single loop task.
+                daily_maintenance_running.store(true, Ordering::SeqCst);
+                let spawn_state = state.clone();
+                let running = daily_maintenance_running.clone();
+                tokio::spawn(async move {
+                    let outcome = run_scheduled(spawn_state.clone(), json!({"type": "daily_maintenance", "since_ts": last_maintenance})).await;
+                    // only advance the checkpoint on a real completion — `run()`'s
+                    // one hard-failure path (agent_loop.rs: an `llm_call` error
+                    // aborts the whole run) still reports a `summary`, just one
+                    // starting with "run aborted". Advancing on that would silently
+                    // skip whatever happened in `[last_maintenance, now)` forever:
+                    // the next run's `since_ts` moves past it with nothing ever
+                    // having actually reviewed that window (this is exactly what
+                    // happened during the 2026-07-08 Moonshot API outage — a failed
+                    // run's checkpoint write ate a whole window's worth of activity).
+                    if !outcome_aborted(&outcome) {
+                        write_last_maintenance(&spawn_state.agent_home, now);
+                    }
+                    running.store(false, Ordering::SeqCst);
+                });
             }
         }
 
@@ -510,6 +553,7 @@ async fn scheduler_loop(state: Arc<AppState>) {
         if now - last_summary >= MAINTENANCE_SUMMARY_INTERVAL_SECS
             && crate::cron::matches(MAINTENANCE_WALL_CLOCK_SPEC, now)
             && last_maintenance_summary_attempt.is_none_or(|last| now - last >= 900)
+            && !maintenance_summary_running.load(Ordering::SeqCst)
         {
             last_maintenance_summary_attempt = Some(now);
             // host-only, cheap — run regardless of whether there's a
@@ -525,10 +569,18 @@ async fn scheduler_loop(state: Arc<AppState>) {
                 // full review of [last_summary, now) same as a real run.
                 write_last_maintenance_summary(&state.agent_home, now);
             } else {
-                let outcome = run_scheduled(state.clone(), json!({"type": "maintenance_summary", "since_ts": last_summary})).await;
-                if !outcome_aborted(&outcome) {
-                    write_last_maintenance_summary(&state.agent_home, now);
-                }
+                // spawned for the same reason as daily_maintenance above —
+                // see that block's comment.
+                maintenance_summary_running.store(true, Ordering::SeqCst);
+                let spawn_state = state.clone();
+                let running = maintenance_summary_running.clone();
+                tokio::spawn(async move {
+                    let outcome = run_scheduled(spawn_state.clone(), json!({"type": "maintenance_summary", "since_ts": last_summary})).await;
+                    if !outcome_aborted(&outcome) {
+                        write_last_maintenance_summary(&spawn_state.agent_home, now);
+                    }
+                    running.store(false, Ordering::SeqCst);
+                });
             }
         }
 
@@ -539,7 +591,10 @@ async fn scheduler_loop(state: Arc<AppState>) {
             if now >= sleep_until && last_handled_sleep_until != Some(sleep_until) {
                 last_handled_sleep_until = Some(sleep_until);
                 let trigger = json!({"type": "cron", "recent_chat": recent_chat_context(&state.agent_home, DEFAULT_SESSION_KEY)});
-                run_scheduled(state.clone(), trigger).await;
+                let spawn_state = state.clone();
+                tokio::spawn(async move {
+                    run_scheduled(spawn_state, trigger).await;
+                });
             }
         }
 
@@ -550,16 +605,26 @@ async fn scheduler_loop(state: Arc<AppState>) {
             // one fire per matching minute — a tick every 30s would
             // otherwise double-fire any spec that matches for a whole minute
             let due_now = crate::cron::matches(&task.cron, now) && !task.last_run.is_some_and(|last| last / 60 == now / 60);
-            let retry_state = task_retry_state.get(&task.id).copied();
+            let retry_state = { task_retry_state.lock().await.get(&task.id).copied() };
             if !scheduled_task_should_run(due_now, retry_state, now) {
                 continue;
             }
             if due_now {
                 crate::scheduler_tasks::mark_run(&state.agent_home, &task.id, now);
             }
-            let outcome = run_scheduled(state.clone(), json!({"type": "scheduled_task", "task_id": task.id, "data_path": task.data_path})).await;
-            let failures = if outcome_aborted(&outcome) { retry_state.map(|(_, f)| f + 1).unwrap_or(1) } else { 0 };
-            task_retry_state.insert(task.id.clone(), (now, failures));
+            // spawned, not awaited — same reasoning as daily_maintenance
+            // above: this is the loop iteration that also needs to notice
+            // *other* tasks due around the same wall-clock minute, and a
+            // slow run here shouldn't delay that.
+            let spawn_state = state.clone();
+            let task_retry_state = task_retry_state.clone();
+            let task_id = task.id.clone();
+            let data_path = task.data_path.clone();
+            tokio::spawn(async move {
+                let outcome = run_scheduled(spawn_state, json!({"type": "scheduled_task", "task_id": task_id, "data_path": data_path})).await;
+                let failures = if outcome_aborted(&outcome) { retry_state.map(|(_, f)| f + 1).unwrap_or(1) } else { 0 };
+                task_retry_state.lock().await.insert(task_id, (now, failures));
+            });
         }
     }
 }

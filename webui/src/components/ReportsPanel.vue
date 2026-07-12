@@ -4,48 +4,28 @@ import { api } from '../api'
 
 const reports = ref([])
 const selectedReport = ref(null)
-const expandedFolders = ref({})
+const activeTab = ref('hourly')
 
-// same tree-flattening approach as NotesPanel — `date` is already
-// "<kind>/<stem>"-shaped (e.g. "hourly/2026-07-12_0915"), so it slots into
-// the same path-based grouping without any backend change
-const reportRows = computed(() => {
-  const root = { children: {} }
-  for (const r of reports.value) {
-    const parts = r.date.split('/')
-    let cur = root
-    let prefix = ''
-    parts.forEach((part, i) => {
-      prefix = prefix ? prefix + '/' + part : part
-      const isLast = i === parts.length - 1
-      if (isLast) {
-        cur.children[part] = { isDir: false, name: part, fullPath: prefix, report: r }
-      } else {
-        if (!cur.children[part]) cur.children[part] = { isDir: true, name: part, fullPath: prefix, children: {} }
-        cur = cur.children[part]
-      }
-    })
-  }
-  const rows = []
-  const walk = (node, depth) => {
-    for (const key of Object.keys(node.children).sort()) {
-      const child = node.children[key]
-      rows.push({ ...child, depth })
-      if (child.isDir && expandedFolders.value[child.fullPath] !== false) walk(child, depth + 1)
-    }
-  }
-  walk(root, 0)
-  return rows
-})
+// `date` is "<kind>/<stem>" (e.g. "hourly/2026-07-12_0915") — filter by the
+// active tab's kind and sort newest first. `stem`'s "YYYY-MM-DD_HHMM" shape
+// sorts correctly as a plain string, no date parsing needed.
+const tabReports = computed(() =>
+  reports.value
+    .filter(r => r.kind === activeTab.value)
+    .slice()
+    .sort((a, b) => b.date.localeCompare(a.date))
+)
 
-function toggleFolder(path) {
-  expandedFolders.value = { ...expandedFolders.value, [path]: expandedFolders.value[path] === false }
+function selectTab(kind) {
+  activeTab.value = kind
+  const stillThere = tabReports.value.find(r => r.date === selectedReport.value?.date)
+  if (!stillThere) selectedReport.value = reports.value.filter(r => r.kind === kind).sort((a, b) => b.date.localeCompare(a.date))[0] || null
 }
 
 async function refresh() {
   reports.value = (await api('/memory/reports')).body.reports || []
   const stillThere = reports.value.find(r => r.date === selectedReport.value?.date)
-  selectedReport.value = stillThere || reports.value[0] || null
+  selectedReport.value = stillThere || tabReports.value[0] || null
 }
 onMounted(refresh)
 defineExpose({ refresh })
@@ -57,12 +37,15 @@ defineExpose({ refresh })
     <div class="hint" v-if="reports.length === 0">no reports yet — one gets written per day by a daily_maintenance run</div>
     <div class="split-body" v-else>
       <div class="split-list">
-        <div v-for="row in reportRows" :key="row.fullPath" class="split-item"
-             :class="{ dir: row.isDir, active: !row.isDir && selectedReport && selectedReport.date === row.report.date }"
-             :style="{ paddingLeft: (row.depth + 0.6) + 'rem' }"
-             @click="row.isDir ? toggleFolder(row.fullPath) : (selectedReport = row.report)">
-          <template v-if="row.isDir">{{ expandedFolders[row.fullPath] === false ? '▸' : '▾' }} 📁 {{ row.name }}</template>
-          <template v-else>📄 {{ row.name }}</template>
+        <div class="tab-row">
+          <button class="secondary" :class="{ active: activeTab === 'hourly' }" @click="selectTab('hourly')">hourly</button>
+          <button class="secondary" :class="{ active: activeTab === 'summary' }" @click="selectTab('summary')">summary</button>
+        </div>
+        <div v-if="tabReports.length === 0" class="hint">no {{ activeTab }} reports yet</div>
+        <div v-for="r in tabReports" :key="r.date" class="split-item"
+             :class="{ active: selectedReport && selectedReport.date === r.date }"
+             @click="selectedReport = r">
+          📄 {{ r.date.split('/')[1] }}
         </div>
       </div>
       <div class="split-content">
@@ -73,3 +56,15 @@ defineExpose({ refresh })
     </div>
   </div>
 </template>
+
+<style scoped>
+.tab-row {
+  display: flex;
+  gap: 0.4rem;
+  padding: 0.4rem 0.6rem;
+}
+.tab-row button.active {
+  font-weight: bold;
+  text-decoration: underline;
+}
+</style>
