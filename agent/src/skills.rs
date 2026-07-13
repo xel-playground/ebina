@@ -1,7 +1,7 @@
 use crate::time::now_unix;
 use std::fs;
 
-pub const SKILLS_DIR: &str = "/memory/skills";
+pub const SKILLS_DIR: &str = "/skills";
 
 pub struct Skill {
     pub name: String,
@@ -11,6 +11,14 @@ pub struct Skill {
     pub used_count: u64,
     /// `None` until `record_use` fires at least once
     pub last_used: Option<u64>,
+    /// How many times this skill's description段 has been surfaced by
+    /// hybrid search (automatic top-of-run retrieval *or* an explicit
+    /// `skill_search` action) — distinct from `used_count` (which only
+    /// counts an actual `use_skill` load). adr/002-skill-v2.md §2/§3: the
+    /// 24h quality gate needs "never retrieved" (this stays 0) to tell apart
+    /// from "retrieved often but never used" (this is high, `used_count`
+    /// stays 0 — a sign the description over-promises what the skill does).
+    pub retrieval_hit_count: u64,
 }
 
 /// Lists every skill's `name`/`description`/usage stats (never the body —
@@ -98,8 +106,9 @@ pub fn save(name: &str, description: &str, body: &str) -> std::io::Result<()> {
     let existing = list().into_iter().find(|s| s.name == name);
     let created_at = existing.as_ref().map(|s| s.created_at).unwrap_or_else(now_unix);
     let used_count = existing.as_ref().map(|s| s.used_count).unwrap_or(0);
-    let last_used = existing.and_then(|s| s.last_used);
-    fs::write(path_for(name), render(name, description, created_at, used_count, last_used, body))
+    let last_used = existing.as_ref().and_then(|s| s.last_used);
+    let retrieval_hit_count = existing.as_ref().map(|s| s.retrieval_hit_count).unwrap_or(0);
+    fs::write(path_for(name), render(name, description, created_at, used_count, last_used, retrieval_hit_count, body))
 }
 
 /// Increments `used_count` and stamps `last_used` — called by
@@ -110,24 +119,53 @@ pub fn record_use(name: &str) {
     let Some(skill) = list().into_iter().find(|s| s.name == name) else { return };
     let _ = fs::write(
         path_for(name),
-        render(name, &skill.description, skill.created_at, skill.used_count + 1, Some(now_unix()), &skill.body),
+        render(
+            name,
+            &skill.description,
+            skill.created_at,
+            skill.used_count + 1,
+            Some(now_unix()),
+            skill.retrieval_hit_count,
+            &skill.body,
+        ),
     );
 }
 
-fn render(name: &str, description: &str, created_at: u64, used_count: u64, last_used: Option<u64>, body: &str) -> String {
+/// Increments `retrieval_hit_count` — called once per skill surfaced by
+/// either the automatic top-of-run `skill_search` or an explicit
+/// `skill_search` action (adr/002-skill-v2.md §2: both count as "found by
+/// retrieval", not just the automatic path). Unlike `record_use`, this can
+/// legitimately fire many times a run finds relevant-but-unused skills, so
+/// it stays a cheap read-modify-write same as the others rather than
+/// batching — retrieval volume for one agent is nowhere near contention.
+pub fn record_retrieval_hit(name: &str) {
+    let _lock = SkillLock::acquire(name);
+    let Some(skill) = list().into_iter().find(|s| s.name == name) else { return };
+    let _ = fs::write(
+        path_for(name),
+        render(name, &skill.description, skill.created_at, skill.used_count, skill.last_used, skill.retrieval_hit_count + 1, &skill.body),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render(name: &str, description: &str, created_at: u64, used_count: u64, last_used: Option<u64>, retrieval_hit_count: u64, body: &str) -> String {
     let last_used_line = last_used.map(|t| format!("last_used: {t}\n")).unwrap_or_default();
     // `body` already ends in the trailing `\n` this function itself always
     // adds — trim it back off first, or re-saving the same skill
     // repeatedly (every `record_use`) grows a longer run of blank lines at
     // the end each time.
     let body = body.trim_end_matches('\n');
-    format!("---\nname: {name}\ndescription: {description}\ncreated_at: {created_at}\nused_count: {used_count}\n{last_used_line}---\n{body}\n")
+    format!(
+        "---\nname: {name}\ndescription: {description}\ncreated_at: {created_at}\nused_count: {used_count}\n\
+         retrieval_hit_count: {retrieval_hit_count}\n{last_used_line}---\n{body}\n"
+    )
 }
 
 /// Minimal frontmatter parser (no yaml crate) — same "flat known-shape text
 /// is simpler than a real parser" call as `memory::current_embed_model`.
-/// `created_at`/`used_count`/`last_used` default to `0`/`0`/`None` when
-/// absent so skill files saved before these fields existed still parse.
+/// `created_at`/`used_count`/`last_used`/`retrieval_hit_count` default to
+/// `0`/`0`/`None`/`0` when absent so skill files saved before these fields
+/// existed still parse.
 fn parse(text: &str) -> Option<Skill> {
     let rest = text.trim_start().strip_prefix("---\n")?;
     let end = rest.find("\n---")?;
@@ -139,6 +177,7 @@ fn parse(text: &str) -> Option<Skill> {
     let mut created_at = 0u64;
     let mut used_count = 0u64;
     let mut last_used = None;
+    let mut retrieval_hit_count = 0u64;
     for line in front.lines() {
         if let Some((key, value)) = line.split_once(':') {
             let value = value.trim();
@@ -147,10 +186,11 @@ fn parse(text: &str) -> Option<Skill> {
                 "description" => description = Some(value.to_string()),
                 "created_at" => created_at = value.parse().unwrap_or(0),
                 "used_count" => used_count = value.parse().unwrap_or(0),
+                "retrieval_hit_count" => retrieval_hit_count = value.parse().unwrap_or(0),
                 "last_used" => last_used = value.parse().ok(),
                 _ => {}
             }
         }
     }
-    Some(Skill { name: name?, description: description.unwrap_or_default(), body, created_at, used_count, last_used })
+    Some(Skill { name: name?, description: description.unwrap_or_default(), body, created_at, used_count, last_used, retrieval_hit_count })
 }

@@ -4,7 +4,9 @@ import { api } from '../api'
 
 const reports = ref([])
 const selectedReport = ref(null)
-const activeTab = ref('hourly')
+// 'summary' default per adr/001-memory-v2.md §9 TODO — the tier most worth
+// checking first day-to-day (hourly is noisy, core changes once a day)
+const activeTab = ref('summary')
 
 // `date` is "<kind>/<stem>" (e.g. "hourly/2026-07-12_0915") — filter by the
 // active tab's kind and sort newest first. `stem`'s "YYYY-MM-DD_HHMM" shape
@@ -23,7 +25,7 @@ function selectTab(kind) {
 }
 
 async function refresh() {
-  reports.value = (await api('/memory/reports')).body.reports || []
+  reports.value = (await api('/reports')).body.reports || []
   const stillThere = reports.value.find(r => r.date === selectedReport.value?.date)
   selectedReport.value = stillThere || tabReports.value[0] || null
 }
@@ -34,13 +36,14 @@ defineExpose({ refresh })
 <template>
   <div class="split-section">
     <h2>Maintenance reports <button class="secondary" @click="refresh">Refresh</button></h2>
+    <div class="tab-row">
+      <button class="secondary" :class="{ active: activeTab === 'hourly' }" @click="selectTab('hourly')">hourly</button>
+      <button class="secondary" :class="{ active: activeTab === 'summary' }" @click="selectTab('summary')">summary</button>
+      <button class="secondary" :class="{ active: activeTab === 'core' }" @click="selectTab('core')">core</button>
+    </div>
     <div class="hint" v-if="reports.length === 0">no reports yet — one gets written per day by a daily_maintenance run</div>
     <div class="split-body" v-else>
       <div class="split-list">
-        <div class="tab-row">
-          <button class="secondary" :class="{ active: activeTab === 'hourly' }" @click="selectTab('hourly')">hourly</button>
-          <button class="secondary" :class="{ active: activeTab === 'summary' }" @click="selectTab('summary')">summary</button>
-        </div>
         <div v-if="tabReports.length === 0" class="hint">no {{ activeTab }} reports yet</div>
         <div v-for="r in tabReports" :key="r.date" class="split-item"
              :class="{ active: selectedReport && selectedReport.date === r.date }"
@@ -61,7 +64,8 @@ defineExpose({ refresh })
 .tab-row {
   display: flex;
   gap: 0.4rem;
-  padding: 0.4rem 0.6rem;
+  padding: 0.4rem 0;
+  margin-bottom: 0.4rem;
 }
 .tab-row button.active {
   font-weight: bold;

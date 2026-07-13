@@ -8,7 +8,7 @@ use std::time::Duration;
 /// sibling of the built-in `daily_maintenance`/`cron` wakes in
 /// `gateway::scheduler_loop`. One file per task under `scheduler/` (agent-home
 /// root, alongside `memory/`/`workspace/`/`logs/`) rather than one shared
-/// JSON blob — same "one file per item" shape as `memory/skills/<name>.md`,
+/// JSON blob — same "one file per item" shape as `skills/<name>.md`,
 /// so a task is directly read_file/write_file-able by the agent itself, not
 /// just through the dedicated actions/API below.
 #[derive(Debug, Serialize, Deserialize, Clone)]

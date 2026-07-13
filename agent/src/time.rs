@@ -11,7 +11,7 @@ pub fn today_utc() -> String {
 }
 
 /// `YYYY-MM-DD` for an arbitrary unix timestamp, not just "now" — used to
-/// find which `memory/notes/<date>/log.md` a given timestamp's entry lives
+/// find which `logs/run_log/<date>/log.md` a given timestamp's entry lives
 /// in when scanning a range of days (daily_maintenance's since-last-run scan).
 pub fn date_from_unix(secs: u64) -> String {
     civil_from_days((secs / 86_400) as i64)

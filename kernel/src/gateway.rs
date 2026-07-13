@@ -178,11 +178,18 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
         .route("/wake", post(post_wake))
         .route("/status", get(get_status))
         .route("/memory/notes", get(get_notes))
-        .route("/memory/reports", get(get_reports))
+        .route("/reports", get(get_reports))
         .route("/config", get(get_config).post(post_config))
         .route("/soul", get(get_soul).post(post_soul))
+        .route("/core", get(get_core))
+        .route("/core/history", get(get_core_history))
+        .route("/core/history/{hash}", get(get_core_at_commit))
         .route("/secrets", post(post_secret))
         .route("/logs", get(get_logs_sse))
+        .route("/logs/tree", get(get_logs_tree))
+        .route("/logs/file", get(get_logs_file))
+        .route("/workspace/tree", get(get_workspace_tree))
+        .route("/workspace/file", get(get_workspace_file))
         .route("/thinking", get(get_thinking_sse))
         .route("/thinking/snapshot", get(get_thinking_snapshot))
         .route("/abort", post(post_abort))
@@ -255,7 +262,22 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
 ///   were tied to the old 6h cadence and would otherwise have started
 ///   firing every 1h once the light pass shrank, which is wrong for both
 ///   (an idle-session threshold of 1h is far too aggressive, and there's
-///   no point re-checking git history that fast).
+///   no point re-checking git history that fast). Also where the skill
+///   quality gate (adr/002-skill-v2.md §3) runs now — never-retrieved
+///   skills get rewritten/retired/merged here, not in `core_distillation`;
+///   the two don't depend on each other, and 6h keeps an unused skill from
+///   sitting unreviewed for a whole day.
+/// - `core_distillation`, every `CORE_DISTILLATION_INTERVAL_SECS` (24h, its
+///   own checkpoint) — adr/001-memory-v2.md's third waterfall tier. Reads
+///   `maintenance_reports/summary/` since the last core run (not `hourly/`
+///   directly — one tier up from `maintenance_summary`, same "eat the layer
+///   below's *product*, not raw data" waterfall shape) and the current
+///   `/core.md`, decides what's durable enough to promote/demote, rewrites
+///   `/core.md` (capped, `agent/src/agent_loop.rs`'s `CORE_MD_MAX_CHARS`).
+///   `/core.md` itself can only ever be written during this trigger type
+///   (`agent_loop.rs`'s `write_action_denial`) — no exception path, by
+///   design (staleness gets fixed by the next distillation cycle rereading
+///   fresh evidence, not by a live-chat shortcut).
 /// - `cron`, once the agent's own last-requested `sleep_until` has passed
 /// - one `scheduled_task` wake per enabled, cron-matching entry under
 ///   `crate::scheduler_tasks` — user/agent-defined jobs (`data_path` points
@@ -283,6 +305,41 @@ const MAINTENANCE_SUMMARY_INTERVAL_SECS: i64 = 6 * 3600;
 /// checks above already gate *whether* a run is due; this just constrains
 /// *when within the hour* a due run is allowed to actually execute.
 const MAINTENANCE_WALL_CLOCK_SPEC: &str = "13 * * * *";
+/// `maintenance_summary` (6h) fires 5 minutes after `MAINTENANCE_WALL_CLOCK_SPEC`
+/// rather than the same `:13` — both used to share one spec, which meant on
+/// every 6h boundary tick the two could race: `tokio::spawn` runs both
+/// concurrently, so `maintenance_summary` could start reading
+/// `maintenance_reports/hourly/` before that same tick's `daily_maintenance`
+/// had finished writing its report. Not a correctness bug (the existing
+/// mtime-based `has_new_maintenance_reports` checkpoint still picks it up
+/// next time), but it meant that specific report waited a full extra 6h
+/// cycle to be consumed. A 5-minute stagger is a normal `daily_maintenance`
+/// run's entire duration several times over — this isn't a hard guarantee
+/// (an unusually slow run, e.g. one eating retry backoff, could still
+/// straddle it), just cheap, lock-free insurance for the common case; the
+/// existing checkpoint is still the real safety net for the rare case this
+/// doesn't cover. See `adr/001-memory-v2.md`'s "上下層錯開 fire 分鐘" note.
+const MAINTENANCE_SUMMARY_WALL_CLOCK_SPEC: &str = "18 * * * *";
+/// Third waterfall tier (adr/001-memory-v2.md): reads the last ~4
+/// `maintenance_summary` reports and `/core.md` itself, decides what's
+/// durable enough to promote/demote, rewrites `/core.md` (capped, see
+/// `agent/src/agent_loop.rs`'s `CORE_MD_MAX_CHARS`). The skill quality gate
+/// (adr/002-skill-v2.md §3) used to run here too but moved to
+/// `maintenance_summary` (6h) instead — core/notes promotion and skill
+/// review don't actually depend on each other, and 6h is frequent enough
+/// that an unused skill doesn't sit unreviewed for a whole day. 24h
+/// interval, own checkpoint (`last_core_marker_path`) — same "fire hourly
+/// at a fixed minute, checkpoint gates whether it's actually due" pattern
+/// as the other two tiers, not a once-a-day-only cron match, so a missed
+/// tick still self-heals on the next one rather than waiting a full day.
+const CORE_DISTILLATION_INTERVAL_SECS: i64 = 24 * 3600;
+/// 5 minutes after `MAINTENANCE_SUMMARY_WALL_CLOCK_SPEC`, same lock-free
+/// stagger reasoning as that const's own doc comment — `core_distillation`
+/// reads `maintenance_summary`'s output, so on any tick where both are due
+/// (same 6h-boundary alignment happens once a day), this gives
+/// `maintenance_summary` a normal run's length of head start before core
+/// distillation starts reading `maintenance_reports/summary/`.
+const CORE_DISTILLATION_WALL_CLOCK_SPEC: &str = "23 * * * *";
 /// Same 15-minute backoff `daily_maintenance` already retries a failed run
 /// on — see `scheduler_loop`'s doc comment.
 const SCHEDULED_TASK_RETRY_BACKOFF_SECS: i64 = 900;
@@ -368,7 +425,7 @@ fn missed_in_gap(cron_spec: &str, gap_start: i64, now: i64) -> bool {
 }
 
 fn last_maintenance_marker_path(agent_home: &Path) -> PathBuf {
-    agent_home.join("memory/maintenance_reports/.last_run")
+    agent_home.join("maintenance_reports/.last_run")
 }
 
 fn read_last_maintenance(agent_home: &Path) -> i64 {
@@ -384,7 +441,7 @@ fn write_last_maintenance(agent_home: &Path, now: i64) {
 }
 
 fn last_maintenance_summary_marker_path(agent_home: &Path) -> PathBuf {
-    agent_home.join("memory/maintenance_reports/.last_summary_run")
+    agent_home.join("maintenance_reports/.last_summary_run")
 }
 
 fn read_last_maintenance_summary(agent_home: &Path) -> i64 {
@@ -393,6 +450,22 @@ fn read_last_maintenance_summary(agent_home: &Path) -> i64 {
 
 fn write_last_maintenance_summary(agent_home: &Path, now: i64) {
     let path = last_maintenance_summary_marker_path(agent_home);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, now.to_string());
+}
+
+fn last_core_marker_path(agent_home: &Path) -> PathBuf {
+    agent_home.join("maintenance_reports/.last_core_run")
+}
+
+fn read_last_core_run(agent_home: &Path) -> i64 {
+    std::fs::read_to_string(last_core_marker_path(agent_home)).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
+}
+
+fn write_last_core_run(agent_home: &Path, now: i64) {
+    let path = last_core_marker_path(agent_home);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -442,7 +515,7 @@ fn has_new_log_entries(agent_home: &Path, since_ts: i64) -> bool {
     let today_day = crate::logs::now_unix_secs() / 86_400;
     let since_day = if since_ts <= 0 { today_day } else { since_ts / 86_400 };
     for day in since_day..=today_day {
-        let path = agent_home.join("memory/notes").join(crate::logs::civil_from_days(day)).join("log.md");
+        let path = agent_home.join("logs/run_log").join(crate::logs::civil_from_days(day)).join("log.md");
         let Ok(text) = std::fs::read_to_string(&path) else { continue };
         for block in text.split("\n## run at ") {
             let Some(start) = block.find("(ts=") else { continue };
@@ -457,13 +530,43 @@ fn has_new_log_entries(agent_home: &Path, since_ts: i64) -> bool {
 }
 
 /// Whether anything under `/workspace/memory/` (the designated short-term
-/// notes/reminders staging spot — see `agent_loop.rs`'s prompt) has changed
-/// since `since_ts`. Combined with `has_new_log_entries`, gates whether a
-/// due `daily_maintenance` run actually has work to do — a pending item
-/// nobody's touched since last time (e.g. a still-unresolved "needs
-/// attention" reminder) shouldn't force another LLM pass on its own.
+/// notes/reminders staging spot — see `agent_loop.rs`'s prompt) needs
+/// `daily_maintenance` to look at it — either something changed since
+/// `since_ts`, *or* a file is just sitting there un-deleted at all.
+///
+/// Used to gate `daily_maintenance` short-circuiting (combined with
+/// `has_new_log_entries`) — deliberately **not** mtime-only: an untouched
+/// pending item (e.g. a still-unresolved "needs attention" reminder nobody's
+/// acted on) must keep showing up in every hourly report, or the 6h
+/// escalation in `adr/001-memory-v2.md` §4 ("same item appears 3+ times
+/// unchanged → chat_send the human") can never accumulate past 1 — the item
+/// gets noted once, then the following hours short-circuit on stale mtime
+/// and the item silently stops being re-surfaced, exactly during the quiet
+/// stretches (e.g. overnight, nobody chatting) that most need the safety
+/// net. A pending item forcing an hourly LLM pass until it's resolved is
+/// the intended cost, not a regression of the short-circuit optimization —
+/// that optimization is about *nothing happening at all*, not about a known
+/// outstanding item being ignored.
 fn workspace_memory_has_new_files(agent_home: &Path, since_ts: i64) -> bool {
     let Ok(entries) = std::fs::read_dir(agent_home.join("workspace/memory")) else { return false };
+    entries.flatten().any(|e| {
+        e.metadata().is_ok_and(|m| {
+            m.modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .is_some_and(|d| d.as_secs() as i64 > since_ts)
+                || m.is_file()
+        })
+    })
+}
+
+/// Whether `maintenance_reports/hourly/` has any `daily_maintenance`
+/// report written since `since_ts` — that's the only material
+/// `maintenance_summary` merges/escalates from; its own output lives in the
+/// separate `maintenance_reports/summary/` folder, see
+/// `agent_loop.rs`'s trigger_note for both.
+fn has_new_maintenance_reports(agent_home: &Path, since_ts: i64) -> bool {
+    let Ok(entries) = std::fs::read_dir(agent_home.join("maintenance_reports/hourly")) else { return false };
     entries.flatten().any(|e| {
         e.metadata()
             .and_then(|m| m.modified())
@@ -473,13 +576,11 @@ fn workspace_memory_has_new_files(agent_home: &Path, since_ts: i64) -> bool {
     })
 }
 
-/// Whether `memory/maintenance_reports/hourly/` has any `daily_maintenance`
-/// report written since `since_ts` — that's the only material
-/// `maintenance_summary` merges/escalates from; its own output lives in the
-/// separate `memory/maintenance_reports/summary/` folder, see
-/// `agent_loop.rs`'s trigger_note for both.
-fn has_new_maintenance_reports(agent_home: &Path, since_ts: i64) -> bool {
-    let Ok(entries) = std::fs::read_dir(agent_home.join("memory/maintenance_reports/hourly")) else { return false };
+/// Same shape as `has_new_maintenance_reports`, one tier up —
+/// `core_distillation`'s primary input is `maintenance_reports/summary/`,
+/// not `hourly/` (adr/001-memory-v2.md §1: 24h eats 6h's output, not 1h's).
+fn has_new_summary_reports(agent_home: &Path, since_ts: i64) -> bool {
+    let Ok(entries) = std::fs::read_dir(agent_home.join("maintenance_reports/summary")) else { return false };
     entries.flatten().any(|e| {
         e.metadata()
             .and_then(|m| m.modified())
@@ -521,6 +622,7 @@ async fn sweep_idle_sessions(state: &Arc<AppState>, idle_after: Duration) {
 async fn scheduler_loop(state: Arc<AppState>) {
     let mut last_daily_maintenance_attempt: Option<i64> = None;
     let mut last_maintenance_summary_attempt: Option<i64> = None;
+    let mut last_core_distillation_attempt: Option<i64> = None;
     let mut last_handled_sleep_until: Option<i64> = None;
     // (last_attempt_ts, consecutive_failures) per task id — see this fn's
     // doc comment and `SCHEDULED_TASK_RETRY_BACKOFF_SECS`/`_MAX_RETRIES`.
@@ -538,6 +640,7 @@ async fn scheduler_loop(state: Arc<AppState>) {
     // deduped by `last_handled_sleep_until` before it ever spawns.
     let daily_maintenance_running = Arc::new(AtomicBool::new(false));
     let maintenance_summary_running = Arc::new(AtomicBool::new(false));
+    let core_distillation_running = Arc::new(AtomicBool::new(false));
     // Persisted (not a local `Option`) — a plain local would reset to "no
     // gap" on every kernel restart, exactly the case (downtime spanning an
     // exact-minute cron match) this is meant to catch. 0 sentinel means
@@ -605,7 +708,7 @@ async fn scheduler_loop(state: Arc<AppState>) {
 
         let last_summary = read_last_maintenance_summary(&state.agent_home);
         if now - last_summary >= MAINTENANCE_SUMMARY_INTERVAL_SECS
-            && crate::cron::matches(MAINTENANCE_WALL_CLOCK_SPEC, now)
+            && crate::cron::matches(MAINTENANCE_SUMMARY_WALL_CLOCK_SPEC, now)
             && last_maintenance_summary_attempt.is_none_or(|last| now - last >= 900)
             && !maintenance_summary_running.load(Ordering::SeqCst)
         {
@@ -632,6 +735,32 @@ async fn scheduler_loop(state: Arc<AppState>) {
                     let outcome = run_scheduled(spawn_state.clone(), json!({"type": "maintenance_summary", "since_ts": last_summary})).await;
                     if !outcome_aborted(&outcome) {
                         write_last_maintenance_summary(&spawn_state.agent_home, now);
+                    }
+                    running.store(false, Ordering::SeqCst);
+                });
+            }
+        }
+
+        let last_core_run = read_last_core_run(&state.agent_home);
+        if now - last_core_run >= CORE_DISTILLATION_INTERVAL_SECS
+            && crate::cron::matches(CORE_DISTILLATION_WALL_CLOCK_SPEC, now)
+            && last_core_distillation_attempt.is_none_or(|last| now - last >= 900)
+            && !core_distillation_running.load(Ordering::SeqCst)
+        {
+            last_core_distillation_attempt = Some(now);
+            if !has_new_summary_reports(&state.agent_home, last_core_run) {
+                // no maintenance_summary reports since last core run —
+                // nothing new to promote/demote from; same "the check itself
+                // is a full review" reasoning as the other two tiers.
+                write_last_core_run(&state.agent_home, now);
+            } else {
+                core_distillation_running.store(true, Ordering::SeqCst);
+                let spawn_state = state.clone();
+                let running = core_distillation_running.clone();
+                tokio::spawn(async move {
+                    let outcome = run_scheduled(spawn_state.clone(), json!({"type": "core_distillation", "since_ts": last_core_run})).await;
+                    if !outcome_aborted(&outcome) {
+                        write_last_core_run(&spawn_state.agent_home, now);
                     }
                     running.store(false, Ordering::SeqCst);
                 });
@@ -1354,19 +1483,20 @@ fn collect_notes(dir: &Path, base: &Path) -> Vec<Value> {
 }
 
 /// One report per maintenance run — `hourly/` (`daily_maintenance`, every
-/// 1h) and `summary/` (`maintenance_summary`, every 6h) are separate
-/// subfolders now (2026-07-12), not one flat directory distinguished only
-/// by a `_summary` filename suffix. `date` is `"<kind>/<filename stem>"`
-/// (e.g. `"hourly/2026-07-05_1830"`) — the kind prefix keeps the two tiers'
-/// keys unique even on the rare tick where both fire with the same
-/// `maintenance_run_id`, at the cost of sorting the two tiers as separate
+/// 1h), `summary/` (`maintenance_summary`, every 6h), and `core/`
+/// (`core_distillation`, every 24h, adr/001-memory-v2.md) are separate
+/// subfolders, not one flat directory distinguished only by a filename
+/// suffix. `date` is `"<kind>/<filename stem>"` (e.g.
+/// `"hourly/2026-07-05_1830"`) — the kind prefix keeps all three tiers'
+/// keys unique even on the rare tick where more than one fires with the same
+/// `maintenance_run_id`, at the cost of sorting the tiers as separate
 /// newest-first blocks rather than fully interleaved by time; `.last_run`/
-/// `.last_summary_run` (checkpoint markers, no `.md` extension) are filtered
-/// out by the extension check regardless.
+/// `.last_summary_run`/`.last_core_run` (checkpoint markers, no `.md`
+/// extension) are filtered out by the extension check regardless.
 async fn get_reports(State(state): State<Arc<AppState>>) -> Json<Value> {
     let mut reports = Vec::new();
-    for kind in ["hourly", "summary"] {
-        let dir = state.agent_home.join("memory/maintenance_reports").join(kind);
+    for kind in ["hourly", "summary", "core"] {
+        let dir = state.agent_home.join("maintenance_reports").join(kind);
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         for entry in entries.flatten() {
             let path = entry.path();
@@ -1381,6 +1511,148 @@ async fn get_reports(State(state): State<Arc<AppState>>) -> Json<Value> {
     }
     reports.sort_by(|a, b| b["date"].as_str().cmp(&a["date"].as_str())); // newest first (within each kind block)
     Json(json!({"reports": reports}))
+}
+
+// ---- generic file browser (logs/ and workspace/) ----
+//
+// Every existing log view (`LlmLogsPanel`, `ScheduleHistoryPanel`, the old
+// `LogsPanel`) is purpose-built for one specific on-disk shape and adds real
+// value beyond raw file content — `LlmLogsPanel` parses three different
+// providers' transcript shapes into one summary line, `ScheduleHistoryPanel`
+// bundles a "Wake now"/"Re-run" action panel around `/scheduler/runs`.
+// Neither is what this is for. This is the fallback for everything *not*
+// already purpose-built: `logs/run_log/`, `logs/chat_sessions/`,
+// `logs/notifications.jsonl`, `stdout.jsonl`, `performance.jsonl`,
+// `usage.jsonl`, `llm_circuit_breaker.json`, `workspace/`'s whole tree
+// (uploads, per-task scratch files, `workspace/memory/` staging notes),
+// ... — a plain directory tree + raw file viewer, one level at a time
+// (lazy, not a full recursive dump — `logs/transcripts/` alone can hold
+// hundreds of files). Parametrized over which top-level directory
+// (`root`, `"logs"` or `"workspace"`) rather than two near-identical
+// copies of the same three functions.
+
+/// Rejects anything that could escape `agent_home/<root>/` — `..`
+/// components, a leading `/` (would be absolute, ignoring `base.join`), or a
+/// NUL byte. Same threat model as `SKILLS_DIR`'s name check elsewhere in
+/// this file: single-owner tool behind the bearer token, but a path built
+/// from a query param is still worth validating component-wise rather than
+/// trusting it.
+fn safe_browse_path(agent_home: &Path, root: &str, rel: &str) -> Option<PathBuf> {
+    if rel.contains('\0') {
+        return None;
+    }
+    for component in rel.split('/') {
+        if component == ".." {
+            return None;
+        }
+    }
+    let base = agent_home.join(root);
+    Some(if rel.is_empty() { base } else { base.join(rel.trim_start_matches('/')) })
+}
+
+#[derive(Deserialize)]
+struct BrowsePathQuery {
+    #[serde(default)]
+    path: String,
+}
+
+/// Lists one directory level under `agent_home/<root>/` — `?path=` relative
+/// to `<root>/` itself, empty for the root. Directories sort first, then
+/// newest-modified first within each group (most log/workspace directories
+/// are naturally chronological — `transcripts/`, `scheduled_runs/`, dated
+/// `run_log/` subfolders, `workspace/uploads/` — so this needs no
+/// per-shape special-casing to be useful).
+async fn get_browse_tree(state: &Arc<AppState>, root: &str, q: &BrowsePathQuery) -> Json<Value> {
+    let Some(dir) = safe_browse_path(&state.agent_home, root, &q.path) else {
+        return Json(json!({"ok": false, "error": "invalid path"}));
+    };
+    let mut entries: Vec<Value> = match std::fs::read_dir(&dir) {
+        Ok(read) => read
+            .flatten()
+            .filter_map(|e| {
+                let meta = e.metadata().ok()?;
+                let mtime = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+                Some(json!({
+                    "name": e.file_name().to_string_lossy(),
+                    "is_dir": meta.is_dir(),
+                    "size": meta.len(),
+                    "mtime": mtime,
+                }))
+            })
+            .collect(),
+        Err(e) => return Json(json!({"ok": false, "error": e.to_string()})),
+    };
+    entries.sort_by(|a, b| {
+        let dir_rank = |v: &Value| !v["is_dir"].as_bool().unwrap_or(false); // dirs (false) sort before files (true)
+        dir_rank(a).cmp(&dir_rank(b)).then_with(|| b["mtime"].as_u64().cmp(&a["mtime"].as_u64()))
+    });
+    Json(json!({"ok": true, "path": q.path, "entries": entries}))
+}
+
+async fn get_logs_tree(State(state): State<Arc<AppState>>, Query(q): Query<BrowsePathQuery>) -> Json<Value> {
+    get_browse_tree(&state, "logs", &q).await
+}
+
+async fn get_workspace_tree(State(state): State<Arc<AppState>>, Query(q): Query<BrowsePathQuery>) -> Json<Value> {
+    get_browse_tree(&state, "workspace", &q).await
+}
+
+/// `tail -n 100`, not a byte cap — every log format here is append-only
+/// chronological, one entry per line (or per few lines), so the last 100
+/// *lines* is the meaningful unit, not the last N bytes (which can cut a
+/// JSON line in half and land mid-entry). `BROWSE_FILE_READ_CAP_BYTES` is a
+/// separate safety net underneath that, not the truncation itself — it just
+/// stops a pathologically huge file (a `logs/transcripts/*.json` can run
+/// 900KB+) from being read fully into memory just to throw away everything
+/// but the last 100 lines.
+const BROWSE_FILE_TAIL_LINES: usize = 100;
+const BROWSE_FILE_READ_CAP_BYTES: u64 = 2_000_000;
+
+async fn get_browse_file(state: &Arc<AppState>, root: &str, q: &BrowsePathQuery) -> Json<Value> {
+    let Some(path) = safe_browse_path(&state.agent_home, root, &q.path) else {
+        return Json(json!({"ok": false, "error": "invalid path"}));
+    };
+    let meta = match std::fs::metadata(&path) {
+        Ok(m) => m,
+        Err(e) => return Json(json!({"ok": false, "error": e.to_string()})),
+    };
+    if meta.is_dir() {
+        return Json(json!({"ok": false, "error": "is a directory, not a file"}));
+    }
+    let total_bytes = meta.len();
+    let read_from = total_bytes.saturating_sub(BROWSE_FILE_READ_CAP_BYTES);
+    let raw = if read_from > 0 {
+        use std::io::{Read, Seek, SeekFrom};
+        match std::fs::File::open(&path) {
+            Ok(mut f) => {
+                let _ = f.seek(SeekFrom::Start(read_from));
+                let mut buf = Vec::new();
+                let _ = f.read_to_end(&mut buf);
+                buf
+            }
+            Err(e) => return Json(json!({"ok": false, "error": e.to_string()})),
+        }
+    } else {
+        match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => return Json(json!({"ok": false, "error": e.to_string()})),
+        }
+    };
+    let text = String::from_utf8_lossy(&raw);
+    let lines: Vec<&str> = text.lines().collect();
+    let line_count = lines.len();
+    let tail_start = line_count.saturating_sub(BROWSE_FILE_TAIL_LINES);
+    let content = lines[tail_start..].join("\n");
+    let truncated = read_from > 0 || tail_start > 0;
+    Json(json!({"ok": true, "content": content, "total_bytes": total_bytes, "truncated": truncated}))
+}
+
+async fn get_logs_file(State(state): State<Arc<AppState>>, Query(q): Query<BrowsePathQuery>) -> Json<Value> {
+    get_browse_file(&state, "logs", &q).await
+}
+
+async fn get_workspace_file(State(state): State<Arc<AppState>>, Query(q): Query<BrowsePathQuery>) -> Json<Value> {
+    get_browse_file(&state, "workspace", &q).await
 }
 
 // ---- config (read/write) ----
@@ -1412,6 +1684,78 @@ async fn post_soul(State(state): State<Arc<AppState>>, body: String) -> impl Int
     match std::fs::write(state.agent_home.join("SOUL.md"), &body) {
         Ok(()) => (StatusCode::OK, "soul updated".to_string()),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("write failed: {e}")),
+    }
+}
+
+// ---- core.md (read-only here — adr/001-memory-v2.md §2.3: only a
+// core_distillation run ever writes it, no exception path, not even a
+// human editing it via webui the way SOUL.md above allows) ----
+
+async fn get_core(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    (StatusCode::OK, std::fs::read_to_string(state.agent_home.join("core.md")).unwrap_or_default())
+}
+
+/// `git log` for `core.md` specifically — `commit_run` (autocommit.rs)
+/// commits the whole agent-home tree every run, so this filters to just the
+/// commits that actually touched this one file (adr/001-memory-v2.md §9
+/// TODO: "core 單獨顯示 + git 演化史" — this is the "演化史" half). `%x1f`
+/// (unit separator) as the field delimiter rather than something printable
+/// — a commit message could otherwise contain the delimiter itself and
+/// desync the split.
+async fn get_core_history(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let git_dir = crate::autocommit::git_dir_path(&state.agent_home);
+    if !git_dir.exists() {
+        return Json(json!({"ok": true, "commits": []}));
+    }
+    let output = std::process::Command::new("git")
+        .args([
+            "--git-dir",
+            &git_dir.to_string_lossy(),
+            "--work-tree",
+            &state.agent_home.to_string_lossy(),
+            "log",
+            "--follow",
+            "--pretty=format:%H%x1f%ct%x1f%s",
+            "--",
+            "core.md",
+        ])
+        .output();
+    let Ok(output) = output else {
+        return Json(json!({"ok": false, "error": "git log failed to run"}));
+    };
+    if !output.status.success() {
+        return Json(json!({"ok": false, "error": String::from_utf8_lossy(&output.stderr).into_owned()}));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let commits: Vec<Value> = text
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\u{1f}');
+            let hash = parts.next()?;
+            let ts: i64 = parts.next()?.parse().ok()?;
+            let message = parts.next().unwrap_or("");
+            Some(json!({"hash": hash, "ts": ts, "message": message}))
+        })
+        .collect();
+    Json(json!({"ok": true, "commits": commits}))
+}
+
+/// `core.md`'s content as of one specific past commit — `git show
+/// <hash>:core.md`. `hash` comes straight from `get_core_history`'s own
+/// output (never free-typed by a caller), but validated as hex anyway
+/// before ever reaching a shelled-out `git` argument.
+async fn get_core_at_commit(State(state): State<Arc<AppState>>, AxumPath(hash): AxumPath<String>) -> impl IntoResponse {
+    if hash.is_empty() || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return (StatusCode::BAD_REQUEST, "invalid commit hash".to_string());
+    }
+    let git_dir = crate::autocommit::git_dir_path(&state.agent_home);
+    let output = std::process::Command::new("git")
+        .args(["--git-dir", &git_dir.to_string_lossy(), "--work-tree", &state.agent_home.to_string_lossy(), "show", &format!("{hash}:core.md")])
+        .output();
+    match output {
+        Ok(o) if o.status.success() => (StatusCode::OK, String::from_utf8_lossy(&o.stdout).into_owned()),
+        Ok(o) => (StatusCode::NOT_FOUND, String::from_utf8_lossy(&o.stderr).into_owned()),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 
@@ -1792,7 +2136,7 @@ async fn get_llm_logs(State(state): State<Arc<AppState>>) -> Json<Value> {
 // ---- skills browser (mirrors agent/src/skills.rs's file format exactly,
 // so anything saved/edited here is exactly what `use_skill` loads) ----
 
-const SKILLS_DIR: &str = "memory/skills";
+const SKILLS_DIR: &str = "skills";
 
 async fn get_skills(State(state): State<Arc<AppState>>) -> Json<Value> {
     let dir = state.agent_home.join(SKILLS_DIR);
@@ -1850,6 +2194,10 @@ async fn post_skill(State(state): State<Arc<AppState>>, Json(skill): Json<SkillB
     let existing = std::fs::read_to_string(&path).ok().and_then(|t| parse_skill(&t));
     let created_at = existing.as_ref().and_then(|s| s["created_at"].as_u64()).unwrap_or_else(|| crate::logs::now_unix_secs() as u64);
     let used_count = existing.as_ref().and_then(|s| s["used_count"].as_u64()).unwrap_or(0);
+    // same reasoning as `used_count`/`last_used` — a webui description/body
+    // edit isn't "never retrieved yet" again, don't reset the quality-gate
+    // signal (adr/002-skill-v2.md §3) just because a human tweaked the text
+    let retrieval_hit_count = existing.as_ref().and_then(|s| s["retrieval_hit_count"].as_u64()).unwrap_or(0);
     let last_used_line = existing
         .as_ref()
         .and_then(|s| s["last_used"].as_u64())
@@ -1859,7 +2207,8 @@ async fn post_skill(State(state): State<Arc<AppState>>, Json(skill): Json<SkillB
     // skill repeatedly grows a longer run of trailing blank lines each time
     let body = skill.body.trim_end_matches('\n');
     let content = format!(
-        "---\nname: {}\ndescription: {}\ncreated_at: {created_at}\nused_count: {used_count}\n{last_used_line}---\n{body}\n",
+        "---\nname: {}\ndescription: {}\ncreated_at: {created_at}\nused_count: {used_count}\n\
+         retrieval_hit_count: {retrieval_hit_count}\n{last_used_line}---\n{body}\n",
         skill.name, skill.description
     );
     match std::fs::write(path, content) {
@@ -1868,10 +2217,42 @@ async fn post_skill(State(state): State<Arc<AppState>>, Json(skill): Json<SkillB
     }
 }
 
+/// Cleans up `skill_chunks`/`skill_chunks_fts` for a deleted skill —
+/// adr/002-skill-v2.md §2: without this, `DELETE /api/skills/{name}`
+/// removes the file but leaves its index rows behind, a dangling result
+/// hybrid search can still surface pointing at a `source_path` that no
+/// longer exists. Runs against its own short-lived `rusqlite::Connection`
+/// (WAL mode already set by `AgentState::db()` the first time any run opens
+/// `index.db`, so a second concurrent connection here is safe) rather than
+/// going through the guest's `db_exec` syscall — this HTTP handler has no
+/// running agent turn to make that call on its behalf. Best-effort: the file
+/// removal below is the primary action, a failure here just leaves an
+/// orphaned index row for the next `reindex_all_skills` sweep to catch
+/// instead (same reverse-orphan-diff safety net as notes).
+fn remove_skill_index_rows(agent_home: &Path, source_path: &str) {
+    let Ok(conn) = rusqlite::Connection::open(agent_home.join("memory/index.db")) else { return };
+    let ids: Vec<i64> = conn
+        .prepare("SELECT id FROM skill_chunks WHERE source_path = ?1")
+        .and_then(|mut stmt| stmt.query_map([source_path], |row| row.get(0))?.collect())
+        .unwrap_or_default();
+    for id in ids {
+        let _ = conn.execute("DELETE FROM skill_chunks_fts WHERE rowid = ?1", [id]);
+    }
+    let _ = conn.execute("DELETE FROM skill_chunks WHERE source_path = ?1", [source_path]);
+}
+
 async fn delete_skill(State(state): State<Arc<AppState>>, AxumPath(name): AxumPath<String>) -> impl IntoResponse {
     let path = state.agent_home.join(SKILLS_DIR).join(format!("{name}.md"));
-    match std::fs::remove_file(path) {
-        Ok(()) => (StatusCode::OK, "deleted".to_string()),
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            // `skill_chunks.source_path` was written by the *guest* side
+            // (`agent/src/skills.rs::path_for` / `SKILLS_DIR`), which sees
+            // its own WASI-root-relative path (`/skills/<name>.md`), not
+            // this handler's host filesystem path — must match that exact
+            // string, not `path` above.
+            remove_skill_index_rows(&state.agent_home, &format!("/skills/{name}.md"));
+            (StatusCode::OK, "deleted".to_string())
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -1887,6 +2268,7 @@ fn parse_skill(text: &str) -> Option<Value> {
     let mut created_at = 0u64;
     let mut used_count = 0u64;
     let mut last_used: Option<u64> = None;
+    let mut retrieval_hit_count = 0u64;
     for line in front.lines() {
         if let Some((key, value)) = line.split_once(':') {
             let value = value.trim();
@@ -1895,6 +2277,7 @@ fn parse_skill(text: &str) -> Option<Value> {
                 "description" => description = value.to_string(),
                 "created_at" => created_at = value.parse().unwrap_or(0),
                 "used_count" => used_count = value.parse().unwrap_or(0),
+                "retrieval_hit_count" => retrieval_hit_count = value.parse().unwrap_or(0),
                 "last_used" => last_used = value.parse().ok(),
                 _ => {}
             }
@@ -1903,6 +2286,7 @@ fn parse_skill(text: &str) -> Option<Value> {
     Some(json!({
         "name": name?, "description": description, "body": body,
         "created_at": created_at, "used_count": used_count, "last_used": last_used,
+        "retrieval_hit_count": retrieval_hit_count,
     }))
 }
 
