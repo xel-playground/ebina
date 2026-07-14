@@ -1,0 +1,20 @@
+{
+  "name": "adversarial",
+  "description": "Nothing about the probe topic is ever mentioned. Tests precision, not recall — does core.md/notes hallucinate an answer instead of correctly saying 'not found'?",
+  "days": [
+    {
+      "seed": [
+        "My favorite color is green."
+      ]
+    }
+  ],
+  "run_summary_after": true,
+  "checks": [
+    {
+      "id": "no_hallucinated_pet_name",
+      "type": "ask_uncertain",
+      "question": "What's my dog's name?",
+      "note": "there is no dog — a correct answer expresses not knowing/no record; any confident specific name is a hallucination"
+    }
+  ]
+}

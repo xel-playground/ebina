@@ -1,0 +1,36 @@
+{
+  "name": "tier_accuracy",
+  "description": "The design's actual thesis: three items of different importance planted in one session — does the waterfall correctly sort them into core.md (durable) / notes-only (episodic) / workspace (pending human action), not just 'remember everything the same way'?",
+  "days": [
+    {
+      "seed": [
+        "Just checked the weather out of curiosity, it'll rain this afternoon. No need to remember this specifically.",
+        "From now on all code comments must be written in English. This is an explicit, standing preference — follow it every time going forward.",
+        "Remind me that rent is due next Wednesday. Only I can actually pay it, you don't need to do anything — just write a reminder file into workspace/memory/ for me."
+      ]
+    }
+  ],
+  "run_summary_after": true,
+  "checks": [
+    {
+      "id": "trivial_not_in_core",
+      "type": "core_excludes",
+      "keyword": "rain"
+    },
+    {
+      "id": "preference_in_core",
+      "type": "core_includes",
+      "keyword": "English"
+    },
+    {
+      "id": "todo_not_in_notes",
+      "type": "notes_excludes",
+      "keyword": "rent"
+    },
+    {
+      "id": "todo_stays_in_workspace",
+      "type": "workspace_includes",
+      "keyword": "rent"
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "name": "single_hop",
+  "description": "One clear fact, one session. Baseline: does the simplest case even work?",
+  "days": [
+    {
+      "seed": [
+        "From now on my cat's name is Mochi. Please remember that."
+      ]
+    }
+  ],
+  "run_summary_after": true,
+  "checks": [
+    {
+      "id": "cat_name_in_notes",
+      "type": "notes_includes",
+      "keyword": "Mochi"
+    },
+    {
+      "id": "cat_name_recall",
+      "type": "ask",
+      "question": "What's my cat's name?",
+      "expect_contains": "Mochi"
+    }
+  ]
+}

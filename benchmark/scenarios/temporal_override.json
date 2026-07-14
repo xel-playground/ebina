@@ -1,0 +1,31 @@
+{
+  "name": "temporal_override",
+  "description": "A preference stated, then explicitly superseded in a later session. Tests §2.4's staleness handling — does the later fact correctly win, or does the stale one linger (in notes/ merge, or worse, already-promoted core.md)?",
+  "days": [
+    {
+      "seed": [
+        "Our main programming language going forward is Python. That's the current decision."
+      ]
+    },
+    {
+      "seed": [
+        "Update: we later decided to switch everything to Rust instead. The Python decision is void — use Rust going forward."
+      ]
+    }
+  ],
+  "run_summary_after": true,
+  "checks": [
+    {
+      "id": "current_language_is_rust",
+      "type": "ask",
+      "question": "What's our main programming language right now?",
+      "expect_contains": "Rust",
+      "_comment": "no expect_not_contains for Python — a correct answer explaining the switch ('was Python, now Rust') legitimately mentions both; only the *current* claim matters"
+    },
+    {
+      "id": "notes_reflect_rust_not_stale_python",
+      "type": "notes_includes",
+      "keyword": "Rust"
+    }
+  ]
+}
