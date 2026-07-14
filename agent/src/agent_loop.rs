@@ -996,12 +996,17 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String], retrieved_skills: 
                  /workspace/memory/ yourself (list_dir, then read_file anything in there — the log delta above \
                  only tells you a file like that *exists*, not what's actually in it; that's the one place \
                  short-term notes/reminders are expected to live, so that's all you need to check, not all of \
-                 /workspace/). Split what you find into two kinds, don't conflate them: a durable fact \
+                 /workspace/). Split what you find into three kinds, don't conflate them: a durable fact \
                  (something true going forward — a preference, a decision, how something works) belongs in \
                  memory/notes/; a pending action item that only a human can actually do (uploading an image, \
                  clicking a button somewhere) isn't a fact to memorize, it stays exactly where it is in \
                  /workspace/memory/ and gets called out in this report's own \"needs attention\" section instead \
-                 — don't write a todo into memory/notes/ just because it showed up during this pass. Once a \
+                 — don't write a todo into memory/notes/ just because it showed up during this pass; and real \
+                 research/analysis/organizing work that happened in conversation (actually investigated \
+                 something, worked through a comparison, dug into a problem) also belongs in memory/notes/ — \
+                 write an actual summary of what was found/concluded, not just a pointer noting that it \
+                 happened. The bar is real work occurred, not merely a question got answered — a plain Q&A \
+                 with a one-line answer isn't this; a topic that got actually explored/organized is. Once a \
                  workspace note's *facts* have been folded into memory/notes/ and nothing pending is left in it, \
                  delete_path it — leaving it behind means the same content gets re-noticed and re-considered \
                  every future cycle for no reason. Then write_file a report to \
