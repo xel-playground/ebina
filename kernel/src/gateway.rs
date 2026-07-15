@@ -801,6 +801,29 @@ async fn scheduler_loop(state: Arc<AppState>) {
             if due_now || missed {
                 crate::scheduler_tasks::mark_run(&state.agent_home, &task.id, now);
             }
+            // Bumped *before* spawning, not just after the run completes —
+            // 2026-07-15 incident: a retry attempt (`morning_report`, a
+            // content_filter failure) took ~20-30s to actually run, longer
+            // than one 30s tick. `task_retry_state` only used to get written
+            // back once the spawned future below finished, so every
+            // intervening tick re-read the *stale* pre-retry state (still
+            // "overdue since >900s ago") and independently decided a retry
+            // was due too, spawning another one — task_run_lock (see
+            // `run_trigger`) serializes their *execution* so they don't
+            // corrupt shared state, but does nothing to stop the scheduler
+            // from having already decided to spawn 4 redundant attempts in
+            // the first place, each of which actually completed and
+            // re-fired `chat_send` to Discord on its own. Writing `now` here
+            // synchronously closes that window: the very next tick sees a
+            // last_attempt only seconds old, `scheduled_task_should_run`
+            // requires the full `SCHEDULED_TASK_RETRY_BACKOFF_SECS` (900s)
+            // to have passed, so it can't re-fire until long after any
+            // single attempt (success or failure) could plausibly still be
+            // running.
+            {
+                let failures = retry_state.map(|(_, f)| f).unwrap_or(0);
+                task_retry_state.lock().await.insert(task.id.clone(), (now, failures));
+            }
             // spawned, not awaited — same reasoning as daily_maintenance
             // above: this is the loop iteration that also needs to notice
             // *other* tasks due around the same wall-clock minute, and a
