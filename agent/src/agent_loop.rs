@@ -716,6 +716,14 @@ pub fn run(trigger: &Value) {
     if skills_reindexed > 0 {
         trace(&think_path, &format!("[cleanup] reindexed {skills_reindexed} skill(s)"));
     }
+    // Unconditional, every run, every trigger type — deliberately not an
+    // LLM decision. `sleep_until` isn't even in the "## Actions" list the
+    // model sees; this is the *only* thing that ever sets it. The `cron`
+    // trigger_note used to tell the model to "call sleep_until with your
+    // next check-in time" at the end of its own turn, but that was always
+    // moot — whatever it picked (if anything; it had no documented way to
+    // actually call an undocumented action) got silently overwritten here
+    // regardless. The next `cron` self-wake is always ~1h out, full stop.
     let sleep_at = now_unix() + 3600;
     let _ = syscall::call("sleep_until", &serde_json::json!({"timestamp": sleep_at}));
 
@@ -1116,8 +1124,8 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String], retrieved_skills: 
              a cron check-in read morning_report.md, ran its script, and re-sent that day's already-sent \
              greeting) duplicates work a different trigger already owns. If you have something genuinely \
              worth proactively telling the human (not just a silent `notify` log entry), use `chat_send` — \
-             it shows up as a real message next time they open Chat. End by calling sleep_until with your \
-             next check-in time.\n"
+             it shows up as a real message next time they open Chat. Just call `done` when finished — the \
+             next check-in is scheduled automatically, not something you need to set yourself.\n"
                 .to_string()
         }
         Some("scheduled_task") => {
