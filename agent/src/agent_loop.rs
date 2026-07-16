@@ -1110,10 +1110,14 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String], retrieved_skills: 
              just a peek at the last few turns for context, not something to reply to. Check whatever's \
              worth checking (unfinished workspace/ work, anything you left yourself a reminder about in \
              memory/notes/), act on it if there's something to do, otherwise just call `done` right away \
-             with a short summary — don't manufacture work to justify the wake. If you have something \
-             genuinely worth proactively telling the human (not just a silent `notify` log entry), use \
-             `chat_send` — it shows up as a real message next time they open Chat. End by calling \
-             sleep_until with your next check-in time.\n"
+             with a short summary — don't manufacture work to justify the wake. Do NOT read_file or execute \
+             anything under /workspace/tasks/ — those are `scheduled_task` definitions, already handled on \
+             their own cron schedule; poking at one here and running what it describes (2026-07-16 incident: \
+             a cron check-in read morning_report.md, ran its script, and re-sent that day's already-sent \
+             greeting) duplicates work a different trigger already owns. If you have something genuinely \
+             worth proactively telling the human (not just a silent `notify` log entry), use `chat_send` — \
+             it shows up as a real message next time they open Chat. End by calling sleep_until with your \
+             next check-in time.\n"
                 .to_string()
         }
         Some("scheduled_task") => {
