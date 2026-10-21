@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 const DEFAULT_WORKSPACE: &str = "ebina";
 const AGENT_HOME_DIRNAME: &str = "agent-home";
-const AGENT_WASM_FILENAME: &str = "agent.wasm";
+const AGENT_BIN_FILENAME: &str = "agent";
 const WEBUI_DIRNAME: &str = "webui";
 const DEFAULT_PORT: u16 = 8080;
 
@@ -64,12 +64,12 @@ enum AgentCommand {
         /// gateway HTTP port
         #[arg(long, default_value_t = DEFAULT_PORT)]
         port: u16,
-        /// path to the compiled agent.wasm (default: <workspace>/agent.wasm
-        /// — a sibling of agent-home, same tier as secrets.toml/.git, so a
-        /// workspace is one self-contained, portable unit: drop a built
-        /// agent.wasm in there and the whole thing runs from anywhere)
+        /// path to the compiled native agent binary (default:
+        /// <workspace>/agent — a sibling of agent-home, same tier as
+        /// secrets.toml/.git, so a workspace is one self-contained unit:
+        /// drop a built agent in there and the whole thing runs from anywhere)
         #[arg(long)]
-        wasm: Option<PathBuf>,
+        agent: Option<PathBuf>,
         /// path to a built webui (default: <workspace>/webui — the output
         /// of `npm run build` in webui/, i.e. its `dist/` renamed/copied
         /// here). Optional: if this doesn't exist and wasn't explicitly
@@ -90,7 +90,7 @@ enum AgentCommand {
 /// `.git` if run inside one). One extra path segment fixes that
 /// structurally: `workspace` is the container, `agent-home` is the guest's
 /// root, siblings (secrets.toml, .git, and — see `Command::Run`'s default
-/// `--wasm` — agent.wasm itself) land inside `workspace` alongside it,
+/// `--agent` — the agent binary itself) land inside `workspace` alongside it,
 /// nothing escapes.
 fn agent_home_path(workspace: &std::path::Path) -> PathBuf {
     workspace.join(AGENT_HOME_DIRNAME)
@@ -102,11 +102,11 @@ async fn main() -> Result<()> {
         Command::Agent(AgentCommand::Init { workspace }) => {
             init::init_agent_home(&agent_home_path(&workspace.unwrap_or_else(|| DEFAULT_WORKSPACE.into())))
         }
-        Command::Agent(AgentCommand::Run { workspace, port, wasm, webui }) => {
+        Command::Agent(AgentCommand::Run { workspace, port, agent, webui }) => {
             let workspace = workspace.unwrap_or_else(|| DEFAULT_WORKSPACE.into());
-            let wasm_path = wasm.unwrap_or_else(|| workspace.join(AGENT_WASM_FILENAME));
+            let agent_path = agent.unwrap_or_else(|| workspace.join(AGENT_BIN_FILENAME));
             let webui_dir = webui.unwrap_or_else(|| workspace.join(WEBUI_DIRNAME));
-            run(agent_home_path(&workspace), wasm_path, webui_dir, port).await
+            run(agent_home_path(&workspace), agent_path, webui_dir, port).await
         }
         Command::LocalDeps(LocalDepsCommand::Start { workspace }) => {
             local_deps::start(&workspace.unwrap_or_else(|| DEFAULT_WORKSPACE.into()))
@@ -117,18 +117,18 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run(agent_home: PathBuf, wasm_path: PathBuf, webui_dir: PathBuf, port: u16) -> Result<()> {
+async fn run(agent_home: PathBuf, agent_path: PathBuf, webui_dir: PathBuf, port: u16) -> Result<()> {
     if !agent_home.join("config.toml").exists() {
         anyhow::bail!(
             "{} has no config.toml — run `ebinactl agent init` on its workspace first",
             agent_home.display(),
         );
     }
-    if !wasm_path.exists() {
+    if !agent_path.exists() {
         anyhow::bail!(
-            "{} doesn't exist — build the agent (`cargo build -p agent --target wasm32-wasip1`) \
-             and place/copy it there, or pass a different one with --wasm",
-            wasm_path.display(),
+            "{} doesn't exist — build the agent (`cargo build -p agent --release`) \
+             and place/copy it there, or pass a different one with --agent",
+            agent_path.display(),
         );
     }
 
@@ -144,11 +144,11 @@ async fn run(agent_home: PathBuf, wasm_path: PathBuf, webui_dir: PathBuf, port: 
     })?;
 
     println!("[ebinactl] agent-home: {}", agent_home.display());
-    println!("[ebinactl] wasm: {}", wasm_path.display());
+    println!("[ebinactl] agent: {}", agent_path.display());
 
     if !webui::looks_like_a_build(&webui_dir) {
         println!("[ebinactl] no webui build at {} — serving the bare API only", webui_dir.display());
-        return kernel::gateway::serve(kernel::gateway::GatewayConfig { agent_home, wasm_path, token, port }).await;
+        return kernel::gateway::serve(kernel::gateway::GatewayConfig { agent_home, agent_path, token, port }).await;
     }
 
     // webui present: the gateway moves to `port + 1` and `webui::serve`
@@ -167,7 +167,7 @@ async fn run(agent_home: PathBuf, wasm_path: PathBuf, webui_dir: PathBuf, port: 
 
     let gateway = tokio::spawn(kernel::gateway::serve(kernel::gateway::GatewayConfig {
         agent_home,
-        wasm_path,
+        agent_path,
         token,
         port: internal_port,
     }));

@@ -38,11 +38,11 @@ EOF
 cp "$SOURCE/agent-home/config.toml" "$TESTBED/agent-home/config.toml"
 cp "$SOURCE/secrets.toml" "$TESTBED/secrets.toml"
 
-# Build the wasm fresh so the testbed always reflects current agent/ code —
+# Build the agent fresh so the testbed always reflects current agent/ code —
 # a stale binary here would silently test old distillation logic.
-echo "Building agent.wasm..."
-cargo build -p agent --target wasm32-wasip1 --release >/dev/null
-cp target/wasm32-wasip1/release/agent.wasm "$TESTBED/agent.wasm"
+echo "Building agent..."
+cargo build -p agent --release >/dev/null
+cp target/release/agent "$TESTBED/agent"
 
 echo "Building ebinactl release binary..."
 cargo build --workspace --release >/dev/null

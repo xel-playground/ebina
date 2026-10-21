@@ -34,7 +34,7 @@ async function wakeNow() {
 // to `/api/wake`, no separate "resume" mechanism needed (there's no
 // execution state left to resume anyway, see kernel/src/lib.rs's
 // `RunOutcome.trapped` doc comment: a trapped run's in-memory progress is
-// gone the moment the wasmtime Store drops)
+// gone the moment the agent process is killed)
 function isFailed(r) {
   const summary = r.outcome?.result?.summary || ''
   return r.outcome?.ok === false || summary.startsWith('run aborted') || summary.startsWith('(run timed out')

@@ -5,7 +5,7 @@ use crate::skills;
 use crate::syscall;
 use crate::time::{human_timestamp, now_unix, today_utc};
 use serde_json::Value;
-use std::fs;
+use crate::vfs as fs;
 use std::io::Write;
 
 const MAX_TURNS: u32 = 50;
@@ -16,6 +16,14 @@ const NOTES_DIR: &str = "/memory/notes";
 /// trails (`transcripts/`, `scheduled_runs/`) rather than mixed in with
 /// curated topic notes.
 const RUN_LOG_DIR: &str = "/logs/run_log";
+/// `write_memory_note` logs every run unconditionally, including
+/// `daily_maintenance`/`maintenance_summary`/`core_distillation`'s own
+/// completions — those are bookkeeping about a previous review, not new
+/// material to review. Excluded here (mirrors `kernel/src/gateway.rs`'s
+/// `MAINTENANCE_TRIGGER_TYPES`, a separate crate so this can't just be
+/// shared) so a maintenance tier's own past "nothing new" entry doesn't
+/// show up in its *own* next delta as if it were something that happened.
+const MAINTENANCE_TRIGGER_TYPES: &[&str] = &["daily_maintenance", "maintenance_summary", "core_distillation"];
 const WORKSPACE_DIR: &str = "/workspace";
 const RETRIEVAL_TOP_K: usize = 5;
 /// adr/002-skill-v2.md §2: skills get their own, smaller quota (2-3, not
@@ -1285,8 +1293,8 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String], retrieved_skills: 
 
     // volatile, not stable — changes every single run, unlike everything
     // above it. Without this the model has no way to answer "what time is
-    // it" at all (there's no clock syscall, no ambient time source in a
-    // wasm sandbox) and either guesses or admits it doesn't know.
+    // it" at all (nothing in its context carries the time otherwise) and
+    // either guesses or admits it doesn't know.
     let now_ts = now_unix();
     let current_time = format!("{} (unix {now_ts})", human_timestamp(now_ts));
 
@@ -1451,6 +1459,10 @@ fn recent_log_entries(since_ts: u64) -> String {
         for block in text.split("\n## run at ").filter(|b| !b.trim().is_empty()) {
             if let Some(ts) = parse_block_ts(block) {
                 if ts > since_ts {
+                    let trigger_type = block.split_once("trigger: ").and_then(|(_, rest)| rest.split_whitespace().next()).unwrap_or("");
+                    if MAINTENANCE_TRIGGER_TYPES.contains(&trigger_type) {
+                        continue;
+                    }
                     entries.push((ts, format!("## run at {}", block.trim())));
                 }
             }
@@ -1759,8 +1771,7 @@ fn write_action_denial(path: &str, trigger: &Value) -> Option<String> {
 /// technique as the host's `kernel::filelock::FileLock`, just implemented
 /// guest-side since `write_file`/`append_file` are plain guest `std::fs`
 /// calls (never host syscalls) with no host state to synchronize through.
-/// No `std::thread::sleep` here (unverified how reliably that maps through
-/// WASI p1 in this setup) — the critical section is just a directory walk
+/// No `std::thread::sleep` here — the critical section is just a directory walk
 /// plus one write, no network call inside it, so a bounded busy-retry
 /// resolves contention almost immediately without needing a real sleep.
 struct DiskQuotaLock;

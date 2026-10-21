@@ -7,6 +7,16 @@ const CHUNK_OVERLAP_CHARS: usize = 100;
 const RRF_K: f64 = 60.0;
 /// how many candidates each retrieval method contributes before RRF fusion
 const CANDIDATES_PER_METHOD: usize = 50;
+/// recency is a tiebreaker, not a score multiplier: two chunks whose RRF
+/// scores fall within this distance of each other are treated as equally
+/// relevant, and recency (newer first) decides their order instead. Scores
+/// farther apart than this are never reordered by recency — an old chunk
+/// that's genuinely more relevant always outranks a newer, weaker match, so
+/// a real answer can never get pushed out of `top_k` just for being old.
+/// Only applied to notes (`hybrid_search`) — skills don't go stale just
+/// because they're unused, adr/002's retrieval is capability-match, not
+/// freshness, so `skill_search` skips this entirely.
+const RECENCY_TIE_EPSILON: f64 = 0.002;
 
 /// PROJECT.md 4.3: `chunks(source_path, content_hash, text, embedding, embed_model)`
 /// + an FTS5 index for the keyword half of hybrid retrieval. Contentless FTS5
@@ -31,10 +41,20 @@ pub fn ensure_schema() {
                     content_hash TEXT NOT NULL, \
                     text TEXT NOT NULL, \
                     embedding TEXT, \
-                    embed_model TEXT\
+                    embed_model TEXT, \
+                    created_at INTEGER NOT NULL DEFAULT 0\
                 )"
             ),
             &Value::Array(vec![]),
+        );
+        // migration for DBs created before `created_at` existed; errors if the
+        // column is already there (fresh DBs from the CREATE TABLE above), ignored
+        let _ = db_exec(&format!("ALTER TABLE {table} ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0"), &Value::Array(vec![]));
+        // backfill rows from before this column existed to "now" rather than
+        // leaving them at 0, so they don't get instantly decayed to ~0 relevance
+        let _ = db_exec(
+            &format!("UPDATE {table} SET created_at = ?1 WHERE created_at = 0"),
+            &serde_json::json!([crate::time::now_unix()]),
         );
         let _ = db_exec(
             &format!("CREATE VIRTUAL TABLE IF NOT EXISTS {fts_table} USING fts5(text, content='', tokenize='porter unicode61')"),
@@ -108,7 +128,7 @@ fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
 /// that embedded them, so a config change triggers a full re-embed
 /// (PROJECT.md 4.3: "embed_model 不符 → 自動全庫重嵌").
 pub fn current_embed_model() -> String {
-    let config_text = std::fs::read_to_string("/config.toml").unwrap_or_default();
+    let config_text = crate::vfs::read_to_string("/config.toml").unwrap_or_default();
     let mut in_embed_section = false;
     for line in config_text.lines() {
         let line = line.trim();
@@ -161,7 +181,7 @@ pub fn content_hash(text: &str) -> String {
 /// embedding, this one's now-redundant result is discarded instead of
 /// inserted as a duplicate.
 pub fn reindex_file(source_path: &str, embed_model: &str) -> Result<bool, String> {
-    let text = std::fs::read_to_string(source_path).map_err(|e| format!("read {source_path}: {e}"))?;
+    let text = crate::vfs::read_to_string(source_path).map_err(|e| format!("read {source_path}: {e}"))?;
     reindex_text(source_path, &text, embed_model)
 }
 
@@ -242,22 +262,44 @@ fn write_reindexed_rows(
         .iter()
         .filter_map(|r| r.get("id").and_then(|v| v.as_i64()))
         .collect();
+    let vec_table = format!("{table}_vec");
     for id in &old_ids {
         let _ = db_exec(&format!("DELETE FROM {fts_table} WHERE rowid = ?1"), &serde_json::json!([id]));
+        let _ = db_exec(&format!("DELETE FROM {vec_table} WHERE rowid = ?1"), &serde_json::json!([id]));
     }
     db_exec(&format!("DELETE FROM {table} WHERE source_path = ?1"), &serde_json::json!([source_path]))?;
 
+    // vec0's dimension is fixed at CREATE time, and isn't known until we've
+    // actually embedded something — created lazily here rather than in
+    // `ensure_schema`. If the configured embed model's dimension ever
+    // changes, existing rows of a different dimension already in this table
+    // would make inserts here fail; PROJECT.md 4.3's "embed_model 不符 →
+    // 自動全庫重嵌" already re-embeds every source_path on model mismatch
+    // (`same_as_indexed` above), so this table converges to one dimension
+    // within a single `reindex_all_notes`/`reindex_all_skills` pass.
+    if let Some(dim) = vectors.first().and_then(|v| v.as_array()).map(Vec::len) {
+        db_exec(
+            &format!("CREATE VIRTUAL TABLE IF NOT EXISTS {vec_table} USING vec0(embedding float[{dim}] distance_metric=cosine)"),
+            &Value::Array(vec![]),
+        )?;
+    }
+
+    let created_at = crate::time::now_unix();
     for (piece, vector) in pieces.iter().zip(vectors.iter()) {
         let embedding_json = vector.to_string();
         db_exec(
-            &format!("INSERT INTO {table} (source_path, content_hash, text, embedding, embed_model) VALUES (?1,?2,?3,?4,?5)"),
-            &serde_json::json!([source_path, hash, piece, embedding_json, embed_model]),
+            &format!("INSERT INTO {table} (source_path, content_hash, text, embedding, embed_model, created_at) VALUES (?1,?2,?3,?4,?5,?6)"),
+            &serde_json::json!([source_path, hash, piece, embedding_json, embed_model, created_at]),
         )?;
         let id_rows = db_exec("SELECT last_insert_rowid() AS id", &Value::Array(vec![]))?;
         let new_id = id_rows.first().and_then(|r| r.get("id")).and_then(|v| v.as_i64()).unwrap_or(0);
         db_exec(
             &format!("INSERT INTO {fts_table}(rowid, text) VALUES (?1, ?2)"),
             &serde_json::json!([new_id, piece]),
+        )?;
+        db_exec(
+            &format!("INSERT INTO {vec_table}(rowid, embedding) VALUES (?1, ?2)"),
+            &serde_json::json!([new_id, embedding_json]),
         )?;
     }
     Ok(())
@@ -274,6 +316,7 @@ fn write_reindexed_rows(
 /// for the same "don't do silent work" trace-line reasoning as
 /// `reindex_all_notes`.
 pub fn remove_orphaned_rows(table: &str, fts_table: &str, live_paths: &HashSet<String>) -> usize {
+    let vec_table = format!("{table}_vec");
     let indexed: Vec<String> = db_exec(&format!("SELECT DISTINCT source_path FROM {table}"), &Value::Array(vec![]))
         .unwrap_or_default()
         .iter()
@@ -291,6 +334,7 @@ pub fn remove_orphaned_rows(table: &str, fts_table: &str, live_paths: &HashSet<S
             .collect();
         for id in &ids {
             let _ = db_exec(&format!("DELETE FROM {fts_table} WHERE rowid = ?1"), &serde_json::json!([id]));
+            let _ = db_exec(&format!("DELETE FROM {vec_table} WHERE rowid = ?1"), &serde_json::json!([id]));
         }
         let _ = db_exec(&format!("DELETE FROM {table} WHERE source_path = ?1"), &serde_json::json!([path]));
         removed += 1;
@@ -310,25 +354,35 @@ fn sanitize_fts_query(query: &str) -> String {
         .join(" ")
 }
 
-fn cosine(a: &[f64], b: &[f64]) -> f64 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
+/// Sort key for combined RRF results: `(bucket, then recency)` — a genuine
+/// total order, unlike a pairwise `(a.1 - b.1).abs() <= EPSILON` "near tie"
+/// check (not transitive: A~B and B~C near-tied doesn't imply A~C). Rust's
+/// `sort_by` panics the moment it detects that kind of inconsistency
+/// ("user-provided comparison function does not correctly implement a total
+/// order") — hit in production once the candidate set was large enough to
+/// produce one, not just a theoretical risk. `apply_recency` is fixed for
+/// the whole sort call (never varies per pair), so this never switches rules
+/// mid-sort either.
+fn rank_cmp(a: (i64, f64), b: (i64, f64), apply_recency: bool, created_ats: &HashMap<i64, i64>) -> std::cmp::Ordering {
+    if apply_recency {
+        let bucket_a = (a.1 / RECENCY_TIE_EPSILON).round() as i64;
+        let bucket_b = (b.1 / RECENCY_TIE_EPSILON).round() as i64;
+        bucket_b.cmp(&bucket_a).then_with(|| {
+            let created_a = created_ats.get(&a.0).copied().unwrap_or(0);
+            let created_b = created_ats.get(&b.0).copied().unwrap_or(0);
+            created_b.cmp(&created_a)
+        })
+    } else {
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
     }
-    let dot: f64 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-    let norm_a: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
-    let norm_b: f64 = b.iter().map(|x| x * x).sum::<f64>().sqrt();
-    if norm_a == 0.0 || norm_b == 0.0 {
-        return 0.0;
-    }
-    dot / (norm_a * norm_b)
 }
 
-/// Hybrid retrieval: FTS5 BM25 ranking + brute-force cosine ranking (fine at
-/// this row count per PROJECT.md 4.3; sqlite-vec can replace the cosine loop
-/// later without changing this function's contract), combined via
-/// Reciprocal Rank Fusion. Returns up to `top_k` chunk texts, best first.
+/// Hybrid retrieval: FTS5 BM25 ranking + cosine-KNN ranking via sqlite-vec's
+/// `vec0` virtual table (`{table}_vec`, kept in step with `table` by
+/// `write_reindexed_rows`/`remove_orphaned_rows`), combined via Reciprocal
+/// Rank Fusion. Returns up to `top_k` chunk texts, best first.
 pub fn hybrid_search(query: &str, top_k: usize) -> Vec<String> {
-    hybrid_search_table(query, top_k, CHUNKS_TABLE, CHUNKS_FTS_TABLE).into_iter().map(|(_, text)| text).collect()
+    hybrid_search_table(query, top_k, CHUNKS_TABLE, CHUNKS_FTS_TABLE, true).into_iter().map(|(_, text)| text).collect()
 }
 
 /// Same retrieval, against `skill_chunks`/`skill_chunks_fts` — adr/002 §2's
@@ -337,10 +391,10 @@ pub fn hybrid_search(query: &str, top_k: usize) -> Vec<String> {
 /// back to which skill it belongs to, for `retrieval_hit_count` bookkeeping
 /// (§2: "自動檢索命中就 +1", tracked per skill file, not per chunk).
 pub fn skill_search(query: &str, top_k: usize) -> Vec<(String, String)> {
-    hybrid_search_table(query, top_k, SKILL_CHUNKS_TABLE, SKILL_CHUNKS_FTS_TABLE)
+    hybrid_search_table(query, top_k, SKILL_CHUNKS_TABLE, SKILL_CHUNKS_FTS_TABLE, false)
 }
 
-fn hybrid_search_table(query: &str, top_k: usize, table: &str, fts_table: &str) -> Vec<(String, String)> {
+fn hybrid_search_table(query: &str, top_k: usize, table: &str, fts_table: &str, apply_recency: bool) -> Vec<(String, String)> {
     let fts_query = sanitize_fts_query(query);
     let fts_ranks: HashMap<i64, usize> = if fts_query.is_empty() {
         HashMap::new()
@@ -358,28 +412,31 @@ fn hybrid_search_table(query: &str, top_k: usize, table: &str, fts_table: &str) 
     };
 
     let vec_ranks: HashMap<i64, usize> = embed_one(query)
-        .map(|qvec| {
-            let mut scored: Vec<(i64, f64)> = db_exec(&format!("SELECT id, embedding FROM {table}"), &Value::Array(vec![]))
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|row| {
-                    let id = row.get("id")?.as_i64()?;
-                    let emb_text = row.get("embedding")?.as_str()?;
-                    let emb: Vec<f64> = serde_json::from_str(emb_text).ok()?;
-                    Some((id, cosine(&qvec, &emb)))
-                })
-                .collect();
-            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            scored
-                .into_iter()
-                .take(CANDIDATES_PER_METHOD)
-                .enumerate()
-                .map(|(rank, (id, _))| (id, rank))
-                .collect()
+        .map(|qvec_json| {
+            db_exec(
+                &format!("SELECT rowid AS id FROM {table}_vec WHERE embedding MATCH ?1 ORDER BY distance LIMIT ?2"),
+                &serde_json::json!([qvec_json, CANDIDATES_PER_METHOD as i64]),
+            )
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|r| r.get("id").and_then(|v| v.as_i64()))
+            .enumerate()
+            .map(|(rank, id)| (id, rank))
+            .collect()
         })
         .unwrap_or_default();
 
     let all_ids: HashSet<i64> = fts_ranks.keys().chain(vec_ranks.keys()).copied().collect();
+    let created_ats: HashMap<i64, i64> = if !apply_recency || all_ids.is_empty() {
+        HashMap::new()
+    } else {
+        let id_list: String = all_ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+        db_exec(&format!("SELECT id, created_at FROM {table} WHERE id IN ({id_list})"), &Value::Array(vec![]))
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|r| Some((r.get("id")?.as_i64()?, r.get("created_at")?.as_i64()?)))
+            .collect()
+    };
     let mut combined: Vec<(i64, f64)> = all_ids
         .into_iter()
         .map(|id| {
@@ -393,7 +450,7 @@ fn hybrid_search_table(query: &str, top_k: usize, table: &str, fts_table: &str) 
             (id, score)
         })
         .collect();
-    combined.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    combined.sort_by(|a, b| rank_cmp(*a, *b, apply_recency, &created_ats));
     combined.truncate(top_k);
 
     combined
@@ -408,16 +465,14 @@ fn hybrid_search_table(query: &str, top_k: usize, table: &str, fts_table: &str) 
         .collect()
 }
 
-fn embed_one(text: &str) -> Option<Vec<f64>> {
+/// Returns the query embedding as a JSON array string — the literal format
+/// `vec0`'s `MATCH` operator accepts directly, no blob packing needed.
+fn embed_one(text: &str) -> Option<String> {
     let resp = syscall::call("embed", &serde_json::json!({"texts": [text]}));
     if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
         return None;
     }
-    resp["result"]["vectors"]
-        .as_array()?
-        .first()?
-        .as_array()
-        .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect())
+    Some(resp["result"]["vectors"].as_array()?.first()?.to_string())
 }
 
 fn db_exec(sql: &str, params: &Value) -> Result<Vec<Value>, String> {
@@ -429,5 +484,60 @@ fn db_exec(sql: &str, params: &Value) -> Result<Vec<Value>, String> {
             .get("error")
             .map(|e| e.to_string())
             .unwrap_or_else(|| format!("db_exec failed for: {sql}")))
+    }
+}
+
+#[cfg(test)]
+mod rank_cmp_tests {
+    use super::*;
+
+    /// This exact shape (many ids whose scores straddle `RECENCY_TIE_EPSILON`
+    /// boundaries by design) is what actually panicked in production: a
+    /// pairwise `(a.1 - b.1).abs() <= EPSILON` "near tie" check isn't
+    /// transitive, and Rust's `sort_by` detects that and panics instead of
+    /// silently misordering. `sort_by` itself is the assertion here — if
+    /// `rank_cmp` isn't a real total order, this call panics.
+    #[test]
+    fn sorting_many_boundary_straddling_scores_does_not_panic() {
+        let created_ats: HashMap<i64, i64> = (0..200).map(|id| (id, 1000 + id)).collect();
+        let mut combined: Vec<(i64, f64)> = (0..200)
+            .map(|id| {
+                // steps of exactly EPSILON/3 so consecutive ids are well
+                // within one epsilon of each other, but ids a few apart
+                // drift past it — the classic non-transitive setup
+                (id, id as f64 * (RECENCY_TIE_EPSILON / 3.0))
+            })
+            .collect();
+        combined.sort_by(|a, b| rank_cmp(*a, *b, true, &created_ats));
+        assert_eq!(combined.len(), 200);
+    }
+
+    #[test]
+    fn recency_breaks_ties_within_a_bucket_newest_first() {
+        let created_ats: HashMap<i64, i64> = [(1, 500), (2, 900), (3, 100)].into_iter().collect();
+        // all three scores round to the same bucket
+        let mut combined = vec![(1, 0.01_f64), (2, 0.0101), (3, 0.0099)];
+        combined.sort_by(|a, b| rank_cmp(*a, *b, true, &created_ats));
+        assert_eq!(combined.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![2, 1, 3]);
+    }
+
+    #[test]
+    fn a_clearly_better_score_always_wins_regardless_of_age() {
+        let created_ats: HashMap<i64, i64> = [(1, 100), (2, 999_999)].into_iter().collect();
+        // far enough apart that no bucket rounding could tie them
+        let mut combined = vec![(1, 0.05_f64), (2, 0.001)];
+        combined.sort_by(|a, b| rank_cmp(*a, *b, true, &created_ats));
+        assert_eq!(combined[0].0, 1, "higher relevance score must win even though id 1 is far older");
+    }
+
+    #[test]
+    fn skill_search_path_ignores_recency_entirely() {
+        // id 1 is far newer (created_at 999_999 vs id 2's 100) but scores
+        // lower — with apply_recency=false this must still sort by raw
+        // score alone, id 2 wins, `created_ats` never even gets consulted.
+        let created_ats: HashMap<i64, i64> = [(1, 999_999), (2, 100)].into_iter().collect();
+        let mut combined = vec![(1, 0.01_f64), (2, 0.0101)];
+        combined.sort_by(|a, b| rank_cmp(*a, *b, false, &created_ats));
+        assert_eq!(combined[0].0, 2, "apply_recency=false must be pure score order regardless of age");
     }
 }

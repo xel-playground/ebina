@@ -264,14 +264,14 @@ impl Default for DbConfig {
 #[derive(Debug, Deserialize, Clone, Copy)]
 #[serde(default)]
 pub struct RuntimeConfig {
-    /// wasmtime epoch-interruption deadline for one *whole run* (every turn
-    /// combined, not a per-step limit) — a genuinely stuck guest (infinite
-    /// loop, no host calls at all) traps at this deadline instead of
-    /// hanging the gateway forever. A well-behaved multi-turn task (several
+    /// wall-clock deadline for one *whole run* (every turn combined, not a
+    /// per-step limit) — the kernel SIGKILLs the agent process at this
+    /// deadline, so a genuinely stuck agent (infinite loop, hung call)
+    /// dies instead of hanging the gateway forever. A well-behaved multi-turn task (several
     /// `http_get`/`llm_call` round-trips — e.g. a report pulling from a few
     /// RSS sources) can legitimately run long, so this needs real headroom:
-    /// a run that hits this trap mid-turn is silently discarded — whatever
-    /// the guest was about to do (even something already decided, like a
+    /// a run that hits this kill mid-turn is silently discarded — whatever
+    /// the agent was about to do (even something already decided, like a
     /// `chat_send` the model had already committed to) never happens, with
     /// nothing written to disk from that point on.
     pub epoch_timeout_secs: u64,
@@ -299,21 +299,6 @@ pub struct RuntimeConfig {
     /// crossed in practice, so this one was doing most of the real
     /// compaction work and 100k left it firing later than useful.
     pub in_run_compact_tokens: u64,
-    /// Test flag comparing two `wasm_path` loading strategies — `false`
-    /// (default): every run compiles the wasm file fresh via
-    /// `Module::from_file` (current/original behavior), which costs a
-    /// recompile per trigger but means a hot-swapped `agent.wasm` on disk
-    /// takes effect on the very next run with no kernel restart. `true`:
-    /// the gateway builds one `WasmRuntime` (Engine/Linker/Module) at
-    /// startup and every run reuses it — skips the recompile, but a
-    /// hot-swapped `agent.wasm` needs a kernel restart to be picked up.
-    /// Engine/Linker/Module are all immutable and Send+Sync once built
-    /// (wasmtime's own documented pattern for concurrent multi-Store use),
-    /// so sharing them across concurrent runs is safe either way — this
-    /// isn't a race-safety switch, purely a perf-vs-hot-swap-convenience
-    /// one. Only `Store` ever needs to be fresh per run regardless of this
-    /// flag (see `lib.rs`'s `run_agent_with_runtime`).
-    pub cache_wasm_module: bool,
     /// Hard cap on one `llm_call`'s own completion length (`max_tokens` for
     /// anthropic/openai-compatible, `options.num_predict` for ollama) —
     /// without *some* cap, a model stuck in an autoregressive repetition
@@ -330,7 +315,7 @@ pub struct RuntimeConfig {
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
-        RuntimeConfig { epoch_timeout_secs: 30 * 60, in_run_compact_tokens: 60_000, cache_wasm_module: false, max_output_tokens: 16_000 }
+        RuntimeConfig { epoch_timeout_secs: 30 * 60, in_run_compact_tokens: 60_000, max_output_tokens: 16_000 }
     }
 }
 
@@ -413,8 +398,8 @@ pub struct DiskConfig {
     /// hard cap on agent-home's total on-disk size. Guest writes are
     /// checked in `agent_loop.rs`'s `write_file` action (sums the whole
     /// tree, refuses + `notify`s rather than growing past this — the kernel
-    /// never intercepts individual guest writes, the preopened WASI dir has
-    /// no hook for that short of a much deeper wasmtime-wasi change). Host
+    /// never intercepts individual agent writes, they're plain `std::fs`
+    /// calls in the agent process). Host
     /// writes (`gateway.rs`'s `POST /api/upload`, for chat attachments)
     /// check the same cap on the kernel side instead, since that path never
     /// goes through the guest at all. This struct exists so the value

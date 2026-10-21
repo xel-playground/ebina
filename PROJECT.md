@@ -5,6 +5,12 @@
 
 核心理念:**沙箱內完整自主,沙箱邊界極簡**。安全邊界 = wasmtime Store 邊界。
 
+> **2026-10 更新:WASM 已全部移除。** agent 改為原生 binary,kernel 每次 run 以子行程
+> spawn(cwd = agent_home、清空 env、`RLIMIT_AS` 512MB、整輪 wall-clock 逾時 SIGKILL),
+> syscall 改走 fd 3 上的 socketpair(一行 JSON 請求 / 一行 JSON 回應,見 `kernel/src/abi.rs`)。
+> 檔案隔離由 agent 端 `agent/src/vfs.rs` 負責(路徑一律以 agent_home 為根,拒絕 `..`/symlink 逃逸),
+> 不再是 OS/執行期強制的硬沙箱。下文提到 wasmtime/WASI/epoch 的段落為原設計紀錄,實作以 README 為準。
+
 ---
 
 ## 1. 設計目標與非目標

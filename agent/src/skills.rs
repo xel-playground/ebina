@@ -1,5 +1,5 @@
 use crate::time::now_unix;
-use std::fs;
+use crate::vfs as fs;
 
 pub const SKILLS_DIR: &str = "/skills";
 

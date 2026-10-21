@@ -10,21 +10,21 @@ async fn main() -> Result<()> {
         return serve().await;
     }
 
-    // direct CLI run, mainly for dev/testing: `kernel <wasm-path> [guest-args...]`
+    // direct CLI run, mainly for dev/testing: `kernel <agent-path> [agent-args...]`
     let agent_home = std::env::var("AGENT_HOME").unwrap_or_else(|_| "agent-home".to_string());
-    let wasm_path = first.unwrap_or_else(|| "target/wasm32-wasip1/debug/agent.wasm".to_string());
+    let agent_path = first.unwrap_or_else(|| "target/debug/agent".to_string());
     let mut guest_args: Vec<String> = args.collect();
     if guest_args.is_empty() {
         guest_args.push("hello".to_string());
     }
 
-    // wasmtime + reqwest's blocking client both panic if driven directly on
-    // a tokio runtime thread ("cannot start/drop a runtime from within a
+    // the blocking syscall loop + reqwest's blocking client both panic /
+    // stall if driven directly on a tokio runtime thread ("cannot start/drop a runtime from within a
     // runtime") — spawn_blocking moves this off the async reactor, same as
     // the gateway's run_trigger does for every request
     let outcome = tokio::task::spawn_blocking(move || {
         let guest_args: Vec<&str> = guest_args.iter().map(String::as_str).collect();
-        kernel::run_agent(&agent_home, &wasm_path, &guest_args)
+        kernel::run_agent(&agent_home, &agent_path, &guest_args)
     })
     .await??;
     print!("{}", outcome.stdout);
@@ -37,8 +37,7 @@ async fn main() -> Result<()> {
 
 async fn serve() -> Result<()> {
     let agent_home = PathBuf::from(std::env::var("AGENT_HOME").unwrap_or_else(|_| "agent-home".to_string()));
-    let wasm_path =
-        std::env::var("AGENT_WASM").unwrap_or_else(|_| "target/wasm32-wasip1/debug/agent.wasm".to_string());
+    let agent_path = std::env::var("AGENT_BIN").unwrap_or_else(|_| "target/debug/agent".to_string());
     let port: u16 = std::env::var("GATEWAY_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8080);
 
     // the gateway's own login token lives in the vault like any other
@@ -59,7 +58,7 @@ async fn serve() -> Result<()> {
 
     kernel::gateway::serve(kernel::gateway::GatewayConfig {
         agent_home,
-        wasm_path: wasm_path.into(),
+        agent_path: agent_path.into(),
         token,
         port,
     })

@@ -2,7 +2,7 @@ use include_dir::{include_dir, Dir};
 
 /// Baked into the `ebinactl` binary at compile time — `init` writes these
 /// straight out, so a fresh workspace never needs the user to separately
-/// `cargo build -p agent --target wasm32-wasip1` or `npm run build` the
+/// `cargo build -p agent` or `npm run build` the
 /// webui and go copy the results into place by hand. There's no release
 /// pipeline to download prebuilt artifacts from instead (this is a
 /// from-source monorepo, not a published project), so embedding at build
@@ -11,9 +11,9 @@ use include_dir::{include_dir, Dir};
 /// direction as everything else built this session.
 ///
 /// Consequence: both must already be built *before* `cargo build -p
-/// ebinactl` — `cargo build -p agent --target wasm32-wasip1 --release` and
+/// ebinactl` — `cargo build -p agent --release` and
 /// `npm run build` in `webui/`. `ebinactl` itself is downstream of both in
 /// the build order, not the other way around.
-pub static AGENT_WASM: &[u8] = include_bytes!("../../target/wasm32-wasip1/release/agent.wasm");
+pub static AGENT_BIN: &[u8] = include_bytes!("../../target/release/agent");
 
 pub static WEBUI_DIST: Dir = include_dir!("$CARGO_MANIFEST_DIR/../webui/dist");

@@ -18,7 +18,7 @@ use std::time::Duration;
 /// (shows up as a normal chat bubble next time the Chat panel opens); for
 /// Discord, `discord.rs`'s `session_watch_loop` is what notices the new
 /// turn and actually sends it through the live bot connection — this
-/// syscall runs synchronously inside the wasm sandbox and has no direct
+/// syscall runs synchronously on the agent run's blocking thread and has no direct
 /// line to that async client, hence the file handoff rather than sending
 /// straight from here.
 ///

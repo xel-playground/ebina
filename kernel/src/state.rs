@@ -3,12 +3,10 @@ use crate::config::Config;
 use crate::secrets::Secrets;
 use rusqlite::Connection;
 use std::path::PathBuf;
-use wasmtime::StoreLimits;
-use wasmtime_wasi::p1::WasiP1Ctx;
 
-/// Everything a syscall needs, held as the wasmtime `Store<T>` data. All
-/// fields are touched only from within host-import closures, which run
-/// synchronously on the single thread driving `_start` — no locking needed.
+/// Everything a syscall needs for one agent run. All fields are touched
+/// only from `abi::serve`, which handles the agent's syscalls one at a time
+/// on the single thread driving that run — no locking needed.
 /// Rate limiting is *not* here — `llm_bucket`/`embed_bucket`/`http_bucket`/
 /// `http_domain_buckets` used to be built fresh per run, which meant the
 /// configured per-minute caps were really "per run", not process-wide, once
@@ -17,7 +15,6 @@ use wasmtime_wasi::p1::WasiP1Ctx;
 /// `crate::ratelimit::global(&state.config.ratelimit)` instead, a
 /// process-wide singleton shared by every concurrent run.
 pub struct AgentState {
-    pub wasi: WasiP1Ctx,
     pub agent_home: PathBuf,
     pub config: Config,
     pub secrets: Secrets,
@@ -25,22 +22,19 @@ pub struct AgentState {
     pub embed_budget: BudgetTracker,
     pub http_daily: BudgetTracker,
     pub search_daily: BudgetTracker,
-    /// set by the `sleep_until` syscall; read by the host after `_start` returns
+    /// set by the `sleep_until` syscall; read by the host after the agent exits
     pub sleep_until: Option<i64>,
-    /// wired to `Store::limiter` — enforces the 512MB memory cap (PROJECT.md 4.1)
-    pub limits: StoreLimits,
     db: Option<Connection>,
 }
 
 impl AgentState {
-    pub fn new(agent_home: PathBuf, config: Config, secrets: Secrets, wasi: WasiP1Ctx, limits: StoreLimits) -> Self {
+    pub fn new(agent_home: PathBuf, config: Config, secrets: Secrets) -> Self {
         let budget = BudgetTracker::load(&agent_home, config.budget.daily_token_cap);
         let embed_budget =
             BudgetTracker::load_named(&agent_home, config.budget.embed_daily_token_cap, "logs/embed-budget-state.json");
         let http_daily = BudgetTracker::load_named(&agent_home, config.network.daily_request_cap, "logs/http-request-count.json");
         let search_daily = BudgetTracker::load_named(&agent_home, config.search.daily_request_cap, "logs/search-request-count.json");
         AgentState {
-            wasi,
             agent_home,
             config,
             secrets,
@@ -49,7 +43,6 @@ impl AgentState {
             http_daily,
             search_daily,
             sleep_until: None,
-            limits,
             db: None,
         }
     }
@@ -60,6 +53,17 @@ impl AgentState {
     /// enabled), and a wall-clock query timeout via progress_handler.
     pub fn db(&mut self) -> rusqlite::Result<&mut Connection> {
         if self.db.is_none() {
+            // sqlite-vec's vec0 module, statically linked in (build.rs compiles
+            // sqlite-vec.c with SQLITE_CORE defined) and registered via
+            // sqlite3_auto_extension — this is *not* the dynamic load_extension()
+            // path the authorizer below denies: it's a single C entrypoint baked
+            // into this binary at compile time, invoked for every connection
+            // opened from here on. No new "load arbitrary .so" surface is added.
+            static VEC_EXTENSION_REGISTERED: std::sync::Once = std::sync::Once::new();
+            VEC_EXTENSION_REGISTERED.call_once(|| unsafe {
+                rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ())));
+            });
+
             let path = self.agent_home.join("memory/index.db");
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
@@ -87,5 +91,35 @@ impl AgentState {
             self.db = Some(conn);
         }
         Ok(self.db.as_mut().unwrap())
+    }
+}
+
+#[cfg(test)]
+mod vec_extension_tests {
+    use rusqlite::Connection;
+
+    /// Confirms sqlite-vec's static registration + vec0 KNN query syntax
+    /// actually works end to end (compile, auto_extension registration,
+    /// `distance_metric=cosine`, JSON-text vector literals, bound `LIMIT ?`
+    /// param for k) rather than trusting docs alone.
+    #[test]
+    fn vec0_registers_and_answers_knn_query() {
+        unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ())));
+        }
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE VIRTUAL TABLE t USING vec0(embedding float[3] distance_metric=cosine)", []).unwrap();
+        conn.execute("INSERT INTO t(rowid, embedding) VALUES (1, '[1.0,0.0,0.0]')", []).unwrap();
+        conn.execute("INSERT INTO t(rowid, embedding) VALUES (2, '[0.0,1.0,0.0]')", []).unwrap();
+        conn.execute("INSERT INTO t(rowid, embedding) VALUES (3, '[0.9,0.1,0.0]')", []).unwrap();
+
+        let k: i64 = 2;
+        let mut stmt = conn.prepare("SELECT rowid FROM t WHERE embedding MATCH ?1 ORDER BY distance LIMIT ?2").unwrap();
+        let rows: Vec<i64> = stmt
+            .query_map(rusqlite::params!["[1.0,0.0,0.0]", k], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows, vec![1, 3]);
     }
 }

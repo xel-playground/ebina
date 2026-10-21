@@ -1,22 +1,32 @@
 use serde_json::Value;
+use std::io::{BufRead, BufReader, Write};
+use std::os::fd::FromRawFd;
+use std::os::unix::net::UnixStream;
+use std::sync::{Mutex, OnceLock};
 
-unsafe extern "C" {
-    fn syscall(
-        name_ptr: *const u8,
-        name_len: i32,
-        req_ptr: *const u8,
-        req_len: i32,
-        out_ptr: *mut u8,
-        out_cap: i32,
-    ) -> i32;
+/// fd the kernel hands us the syscall channel on — mirrors
+/// kernel/src/lib.rs::SYSCALL_FD
+const SYSCALL_FD: i32 = 3;
+
+struct Channel {
+    reader: BufReader<UnixStream>,
+    writer: UnixStream,
 }
 
-/// sentinel for a fatal ABI-level failure — mirrors kernel/src/abi.rs::FATAL
-const FATAL: i32 = i32::MIN;
+fn channel() -> &'static Mutex<Channel> {
+    static CHANNEL: OnceLock<Mutex<Channel>> = OnceLock::new();
+    CHANNEL.get_or_init(|| {
+        // SAFETY: the kernel dup2()s one end of a socketpair onto this fd
+        // before exec and nothing else in this process opens or closes it
+        let stream = unsafe { UnixStream::from_raw_fd(SYSCALL_FD) };
+        let writer = stream.try_clone().expect("syscall channel on fd 3 — is this running under the kernel?");
+        Mutex::new(Channel { reader: BufReader::new(stream), writer })
+    })
+}
 
-/// Calls host syscall `name` with JSON request `req`, growing the output
-/// buffer and retrying if the host reports it was too small. Always returns
-/// a JSON value: on protocol failure, a synthesized `{"ok":false,...}`
+/// Calls host syscall `name` with JSON request `req` over the kernel's
+/// line-delimited JSON channel (see kernel/src/abi.rs). Always returns a
+/// JSON value: on transport failure, a synthesized `{"ok":false,...}`
 /// envelope in the same shape the host would produce.
 ///
 /// Every host call funnels through this one function regardless of which
@@ -31,33 +41,19 @@ pub fn call(name: &str, req: &Value) -> Value {
 }
 
 fn call_inner(name: &str, req: &Value) -> Value {
-    let req_bytes = serde_json::to_vec(req).expect("request must serialize");
-    let mut cap: usize = 4096;
-    loop {
-        let mut buf = vec![0u8; cap];
-        let written = unsafe {
-            syscall(
-                name.as_ptr(),
-                name.len() as i32,
-                req_bytes.as_ptr(),
-                req_bytes.len() as i32,
-                buf.as_mut_ptr(),
-                buf.len() as i32,
-            )
-        };
+    let mut line = serde_json::to_vec(&serde_json::json!({"name": name, "req": req})).expect("request must serialize");
+    line.push(b'\n');
 
-        if written == FATAL {
-            panic!("fatal syscall ABI error calling `{name}`");
-        }
-        if written >= 0 {
-            buf.truncate(written as usize);
-            return serde_json::from_slice(&buf).unwrap_or_else(|e| {
-                serde_json::json!({
-                    "ok": false,
-                    "error": {"code": "bad_response_json", "message": e.to_string()}
-                })
-            });
-        }
-        cap = (-written) as usize;
+    let mut ch = channel().lock().unwrap_or_else(|e| e.into_inner());
+    let mut response = String::new();
+    let io_result = ch.writer.write_all(&line).and_then(|_| ch.reader.read_line(&mut response));
+    match io_result {
+        Ok(0) => transport_error("channel_closed", "kernel closed the syscall channel"),
+        Ok(_) => serde_json::from_str(&response).unwrap_or_else(|e| transport_error("bad_response_json", &e.to_string())),
+        Err(e) => transport_error("channel_error", &e.to_string()),
     }
+}
+
+fn transport_error(code: &str, message: &str) -> Value {
+    serde_json::json!({"ok": false, "error": {"code": code, "message": message}})
 }

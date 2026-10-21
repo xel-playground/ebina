@@ -11,7 +11,7 @@ use std::path::Path;
 /// `<workspace>/secrets.toml` (host-only, outside agent_home, same
 /// convention as the kernel's git-dir/model-cache assets — see
 /// `kernel::secrets_path`) seeded with a freshly generated `gateway_token`
-/// so `run`'s fail-fast check for one already passes, plus `agent.wasm` and
+/// so `run`'s fail-fast check for one already passes, plus the `agent` binary and
 /// a `webui/` build — both baked into this very binary at compile time (see
 /// `embedded.rs`), written out here rather than making the human separately
 /// build and copy them into place.
@@ -63,15 +63,16 @@ pub fn init_agent_home(agent_home: &Path) -> Result<()> {
         secrets.save(&secrets_path).context("writing secrets.toml")?;
     }
 
-    let wasm_path = workspace.join("agent.wasm");
-    std::fs::write(&wasm_path, crate::embedded::AGENT_WASM).context("writing agent.wasm")?;
+    let agent_path = workspace.join("agent");
+    std::fs::write(&agent_path, crate::embedded::AGENT_BIN).context("writing agent binary")?;
+    std::fs::set_permissions(&agent_path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).context("chmod agent binary")?;
     let webui_dir = workspace.join("webui");
     crate::embedded::WEBUI_DIST.extract(&webui_dir).context("extracting embedded webui build")?;
 
     println!("initialized agent-home at {}", agent_home.display());
     println!("secrets vault at {} (gateway_token + ssh_key_path generated)", secrets_path.display());
     println!("ssh keypair at {} / {}.pub", ssh_key_path.display(), ssh_key_path.display());
-    println!("agent.wasm written to {}", wasm_path.display());
+    println!("agent binary written to {}", agent_path.display());
     println!("webui written to {}", webui_dir.display());
     println!();
     println!("next steps:");
@@ -103,8 +104,8 @@ fn generate_ssh_keypair(path: &Path) -> Result<()> {
 
 /// 24 bytes of `/dev/urandom`, hex-encoded — no `rand` crate dependency for
 /// something this small and Linux-only-already (this whole project assumes
-/// a Linux host: `ssh2`, `rusqlite` bundled sqlite, wasmtime's Linux epoch
-/// timer). 48 hex chars, 192 bits, plenty for a bearer token nothing else
+/// a Linux host: `ssh2`, `rusqlite` bundled sqlite, the agent's
+/// socketpair/`RLIMIT_AS` setup). 48 hex chars, 192 bits, plenty for a bearer token nothing else
 /// derives from.
 fn generate_token() -> Result<String> {
     let mut buf = [0u8; 24];

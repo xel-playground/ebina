@@ -23,7 +23,8 @@ use std::time::Duration;
 /// request; a separate wrapper (not built yet) is what runs both together.
 pub struct GatewayConfig {
     pub agent_home: PathBuf,
-    pub wasm_path: PathBuf,
+    /// the native agent binary spawned for every run
+    pub agent_path: PathBuf,
     /// single bearer token gating every `/api/*` route (PROJECT.md 4.4)
     pub token: String,
     pub port: u16,
@@ -64,7 +65,7 @@ impl KeyedLocks {
 
 pub(crate) struct AppState {
     pub(crate) agent_home: PathBuf,
-    wasm_path: PathBuf,
+    agent_path: PathBuf,
     token: String,
     /// Only `message`-type runs (a real conversation) get serialized, and
     /// only against *their own session* — same session's turns must land in
@@ -109,12 +110,6 @@ pub(crate) struct AppState {
     /// per-session; this is trigger-type-agnostic so the webui still gets a
     /// meaningful "something's running right now" signal.
     active_runs: std::sync::atomic::AtomicUsize,
-    /// `Some` only when `config.toml`'s `[runtime] cache_wasm_module` was
-    /// `true` at startup — see `WasmRuntime`'s doc comment. `Arc` (not a
-    /// bare `WasmRuntime`) so `run_trigger_inner`'s `spawn_blocking` closure
-    /// can cheaply clone a `'static` handle to it; no `Mutex` needed since
-    /// nothing about it ever changes after `serve` builds it once.
-    wasm_runtime: Option<Arc<crate::WasmRuntime>>,
 }
 
 impl AppState {
@@ -142,7 +137,7 @@ impl AppState {
 }
 
 /// Kernel space: this is the only piece of the system that knows agent-home
-/// exists as a directory on disk and that a wasm binary needs running — the
+/// exists as a directory on disk and that an agent binary needs running — the
 /// agent itself never sees the gateway (PROJECT.md 4.4).
 pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
     // once-at-startup, not lazily inside `pairing_seed()` — an
@@ -151,24 +146,20 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
     // would silently never fire for exactly the installs that most need it
     crate::discord::migrate_legacy_seed_path(&cfg.agent_home);
 
-    // built once, here, rather than lazily on first run — a bad wasm_path
+    // checked once, here, rather than on first run — a bad agent_path
     // should fail gateway startup loudly, not surface as a mysterious first
     // request failure
-    let cache_wasm_module = Config::load(&cfg.agent_home).map(|c| c.runtime.cache_wasm_module).unwrap_or(false);
-    let wasm_runtime = if cache_wasm_module {
-        Some(Arc::new(crate::WasmRuntime::build(&cfg.wasm_path.to_string_lossy())?))
-    } else {
-        None
-    };
+    if !cfg.agent_path.is_file() {
+        anyhow::bail!("agent binary {} doesn't exist", cfg.agent_path.display());
+    }
 
     let state = Arc::new(AppState {
         agent_home: cfg.agent_home,
-        wasm_path: cfg.wasm_path,
+        agent_path: cfg.agent_path,
         token: cfg.token,
         session_locks: KeyedLocks::new(),
         task_run_locks: KeyedLocks::new(),
         active_runs: std::sync::atomic::AtomicUsize::new(0),
-        wasm_runtime,
     });
 
     let api = Router::new()
@@ -472,6 +463,51 @@ fn write_last_core_run(agent_home: &Path, now: i64) {
     let _ = std::fs::write(path, now.to_string());
 }
 
+fn maintenance_run_counts_path(agent_home: &Path) -> PathBuf {
+    agent_home.join("logs/maintenance_run_counts.json")
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct TierRunCounts {
+    #[serde(default)]
+    ran: u64,
+    #[serde(default)]
+    skipped: u64,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct MaintenanceRunCounts {
+    #[serde(default)]
+    daily_maintenance: TierRunCounts,
+    #[serde(default)]
+    maintenance_summary: TierRunCounts,
+    #[serde(default)]
+    core_distillation: TierRunCounts,
+}
+
+/// Visibility into whether the short-circuits above are actually engaging —
+/// `scheduler_loop` is the only writer (one tick at a time, sequential, no
+/// concurrent callers), so unlike `BudgetTracker` this needs no file lock.
+/// `ran` counts a tier actually spawning an LLM pass; `skipped` counts the
+/// host-only "nothing new" path. A `daily_maintenance.skipped` that never
+/// climbs despite quiet hours is the signal `has_new_log_entries` isn't
+/// excluding something it should.
+fn record_maintenance_tier(agent_home: &Path, pick: impl Fn(&mut MaintenanceRunCounts) -> &mut TierRunCounts, ran: bool) {
+    let path = maintenance_run_counts_path(agent_home);
+    let mut counts: MaintenanceRunCounts =
+        std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    let tier = pick(&mut counts);
+    if ran {
+        tier.ran += 1;
+    } else {
+        tier.skipped += 1;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, serde_json::to_string(&counts).unwrap_or_default());
+}
+
 /// Pure host-side check, no LLM involved — `memory/notes/` should show at
 /// least one real git commit within `window_secs` if the hourly
 /// `daily_maintenance` passes during that window are actually distilling
@@ -511,6 +547,15 @@ fn verify_recent_distillation(agent_home: &Path, window_secs: i64) {
 /// `scheduler_loop` decide *whether* a `daily_maintenance` run has anything
 /// to review at all before paying for the LLM call that would otherwise
 /// just come back saying "nothing new since the last maintenance run".
+/// A tier's own run logs itself unconditionally (`agent_loop.rs`'s
+/// `write_memory_note` is called at the end of *every* `run()`, `trigger`
+/// type included) — without this exclusion, `daily_maintenance`'s own
+/// completion entry would itself count as "new log activity" on the very
+/// next check, making the short-circuit below never actually engage: a
+/// tier that ran once would keep re-triggering itself forever purely from
+/// its own bookkeeping, independent of whether anything real ever happened.
+const MAINTENANCE_TRIGGER_TYPES: &[&str] = &["daily_maintenance", "maintenance_summary", "core_distillation"];
+
 fn has_new_log_entries(agent_home: &Path, since_ts: i64) -> bool {
     let today_day = crate::logs::now_unix_secs() / 86_400;
     let since_day = if since_ts <= 0 { today_day } else { since_ts / 86_400 };
@@ -521,9 +566,15 @@ fn has_new_log_entries(agent_home: &Path, since_ts: i64) -> bool {
             let Some(start) = block.find("(ts=") else { continue };
             let rest = &block[start + 4..];
             let Some(end) = rest.find(')') else { continue };
-            if rest[..end].parse::<i64>().is_ok_and(|ts| ts > since_ts) {
-                return true;
+            let Ok(ts) = rest[..end].parse::<i64>() else { continue };
+            if ts <= since_ts {
+                continue;
             }
+            let trigger_type = block.split("trigger: ").nth(1).and_then(|s| s.split_whitespace().next()).unwrap_or("");
+            if MAINTENANCE_TRIGGER_TYPES.contains(&trigger_type) {
+                continue;
+            }
+            return true;
         }
     }
     false
@@ -669,7 +720,9 @@ async fn scheduler_loop(state: Arc<AppState>) {
                 // review of [last_maintenance, now), so it's safe to advance
                 // the checkpoint same as a real completed run would.
                 write_last_maintenance(&state.agent_home, now);
+                record_maintenance_tier(&state.agent_home, |c| &mut c.daily_maintenance, false);
             } else {
+                record_maintenance_tier(&state.agent_home, |c| &mut c.daily_maintenance, true);
                 // `tokio::spawn`, not `.await` — a real LLM-driven pass here
                 // has taken several minutes in practice, and this loop is
                 // the *only* place a `scheduled_task`'s exact-minute cron
@@ -725,7 +778,9 @@ async fn scheduler_loop(state: Arc<AppState>) {
                 // nothing to merge or escalate from, so this counts as a
                 // full review of [last_summary, now) same as a real run.
                 write_last_maintenance_summary(&state.agent_home, now);
+                record_maintenance_tier(&state.agent_home, |c| &mut c.maintenance_summary, false);
             } else {
+                record_maintenance_tier(&state.agent_home, |c| &mut c.maintenance_summary, true);
                 // spawned for the same reason as daily_maintenance above —
                 // see that block's comment.
                 maintenance_summary_running.store(true, Ordering::SeqCst);
@@ -753,7 +808,9 @@ async fn scheduler_loop(state: Arc<AppState>) {
                 // nothing new to promote/demote from; same "the check itself
                 // is a full review" reasoning as the other two tiers.
                 write_last_core_run(&state.agent_home, now);
+                record_maintenance_tier(&state.agent_home, |c| &mut c.core_distillation, false);
             } else {
+                record_maintenance_tier(&state.agent_home, |c| &mut c.core_distillation, true);
                 core_distillation_running.store(true, Ordering::SeqCst);
                 let spawn_state = state.clone();
                 let running = core_distillation_running.clone();
@@ -947,11 +1004,11 @@ async fn delete_scheduler_task(State(state): State<Arc<AppState>>, AxumPath(id):
 #[derive(Deserialize)]
 struct TaskFileQuery {
     /// a task's `data_path` verbatim — guest-absolute (e.g.
-    /// `/workspace/tasks/x.md`), same root as the wasm preopen
+    /// `/workspace/tasks/x.md`), same root the agent's paths resolve against
     path: String,
 }
 
-/// `data_path` is guest-absolute; the guest's preopen root is exactly
+/// `data_path` is guest-absolute; the agent's filesystem root is exactly
 /// `agent_home`, so the host-side file lives at `agent_home/<path minus
 /// leading '/'>`. Rejects any `..` component so this can't be steered
 /// outside agent_home (same shape check as `get_attachment`'s
@@ -1090,7 +1147,6 @@ pub(crate) async fn handle_chat_message(
     // mixing tagged (Discord) and untagged (webui) turns.
     sender: Option<MessageSender>,
 ) -> Value {
-    let mut session = load_session(&state.agent_home, &session_key);
     // an empty text block inside a multimodal content array (attachments
     // with no caption) trips the same "must not be empty" rejection the
     // all-empty-reply guard further down exists for — give it a placeholder
@@ -1105,23 +1161,19 @@ pub(crate) async fn handle_chat_message(
     let sender_label = sender.as_ref().map(|s| format!("{} (id {}, {})", s.name, s.id, if s.is_owner { "owner" } else { "not owner" }));
     let user_turn =
         SessionTurn { role: "user".to_string(), content: display_text, attachments, ts: crate::logs::now_unix_secs(), sender: sender_label };
-    session.push(user_turn.clone());
-    let supports_vision = Config::load(&state.agent_home).map(|c| c.llm.supports_vision).unwrap_or(false);
-    let history: Vec<Value> = session.iter().map(|t| turn_to_message(&state.agent_home, supports_vision, t)).collect();
 
-    // Persisted immediately, not batched with `assistant_turn` after
-    // `run_trigger` — for a session key nobody's ever written to before (a
-    // Discord channel's first-ever message), `discord.rs`'s
-    // `session_watch_loop` baselines on whatever it sees the *first* time
-    // it polls a new key (meant to skip replaying old history after a
-    // restart). If user+assistant landed together in one write, that first
-    // sighting already contains the never-sent assistant reply — the loop
-    // treats it as "old history" and silently swallows it instead of
-    // delivering it. Writing the user turn alone right away gives the loop
-    // something harmless to baseline on (it only ever sends `assistant`-
-    // role turns, so this is never itself delivered anywhere), so the
-    // assistant turn appended below after `run_trigger` is a genuine,
-    // detectable append.
+    // Persisted immediately, not batched with `assistant_turn` after the run
+    // — for a session key nobody's ever written to before (a Discord
+    // channel's first-ever message), `discord.rs`'s `session_watch_loop`
+    // baselines on whatever it sees the *first* time it polls a new key
+    // (meant to skip replaying old history after a restart). If user+
+    // assistant landed together in one write, that first sighting already
+    // contains the never-sent assistant reply — the loop treats it as "old
+    // history" and silently swallows it instead of delivering it. Writing
+    // the user turn alone right away gives the loop something harmless to
+    // baseline on (it only ever sends `assistant`-role turns, so this is
+    // never itself delivered anywhere), so the assistant turn appended below
+    // after the run is a genuine, detectable append.
     {
         let agent_home = state.agent_home.clone();
         let key = session_key.clone();
@@ -1130,6 +1182,27 @@ pub(crate) async fn handle_chat_message(
             let _ = crate::logs::notify(&state.agent_home, &format!("failed to save this turn to session {session_key}: {e}"));
         }
     }
+
+    // Snapshot: this specific message's view of the conversation, frozen to
+    // its own real file the moment it arrives — *before* it ever waits on
+    // `run_trigger`'s session lock, same timing as `history` always had. Two
+    // people messaging the same session close together each get their own
+    // distinct, uniquely-named snapshot (not one shared/overwritten file),
+    // so a message that ends up queued behind another still-running one
+    // keeps exactly the view it had when it arrived, and each is deleted
+    // once its own run finishes — nothing permanent left behind, but the
+    // exact context a specific run acted on is inspectable on disk while
+    // it's still in flight or if something goes wrong mid-run.
+    let mut session = load_session(&state.agent_home, &session_key);
+    session.push(user_turn.clone());
+    let supports_vision = Config::load(&state.agent_home).map(|c| c.llm.supports_vision).unwrap_or(false);
+    let history: Vec<Value> = session.iter().map(|t| turn_to_message(&state.agent_home, supports_vision, t)).collect();
+    let snapshot_nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let snapshot_path = session_dir(&state.agent_home, &session_key).join(format!("run_snapshot_{snapshot_nanos}.json"));
+    if let Some(parent) = snapshot_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&snapshot_path, serde_json::to_string(&history).unwrap_or_default());
 
     let mut trigger = json!({"type": "message", "text": text, "history": history, "session_key": session_key});
     if let Some(c) = channel {
@@ -1159,6 +1232,7 @@ pub(crate) async fn handle_chat_message(
         trigger["sender_label"] = Value::String(label.clone());
     }
     let outcome = run_trigger(state.clone(), trigger).await;
+    let _ = std::fs::remove_file(&snapshot_path); // this run is done — its own snapshot has no further use
 
     let mut reply = outcome.get("result").and_then(|r| r.get("summary")).and_then(|s| s.as_str()).unwrap_or("").to_string();
     // an empty `content` here isn't just a bad UX moment — it gets baked
@@ -1356,9 +1430,9 @@ async fn post_wake(State(state): State<Arc<AppState>>, Json(trigger): Json<Value
     Json(run_trigger(state, trigger).await)
 }
 
-/// Runs one trigger in-process (`spawn_blocking`, since wasmtime + reqwest's
-/// blocking client both panic if driven directly on a tokio runtime
-/// thread). Locking is per-session, for any trigger that actually touches a
+/// Runs one trigger as a fresh agent process (`spawn_blocking`, since the
+/// syscall loop and reqwest's blocking client both block / panic if driven
+/// directly on a tokio runtime thread). Locking is per-session, for any trigger that actually touches a
 /// session — `message` (a live turn) and `compact_session` (reads +
 /// rewrites the same `session.json`, see `compact_session_key`) — see
 /// `AppState::session_locks`'s doc comment for why everything else runs
@@ -1385,29 +1459,20 @@ async fn run_trigger(state: Arc<AppState>, trigger: Value) -> Value {
 
 async fn run_trigger_inner(state: &Arc<AppState>, trigger: Value) -> Value {
     let agent_home = state.agent_home.clone();
-    let wasm_path = state.wasm_path.clone();
+    let agent_path = state.agent_path.clone();
     let trigger_str = trigger.to_string();
-    let wasm_runtime = state.wasm_runtime.clone();
 
     let outcome = tokio::task::spawn_blocking(move || {
         let agent_home = agent_home.to_string_lossy().into_owned();
-        match wasm_runtime {
-            Some(runtime) => {
-                let epoch_timeout = crate::epoch_timeout_for(&agent_home);
-                crate::run_agent_with_runtime(&agent_home, &runtime, &["run", &trigger_str], epoch_timeout)
-            }
-            None => {
-                let wasm_path = wasm_path.to_string_lossy().into_owned();
-                crate::run_agent(&agent_home, &wasm_path, &["run", &trigger_str])
-            }
-        }
+        let agent_path = agent_path.to_string_lossy().into_owned();
+        crate::run_agent(&agent_home, &agent_path, &["run", &trigger_str])
     })
     .await;
 
     match outcome {
         Ok(Ok(outcome)) => {
-            // `outcome.trapped` means the guest never reached its own
-            // `RESULT:` line (almost always the epoch-timeout trap mid-turn
+            // `outcome.trapped` means the agent never reached its own
+            // `RESULT:` line (almost always the run-timeout kill mid-turn
             // — see `run_agent_with_epoch_timeout`'s doc comment) — without
             // this, `result` stays `null` and every caller (the webui's
             // Schedule history panel included) has no way to tell "it
@@ -1415,7 +1480,7 @@ async fn run_trigger_inner(state: &Arc<AppState>, trigger: Value) -> Value {
             // say", both of which otherwise render as the same unhelpful
             // "(no summary)".
             let result = if outcome.trapped {
-                json!({"summary": "(run timed out — trapped mid-turn with no result, see notifications log)"})
+                json!({"summary": "(run timed out — killed mid-turn with no result, see notifications log)"})
             } else {
                 extract_result(&outcome.stdout)
             };
@@ -1869,14 +1934,25 @@ struct SessionTurn {
 /// just gets named in the text so the agent can `read_file`/`list_dir` it
 /// itself instead of the model silently never learning it exists.
 fn turn_to_message(agent_home: &Path, supports_vision: bool, turn: &SessionTurn) -> Value {
-    // `sender` only ever set on a `role: "user"` turn (see its doc comment)
-    // — prefixed onto every historical turn that has one, not just the
-    // newest, so a shared multi-person channel session's `history` lets the
-    // model tell past turns apart by who actually said them.
-    let content = match &turn.sender {
-        Some(label) => format!("[{label}] {}", turn.content),
-        None => turn.content.clone(),
-    };
+    // `[timestamp]` first, then `[sender]` — `sender` only ever set on a
+    // `role: "user"` turn (see its doc comment), prefixed onto every
+    // historical turn that has one, not just the newest, so a shared
+    // multi-person channel session's `history` lets the model tell past
+    // turns apart by who actually said them. The timestamp is unconditional
+    // (every turn has one) — without it the model has no way to tell "this
+    // was 5 turns ago" from "this was 3 days ago" in a resumed session, and
+    // (2026-07-21) no way to notice a reply landed on a stale view of a
+    // fast-moving multi-person conversation. `turn.ts` is fixed once a turn
+    // is written, unlike `## Current time` (agent_loop.rs's `volatile`
+    // block) which is deliberately recomputed every run — so, unlike that
+    // one, prefixing it here doesn't defeat prefix caching turn over turn
+    // (see kernel/src/logs.rs's `human_timestamp` doc comment).
+    let content = format!(
+        "[{}]{} {}",
+        crate::logs::human_timestamp(turn.ts),
+        turn.sender.as_ref().map(|label| format!(" [{label}]")).unwrap_or_default(),
+        turn.content
+    );
     if turn.attachments.is_empty() {
         return json!({"role": turn.role, "content": content});
     }
@@ -2024,7 +2100,7 @@ async fn post_session_reset(State(state): State<Arc<AppState>>) -> Json<Value> {
 /// mention command (discord.rs) — same mechanism, keyed by whichever
 /// session it's asked for. Takes the same per-session lock `run_trigger`
 /// does for `message`/`compact_session` — this doesn't go through
-/// `run_trigger` at all (pure filesystem, no wasmtime run needed), but
+/// `run_trigger` at all (pure filesystem, no agent run needed), but
 /// without the lock a Reset click landing while that session's own
 /// in-flight `message` run is mid-turn could race: the run's own
 /// end-of-turn `session.json` write could land *after* this clears it,
@@ -2472,6 +2548,71 @@ mod scheduled_task_retry_tests {
         assert!(outcome_aborted(&serde_json::json!({"ok": false, "error": "spawn failed"})));
         assert!(outcome_aborted(&serde_json::json!({"ok": true, "result": {"summary": "run aborted: llm_call failed 3x in a row"}})));
         assert!(!outcome_aborted(&serde_json::json!({"ok": true, "result": {"summary": "did the thing successfully"}})));
+    }
+}
+
+#[cfg(test)]
+mod has_new_log_entries_tests {
+    use super::*;
+    use std::fs;
+
+    fn write_log_day(agent_home: &Path, day: &str, contents: &str) {
+        let dir = agent_home.join("logs/run_log").join(day);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("log.md"), contents).unwrap();
+    }
+
+    /// Reproduces the self-feeding loop this test guards against: a
+    /// `daily_maintenance` run's own completion is logged via
+    /// `write_memory_note` (unconditional for every trigger type) with a ts
+    /// after the checkpoint that gated it — before the fix, this alone made
+    /// `has_new_log_entries` return true on the very next check forever,
+    /// independent of whether anything external ever happened.
+    #[test]
+    fn ignores_a_tiers_own_bookkeeping_entry() {
+        let dir = tempfile_dir();
+        let today = crate::logs::civil_from_days(crate::logs::now_unix_secs() / 86_400);
+        write_log_day(
+            &dir,
+            &today,
+            "\n## run at 2026-07-21 19:13:00 UTC (ts=2000)\ntrigger: daily_maintenance — nothing new\nsummary: nothing new\n",
+        );
+        assert!(!has_new_log_entries(&dir, 1000), "a tier's own daily_maintenance/maintenance_summary/core_distillation entry must not count as new activity");
+    }
+
+    #[test]
+    fn still_detects_a_real_message_event() {
+        let dir = tempfile_dir();
+        let today = crate::logs::civil_from_days(crate::logs::now_unix_secs() / 86_400);
+        write_log_day(
+            &dir,
+            &today,
+            "\n## run at 2026-07-21 19:13:00 UTC (ts=2000)\ntrigger: message [webui] — hi\nsummary: replied\n",
+        );
+        assert!(has_new_log_entries(&dir, 1000), "a real chat message must still count as new activity");
+    }
+
+    #[test]
+    fn mixed_log_finds_the_real_event_past_the_bookkeeping_noise() {
+        let dir = tempfile_dir();
+        let today = crate::logs::civil_from_days(crate::logs::now_unix_secs() / 86_400);
+        write_log_day(
+            &dir,
+            &today,
+            "\n## run at 2026-07-21 19:13:00 UTC (ts=2000)\ntrigger: daily_maintenance — nothing new\nsummary: nothing new\n\
+             \n## run at 2026-07-21 20:00:00 UTC (ts=2500)\ntrigger: cron — scheduled task fired\nsummary: sent report\n",
+        );
+        assert!(has_new_log_entries(&dir, 1000));
+    }
+
+    fn tempfile_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ebina-gateway-test-{}-{}", std::process::id(), rand_suffix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn rand_suffix() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64
     }
 }
 

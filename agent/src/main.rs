@@ -5,8 +5,9 @@ mod scheduler;
 mod skills;
 mod syscall;
 mod time;
+mod vfs;
 
-use std::fs;
+use crate::vfs as fs;
 use std::io::Write;
 
 fn main() {

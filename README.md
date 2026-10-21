@@ -1,13 +1,13 @@
-# ebina — WASM Agent OS
+# ebina — Agent OS
 
 Toy microkernel agent OS. See [PROJECT.md](PROJECT.md) for full design/TODO.
 
 ## Layout
 
-- `kernel/` — host binary: wasmtime embed, syscalls, gateway. **Pure API
+- `kernel/` — host binary: agent process runner, syscalls, gateway. **Pure API
   server** — it has no knowledge of `webui/` at all, not even a static file
   path; `/` returns a plain 404.
-- `agent/` — guest agent, built to `wasm32-wasip1`
+- `agent/` — the agent, a native binary the kernel spawns once per run
 - `webui/` — the gateway's web UI: a fully independent Vite + Vue project.
   Nothing wires it to `kernel/` except both talking to the same `/api/*` HTTP
   surface — no shared code, no build-time embedding, no runtime static-file
@@ -17,23 +17,33 @@ Toy microkernel agent OS. See [PROJECT.md](PROJECT.md) for full design/TODO.
   together behind one port (`agent run`), and spins up local Docker deps
   for `[embed]`/`[search]`/`[ssh]` (`local-deps start`). Depends on `kernel`
   as a library; deliberately never touches `kernel`'s own CLI/`main.rs`.
-  `agent.wasm` and the built `webui/dist/` are embedded into the `ebinactl`
+  the `agent` binary and the built `webui/dist/` are embedded into the `ebinactl`
   binary itself at compile time (`cli/src/embedded.rs`) — `init` writes them
   out, no separate build/copy step for a human running it.
 - an **`ebinactl` workspace** (e.g. `./ebina`, or `tmp/main` in this repo's
   own dev/test setup) — the container a running agent actually lives in:
-  `<workspace>/agent-home/` (the sandboxed guest root: config, memory,
+  `<workspace>/agent-home/` (the agent's filesystem root: config, memory,
   workspace, logs), plus host-only siblings `<workspace>/secrets.toml`,
-  `<workspace>/.git` (autocommit history), `<workspace>/agent.wasm`,
+  `<workspace>/.git` (autocommit history), `<workspace>/agent`,
   `<workspace>/webui/`. One workspace = one self-contained agent; nothing
   inside it ever depends on where `ebinactl` itself was built or run from.
 
 ## Architecture
 
-Core idea: **full autonomy inside the sandbox, a minimal boundary around
-it.** The security boundary is the wasmtime `Store` boundary — not content
-filtering, not a permissions list the model has to respect, just "the guest
-physically cannot call anything except what's wired up as a syscall."
+Core idea: **full autonomy inside agent-home, a minimal boundary around
+it.** The agent runs as a plain native child process of the kernel. The
+model never runs code of its own — it can only pick from the agent's fixed
+action set, and every action that reaches outside agent-home (LLM, network,
+SSH, the database, notifications) is a kernel syscall sent over a private
+socket. File actions go through the agent's path layer (`agent/src/vfs.rs`),
+which re-roots every path at agent-home and refuses `..`/symlink escapes.
+
+This is *not* a hard sandbox the way the old wasmtime build was: the agent
+process runs with the kernel's own uid, so the containment rests on the
+agent binary being trusted code, not on the OS. What the kernel still
+enforces from outside: a cleared environment (no host secrets), a 512MB
+`RLIMIT_AS` cap, a whole-run wall-clock deadline (SIGKILL), and
+stdout captured to logs.
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -59,18 +69,18 @@ physically cannot call anything except what's wired up as a syscall."
 │         └──────────┬──────────┘            │  schedule_task family   │   │
 │                     ▼                       └────────────┬─────────────┘
 │         ┌─────────────────────────────────────────────────┐          │
-│         │ wasmtime Store — fresh instantiate every single   │          │
-│         │ run, zero state carried over in-process            │          │
-│         │ fuel/epoch limit · memory cap · empty env ·         │        │
-│         │ stdio → log                                          │        │
+│         │ agent process — fresh spawn every single run,     │          │
+│         │ zero state carried over in memory                  │          │
+│         │ run deadline (SIGKILL) · RLIMIT_AS · empty env ·    │        │
+│         │ stdout → log · syscalls over socketpair fd 3        │        │
 │         │  ┌──────────────────────────────────────────────┐   │        │
-│         │  │ agent.wasm — the *only* code that can ever      │   │        │
+│         │  │ agent (native) — the *only* code that can ever  │   │        │
 │         │  │ emit a syscall                                  │   │        │
 │         │  └──────────────────────────────────────────────┘   │        │
 │         └────────────────────────┬────────────────────────────┘        │
-│                                   │ WASI preopen                        │
+│                                   │ cwd + vfs path layer                │
 │         ┌─────────────────────────▼───────────────────────────┐        │
-│         │ agent-home/ — the entire "/" the guest can see         │      │
+│         │ agent-home/ — the entire "/" the agent can see         │      │
 │         │  config.toml · SOUL.md · memory/(notes, skills,        │      │
 │         │  index.db) · workspace/ · scheduler/ · logs/            │      │
 │         └───────────────────────────────────────────────────────┘      │
@@ -86,7 +96,7 @@ physically cannot call anything except what's wired up as a syscall."
 
 **Every run is stateless, persistent on disk.** Each trigger
 (`message`/`cron`/`daily_maintenance`/`scheduled_task`/`manual`) gets a
-brand-new wasmtime instantiation — nothing survives in memory between runs.
+brand-new agent process — nothing survives in memory between runs.
 What *does* persist is entirely on the filesystem, under `agent-home/`:
 `memory/notes/` (RAG-searched curated facts + a raw per-run log, see
 [Memory](#memory-memorynotes-rag--daily_maintenance) below),
@@ -167,9 +177,9 @@ is one binary:
 
 ```bash
 cargo build -p kernel
-cargo build -p agent --target wasm32-wasip1 --release
+cargo build -p agent --release
 cd webui && npm install && npm run build && cd ..   # produces webui/dist/
-cargo build -p ebinactl   # embeds the wasm + webui build from the two steps above
+cargo build -p ebinactl   # embeds the agent binary + webui build from the two steps above
 ```
 
 ```bash
@@ -185,7 +195,7 @@ files + a reverse proxy to `/api/*`) on the public `--port` — one origin, no
 CORS, matches how the Vite dev proxy behaves. If `<workspace>/webui/` isn't
 there (or was never written), it just serves the bare `/api/*` gateway on
 `--port` directly. See `ebinactl --help` / `ebinactl agent --help` for every
-flag (`--wasm`, `--webui`, `--port`, workspace defaults to `./ebina`).
+flag (`--agent`, `--webui`, `--port`, workspace defaults to `./ebina`).
 
 The gateway's login token is **not** an env var — it's the `gateway_token`
 entry `agent init` generates in `<workspace>/secrets.toml` (kernel refuses to
@@ -217,7 +227,8 @@ for iterating on `kernel`/`webui` themselves without rebuilding the CLI:
 
 ```bash
 # terminal 1 — the gateway only
-AGENT_HOME=tmp/main/agent-home AGENT_WASM=target/wasm32-wasip1/debug/agent.wasm GATEWAY_PORT=8099 cargo run -p kernel -- serve
+cargo build -p agent
+AGENT_HOME=tmp/main/agent-home AGENT_BIN=target/debug/agent GATEWAY_PORT=8099 cargo run -p kernel -- serve
 
 # terminal 2 — Vite dev server on :5173, proxies /api to localhost:8099
 # (see webui/vite.config.js) so the browser only ever talks to one origin
@@ -227,7 +238,7 @@ cd webui && npm run dev
 One-off single trigger, no gateway (mainly for dev/testing):
 
 ```bash
-AGENT_HOME=tmp/main/agent-home cargo run -p kernel -- target/wasm32-wasip1/debug/agent.wasm run '{"type":"manual","text":"..."}'
+AGENT_HOME=tmp/main/agent-home cargo run -p kernel -- target/debug/agent run '{"type":"manual","text":"..."}'
 ```
 
 ## Credentials
@@ -345,20 +356,6 @@ should), and the 2 most recent messages gets summarized via one extra
 loop had no backstop of its own and could blow its own context before ever
 reaching `done`.
 
-### Wasm runtime reuse (`runtime.cache_wasm_module`)
-
-`false` by default: every run compiles `agent.wasm` fresh
-(`Module::from_file`), which costs a recompile per trigger but means a
-hot-swapped wasm binary on disk takes effect on the very next run with no
-gateway restart — handy while iterating on `agent/`. Set `true` and the
-gateway builds the wasmtime `Engine`/`Linker`/`Module` once at startup and
-every run reuses them, skipping the recompile; a hot-swapped `agent.wasm`
-then needs a restart to be picked up. Either way the `Store` — the part
-that actually holds a run's state — is always fresh per run; sharing the
-other three is safe under real concurrency (they're immutable and
-Send+Sync once built, wasmtime's own pattern for many concurrent `Store`s
-off one `Engine`), not a correctness switch.
-
 ## LLM / embed providers
 
 `[llm]`/`[embed]` each have a `provider` field (`"anthropic"`, `"ollama"`, or
@@ -390,9 +387,7 @@ api_key = "{secrets.kimi}"
 ### No embed provider available? Run one locally
 
 Some API keys (e.g. an Ollama Cloud key on the free tier) only cover chat
-models, not embeddings. Rather than trying to run an embedding model *inside*
-the wasm sandbox (see below for why not), run Ollama locally as the embed
-backend:
+models, not embeddings. Run Ollama locally as the embed backend:
 
 ```bash
 # no sudo needed — extract anywhere, e.g. ~/.local/ollama
@@ -412,31 +407,13 @@ provider = "ollama"
 api_key = "{secrets.local}"   # value ignored by an unauthenticated local server
 ```
 
-### Why not run the embedding model inside the wasm sandbox instead?
-
-Would avoid the local-install step, but not worth it:
-
-- **Efficiency**: wasm32-wasip1 has no stable SIMD, is single-threaded, and
-  is capped at 512MB memory (PROJECT.md 4.1). Transformer inference that
-  takes single-digit milliseconds natively can take orders of magnitude
-  longer under those constraints.
-- **Doesn't fit the security model**: `embed`/`llm_call` are designed as
-  syscalls precisely so the API key (or, for local inference, the model
-  weights) stays on the host side. Moving inference into the guest either
-  ships model weights into the sandbox for no security benefit, or still
-  ends up calling back out to the host for the actual compute — at which
-  point it's just a syscall with extra steps.
-
-Host-side inference (local Ollama or a cloud API) through the existing
-`embed` syscall is the intended design, not a workaround.
-
 ## Directory/file management (`list_dir`/`make_dir`/`delete_path` actions)
 
 `read_file`/`write_file` only handle one already-known file each — these
 three cover "what's actually in this directory" and basic file/directory
 management. Same as `read_file`/`write_file`, these run guest-side against
-the agent's own already-preopened `/` (`agent_loop.rs`, plain `std::fs`) —
-no separate sandbox, no host syscall, since it's the agent's own trusted
+the agent's own `/` (`agent_loop.rs` through `vfs.rs`'s re-rooting path
+layer) — no host syscall, since it's the agent's own trusted
 code operating on its own already-fully-accessible agent-home, not
 untrusted code that needs isolating:
 

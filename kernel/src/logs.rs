@@ -23,6 +23,17 @@ pub fn today_utc() -> String {
     civil_from_days(days)
 }
 
+/// `YYYY-MM-DD HH:MM:SS UTC` — host-side mirror of `agent/src/time.rs`'s
+/// `human_timestamp` (same reasoning: no chrono dependency for one field).
+/// Used to prefix each `history` turn `gateway.rs`'s `turn_to_message` sends
+/// to the LLM with when it was actually said, not just who said it.
+pub fn human_timestamp(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let time_of_day = secs.rem_euclid(86_400);
+    let (h, m, s) = (time_of_day / 3600, (time_of_day % 3600) / 60, time_of_day % 60);
+    format!("{} {h:02}:{m:02}:{s:02} UTC", civil_from_days(days))
+}
+
 // days-since-epoch -> proleptic Gregorian date, Howard Hinnant's algorithm
 // (std has no chrono; this avoids pulling in a date crate for one field).
 // `pub(crate)` — `gateway.rs`'s maintenance skip-checks need to build the

@@ -1,9 +1,9 @@
 use std::fs;
 use std::path::PathBuf;
 
-fn agent_wasm_path() -> String {
+fn agent_bin_path() -> String {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    format!("{manifest_dir}/../target/wasm32-wasip1/debug/agent.wasm")
+    format!("{manifest_dir}/../target/debug/agent")
 }
 
 fn scratch_agent_home(name: &str) -> PathBuf {
@@ -16,7 +16,7 @@ fn scratch_agent_home(name: &str) -> PathBuf {
 #[test]
 fn http_fetch_denies_localhost() {
     let home = scratch_agent_home("localhost");
-    let out = kernel::run_agent(home.to_str().unwrap(), &agent_wasm_path(), &["http_fetch_ssrf_localhost"])
+    let out = kernel::run_agent(home.to_str().unwrap(), &agent_bin_path(), &["http_fetch_ssrf_localhost"])
         .expect("run_agent should not error")
         .stdout;
     assert!(out.contains("\"code\":\"denied_ip\""), "expected localhost to be denied, got: {out}");
@@ -25,7 +25,7 @@ fn http_fetch_denies_localhost() {
 #[test]
 fn http_fetch_denies_rfc1918_private_range() {
     let home = scratch_agent_home("private");
-    let out = kernel::run_agent(home.to_str().unwrap(), &agent_wasm_path(), &["http_fetch_ssrf_private"])
+    let out = kernel::run_agent(home.to_str().unwrap(), &agent_bin_path(), &["http_fetch_ssrf_private"])
         .expect("run_agent should not error")
         .stdout;
     assert!(out.contains("\"code\":\"denied_ip\""), "expected 192.168.x.x to be denied, got: {out}");
@@ -34,7 +34,7 @@ fn http_fetch_denies_rfc1918_private_range() {
 #[test]
 fn http_fetch_denies_cloud_metadata_endpoint() {
     let home = scratch_agent_home("metadata");
-    let out = kernel::run_agent(home.to_str().unwrap(), &agent_wasm_path(), &["http_fetch_ssrf_metadata"])
+    let out = kernel::run_agent(home.to_str().unwrap(), &agent_bin_path(), &["http_fetch_ssrf_metadata"])
         .expect("run_agent should not error")
         .stdout;
     assert!(out.contains("\"code\":\"denied_ip\""), "expected 169.254.169.254 to be denied, got: {out}");
@@ -43,7 +43,7 @@ fn http_fetch_denies_cloud_metadata_endpoint() {
 #[test]
 fn http_fetch_rejects_oversized_url() {
     let home = scratch_agent_home("longurl");
-    let out = kernel::run_agent(home.to_str().unwrap(), &agent_wasm_path(), &["http_fetch_long_url"])
+    let out = kernel::run_agent(home.to_str().unwrap(), &agent_bin_path(), &["http_fetch_long_url"])
         .expect("run_agent should not error")
         .stdout;
     assert!(out.contains("\"code\":\"url_too_long\""), "expected oversized url to be rejected, got: {out}");
@@ -57,7 +57,7 @@ fn http_fetch_rejects_oversized_url() {
 #[test]
 fn http_fetch_post_actually_posts() {
     let home = scratch_agent_home("post");
-    let out = kernel::run_agent(home.to_str().unwrap(), &agent_wasm_path(), &["http_fetch_post"])
+    let out = kernel::run_agent(home.to_str().unwrap(), &agent_bin_path(), &["http_fetch_post"])
         .expect("run_agent should not error")
         .stdout;
     assert!(out.contains("\"ok\":true"), "expected the POST to complete, got: {out}");
@@ -71,7 +71,7 @@ fn http_fetch_post_actually_posts() {
 #[test]
 fn http_fetch_rejects_unbound_secret_placeholder() {
     let home = scratch_agent_home("unboundsecret");
-    let out = kernel::run_agent(home.to_str().unwrap(), &agent_wasm_path(), &["http_fetch_secret_header"])
+    let out = kernel::run_agent(home.to_str().unwrap(), &agent_bin_path(), &["http_fetch_secret_header"])
         .expect("run_agent should not error")
         .stdout;
     assert!(out.contains("\"code\":\"bad_secret_placeholder\""), "expected an unbound secret placeholder to be rejected, got: {out}");
@@ -85,12 +85,12 @@ fn http_fetch_daily_request_cap_is_enforced() {
     let home = scratch_agent_home("dailycap");
     fs::write(home.join("config.toml"), "[network]\ndaily_request_cap = 1\n").unwrap();
 
-    let first = kernel::run_agent(home.to_str().unwrap(), &agent_wasm_path(), &["http_fetch_demo"])
+    let first = kernel::run_agent(home.to_str().unwrap(), &agent_bin_path(), &["http_fetch_demo"])
         .expect("run_agent should not error")
         .stdout;
     assert!(first.contains("\"ok\":true"), "first request should succeed within cap, got: {first}");
 
-    let second = kernel::run_agent(home.to_str().unwrap(), &agent_wasm_path(), &["http_fetch_demo"])
+    let second = kernel::run_agent(home.to_str().unwrap(), &agent_bin_path(), &["http_fetch_demo"])
         .expect("run_agent should not error")
         .stdout;
     assert!(

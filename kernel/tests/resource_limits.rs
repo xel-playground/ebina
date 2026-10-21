@@ -2,9 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-fn agent_wasm_path() -> String {
+fn agent_bin_path() -> String {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    format!("{manifest_dir}/../target/wasm32-wasip1/debug/agent.wasm")
+    format!("{manifest_dir}/../target/debug/agent")
 }
 
 fn scratch_agent_home(name: &str) -> PathBuf {
@@ -17,7 +17,7 @@ fn scratch_agent_home(name: &str) -> PathBuf {
 #[test]
 fn memory_cap_stops_oversized_allocation() {
     let home = scratch_agent_home("memory");
-    let outcome = kernel::run_agent(home.to_str().unwrap(), &agent_wasm_path(), &["memory_hog"])
+    let outcome = kernel::run_agent(home.to_str().unwrap(), &agent_bin_path(), &["memory_hog"])
         .expect("run_agent should not error even if the guest aborts");
     assert!(
         !outcome.stdout.contains("RESULT:allocated"),
@@ -32,7 +32,7 @@ fn epoch_timeout_traps_a_stuck_guest() {
     let start = Instant::now();
     let outcome = kernel::run_agent_with_epoch_timeout(
         home.to_str().unwrap(),
-        &agent_wasm_path(),
+        &agent_bin_path(),
         &["spin_forever"],
         Duration::from_millis(300),
     )

@@ -1,6 +1,6 @@
 use crate::time::now_unix;
 use std::cell::Cell;
-use std::fs;
+use crate::vfs as fs;
 use std::io::Write;
 use std::time::Instant;
 

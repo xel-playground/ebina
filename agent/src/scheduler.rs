@@ -1,5 +1,5 @@
 use serde_json::Value;
-use std::fs;
+use crate::vfs as fs;
 
 /// Mirrors `kernel::scheduler_tasks::ScheduledTask`'s file shape exactly —
 /// one JSON file per task under `/scheduler/`, so the agent can list its own

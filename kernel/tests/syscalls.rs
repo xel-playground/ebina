@@ -2,9 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
-fn agent_wasm_path() -> String {
+fn agent_bin_path() -> String {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    format!("{manifest_dir}/../target/wasm32-wasip1/debug/agent.wasm")
+    format!("{manifest_dir}/../target/debug/agent")
 }
 
 fn scratch_agent_home(name: &str) -> PathBuf {
@@ -17,7 +17,7 @@ fn scratch_agent_home(name: &str) -> PathBuf {
 #[test]
 fn db_exec_attach_is_denied() {
     let home = scratch_agent_home("attach");
-    let out = kernel::run_agent(home.to_str().unwrap(), &agent_wasm_path(), &["db_attach_escape"])
+    let out = kernel::run_agent(home.to_str().unwrap(), &agent_bin_path(), &["db_attach_escape"])
         .expect("run_agent should not error")
         .stdout;
     assert!(
@@ -36,7 +36,7 @@ fn db_exec_slow_query_is_interrupted_by_timeout() {
     let start = Instant::now();
     let outcome = kernel::run_agent(
         home.to_str().unwrap(),
-        &agent_wasm_path(),
+        &agent_bin_path(),
         &["db_slow_query"],
     )
     .expect("run_agent should not error");
@@ -56,7 +56,7 @@ fn db_exec_slow_query_is_interrupted_by_timeout() {
 #[test]
 fn db_exec_create_insert_select_roundtrip() {
     let home = scratch_agent_home("roundtrip");
-    let out = kernel::run_agent(home.to_str().unwrap(), &agent_wasm_path(), &["db_exec"])
+    let out = kernel::run_agent(home.to_str().unwrap(), &agent_bin_path(), &["db_exec"])
         .expect("run_agent should not error")
         .stdout;
     assert!(out.contains("\"text\":\"hello from guest\""), "got: {out}");
@@ -65,7 +65,7 @@ fn db_exec_create_insert_select_roundtrip() {
 #[test]
 fn notify_writes_to_notifications_log() {
     let home = scratch_agent_home("notify");
-    let out = kernel::run_agent(home.to_str().unwrap(), &agent_wasm_path(), &["notify"])
+    let out = kernel::run_agent(home.to_str().unwrap(), &agent_bin_path(), &["notify"])
         .expect("run_agent should not error")
         .stdout;
     assert!(out.contains("\"ok\":true"), "got: {out}");
@@ -77,7 +77,7 @@ fn notify_writes_to_notifications_log() {
 #[test]
 fn sleep_until_is_reported_back_to_host() {
     let home = scratch_agent_home("sleep");
-    let outcome = kernel::run_agent(home.to_str().unwrap(), &agent_wasm_path(), &["sleep_until"])
+    let outcome = kernel::run_agent(home.to_str().unwrap(), &agent_bin_path(), &["sleep_until"])
         .expect("run_agent should not error");
     assert_eq!(outcome.sleep_until, Some(1_900_000_000));
 }
