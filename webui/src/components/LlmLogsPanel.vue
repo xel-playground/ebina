@@ -18,7 +18,10 @@ function replyText(entry) {
 }
 function tokens(entry) {
   const u = entry.response?.usage
-  if (u) return `${u.prompt_tokens ?? u.input_tokens ?? '?'} in / ${u.completion_tokens ?? u.output_tokens ?? '?'} out`
+  if (u) {
+    const cached = u.cache_read_tokens ? ` (${u.cache_read_tokens} cached)` : ''
+    return `${u.prompt_tokens ?? u.input_tokens ?? '?'} in${cached} / ${u.completion_tokens ?? u.output_tokens ?? '?'} out`
+  }
   const r = entry.response || {}
   if (r.prompt_eval_count != null) return `${r.prompt_eval_count} in / ${r.eval_count ?? '?'} out`
   return '—'

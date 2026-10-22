@@ -487,7 +487,7 @@ fn handle_ollama_stream(state: &mut AgentState, body: Value, response: reqwest::
         return error_json("repetition_loop", "model appears stuck repeating itself — generation was cut short automatically");
     }
 
-    record_usage(state, input_tokens, output_tokens, source);
+    record_usage(state, input_tokens, output_tokens, CacheUsage::default(), source);
     ok_json(serde_json::json!({
         "text": text,
         "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
@@ -513,6 +513,7 @@ fn handle_openai_stream(state: &mut AgentState, body: Value, response: reqwest::
     let mut full_thinking = String::new();
     let mut input_tokens = 0u64;
     let mut output_tokens = 0u64;
+    let mut cache = CacheUsage::default();
     let mut aborted = false;
     let mut content_guard = RepeatGuard::new();
     let mut thinking_guard = RepeatGuard::new();
@@ -543,6 +544,10 @@ fn handle_openai_stream(state: &mut AgentState, body: Value, response: reqwest::
         if let Some(usage) = chunk.get("usage").filter(|u| !u.is_null()) {
             input_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(input_tokens);
             output_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(output_tokens);
+            // both are subsets of `prompt_tokens`, not on top of it
+            let details = usage.get("prompt_tokens_details");
+            let field = |name: &str| details.and_then(|d| d.get(name)).and_then(|v| v.as_u64()).unwrap_or(0);
+            cache = CacheUsage { read: field("cached_tokens"), write: field("cache_write_tokens") };
         }
 
         if abort_path.exists() {
@@ -561,7 +566,10 @@ fn handle_openai_stream(state: &mut AgentState, body: Value, response: reqwest::
         &body,
         &serde_json::json!({
             "choices": [{"message": {"content": full_content, "reasoning_content": full_thinking}}],
-            "usage": {"prompt_tokens": input_tokens, "completion_tokens": output_tokens},
+            "usage": {
+                "prompt_tokens": input_tokens, "completion_tokens": output_tokens,
+                "cache_read_tokens": cache.read, "cache_write_tokens": cache.write,
+            },
             "aborted": aborted || stuck,
         }),
         source,
@@ -574,7 +582,7 @@ fn handle_openai_stream(state: &mut AgentState, body: Value, response: reqwest::
         return error_json("repetition_loop", "model appears stuck repeating itself — generation was cut short automatically");
     }
 
-    record_usage(state, input_tokens, output_tokens, source);
+    record_usage(state, input_tokens, output_tokens, cache, source);
     ok_json(serde_json::json!({
         "text": full_content,
         "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
@@ -600,6 +608,7 @@ fn handle_anthropic_stream(state: &mut AgentState, body: Value, response: reqwes
     let mut full_thinking = String::new();
     let mut input_tokens = 0u64;
     let mut output_tokens = 0u64;
+    let mut cache = CacheUsage::default();
     let mut aborted = false;
     let mut content_guard = RepeatGuard::new();
     let mut thinking_guard = RepeatGuard::new();
@@ -612,12 +621,13 @@ fn handle_anthropic_stream(state: &mut AgentState, body: Value, response: reqwes
 
         match chunk.get("type").and_then(|v| v.as_str()).unwrap_or("") {
             "message_start" => {
-                input_tokens = chunk
-                    .get("message")
-                    .and_then(|m| m.get("usage"))
-                    .and_then(|u| u.get("input_tokens"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+                let usage = chunk.get("message").and_then(|m| m.get("usage"));
+                let field = |name: &str| usage.and_then(|u| u.get(name)).and_then(|v| v.as_u64()).unwrap_or(0);
+                // Anthropic counts cache reads/writes *separately* from
+                // `input_tokens` (the uncached remainder) — summed here so
+                // `input_tokens` means the whole prompt for every provider
+                cache = CacheUsage { read: field("cache_read_input_tokens"), write: field("cache_creation_input_tokens") };
+                input_tokens = field("input_tokens") + cache.read + cache.write;
             }
             "content_block_delta" => {
                 if let Some(delta) = chunk.get("delta") {
@@ -658,7 +668,10 @@ fn handle_anthropic_stream(state: &mut AgentState, body: Value, response: reqwes
         &serde_json::json!({
             "content": [{"type": "text", "text": full_content}],
             "thinking": full_thinking,
-            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+            "usage": {
+                "input_tokens": input_tokens, "output_tokens": output_tokens,
+                "cache_read_tokens": cache.read, "cache_write_tokens": cache.write,
+            },
             "aborted": aborted || stuck,
         }),
         source,
@@ -671,14 +684,24 @@ fn handle_anthropic_stream(state: &mut AgentState, body: Value, response: reqwes
         return error_json("repetition_loop", "model appears stuck repeating itself — generation was cut short automatically");
     }
 
-    record_usage(state, input_tokens, output_tokens, source);
+    record_usage(state, input_tokens, output_tokens, cache, source);
     ok_json(serde_json::json!({
         "text": full_content,
         "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
     }))
 }
 
-fn record_usage(state: &mut AgentState, input_tokens: u64, output_tokens: u64, source: &Value) {
+/// Prompt-cache activity for one call, in tokens — both are part of that
+/// call's `input_tokens`, not extra. `read` was served from the provider's
+/// cache (billed at a fraction of the input rate); `write` was written to
+/// it (billed at a premium on GPT-6/Anthropic).
+#[derive(Default, Clone, Copy)]
+struct CacheUsage {
+    read: u64,
+    write: u64,
+}
+
+fn record_usage(state: &mut AgentState, input_tokens: u64, output_tokens: u64, cache: CacheUsage, source: &Value) {
     let total_tokens = input_tokens + output_tokens;
     if let Err(e) = state.budget.record(total_tokens) {
         let _ = crate::logs::notify(&state.agent_home, &format!("failed to record budget: {e}"));
@@ -690,6 +713,8 @@ fn record_usage(state: &mut AgentState, input_tokens: u64, output_tokens: u64, s
             "syscall": "llm_call",
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
+            "cache_read_tokens": cache.read,
+            "cache_write_tokens": cache.write,
             "total_tokens": total_tokens,
             "source": source,
         }),
