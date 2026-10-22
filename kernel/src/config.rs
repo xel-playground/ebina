@@ -15,6 +15,7 @@ pub struct Config {
     pub disk: DiskConfig,
     pub ssh: SshConfig,
     pub runtime: RuntimeConfig,
+    pub memory: MemoryConfig,
 }
 
 impl Default for Config {
@@ -31,6 +32,7 @@ impl Default for Config {
             disk: DiskConfig::default(),
             ssh: SshConfig::default(),
             runtime: RuntimeConfig::default(),
+            memory: MemoryConfig::default(),
         }
     }
 }
@@ -424,5 +426,29 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
             Err(e) => Err(e.into()),
         }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(default)]
+pub struct MemoryConfig {
+    /// target size for one curated `memory/notes/*.md`, in estimated tokens
+    /// (`agent/src/agent_loop.rs`'s `estimate_tokens`: 1 per non-ASCII
+    /// char, 1 per 4 ASCII chars). A note write past it still goes through
+    /// (with a warning), and the note is listed for distillation in the
+    /// next `maintenance_summary`.
+    pub note_soft_max_tokens: u64,
+    /// hard per-note cap — `write_file`/`append_file` refuse a note write
+    /// that would end up over it.
+    ///
+    /// All of these are enforced agent-side; the kernel never reads them. They live
+    /// here so the defaults are documented and `POST /api/config` validates
+    /// them like every other key.
+    pub note_max_tokens: u64,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        MemoryConfig { note_soft_max_tokens: 2000, note_max_tokens: 4000 }
     }
 }

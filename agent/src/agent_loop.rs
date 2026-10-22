@@ -392,6 +392,8 @@ pub fn run(trigger: &Value) {
                         content.chars().count()
                     );
                     serde_json::json!({"ok": false, "error": msg})
+                } else if let Some(msg) = note_size_denial(&path, content) {
+                    serde_json::json!({"ok": false, "error": msg})
                 } else {
                     let _lock = DiskQuotaLock::acquire();
                     let quota = disk_quota_bytes();
@@ -407,7 +409,10 @@ pub fn run(trigger: &Value) {
                             let _ = fs::create_dir_all(parent);
                         }
                         match fs::write(&path, content) {
-                            Ok(()) => serde_json::json!({"ok": true}),
+                            Ok(()) => match note_size_warning(&path, content) {
+                                Some(warning) => serde_json::json!({"ok": true, "warning": warning}),
+                                None => serde_json::json!({"ok": true}),
+                            },
                             Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}),
                         }
                     }
@@ -424,6 +429,8 @@ pub fn run(trigger: &Value) {
                 let content = action.get("content").and_then(|c| c.as_str()).unwrap_or("");
                 let result = if let Some(msg) = write_action_denial(&path, trigger) {
                     serde_json::json!({"ok": false, "error": msg})
+                } else if let Some(msg) = note_size_denial(&path, &(fs::read_to_string(&path).unwrap_or_default() + content)) {
+                    serde_json::json!({"ok": false, "error": msg})
                 } else {
                     let _lock = DiskQuotaLock::acquire();
                     let quota = disk_quota_bytes();
@@ -439,7 +446,10 @@ pub fn run(trigger: &Value) {
                             let _ = fs::create_dir_all(parent);
                         }
                         match fs::OpenOptions::new().create(true).append(true).open(&path).and_then(|mut f| f.write_all(content.as_bytes())) {
-                            Ok(()) => serde_json::json!({"ok": true}),
+                            Ok(()) => match note_size_warning(&path, &fs::read_to_string(&path).unwrap_or_default()) {
+                                Some(warning) => serde_json::json!({"ok": true, "warning": warning}),
+                                None => serde_json::json!({"ok": true}),
+                            },
                             Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}),
                         }
                     }
@@ -1008,7 +1018,8 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String], retrieved_skills: 
                  pass (hourly) now, not a deep review; a separate maintenance_summary run handles \
                  consolidation every 6h. Only what's new since the last run:\n\n{delta}\n\n\
                  Distill anything worth keeping into memory/notes/ (write_file — merge duplicates, prune what's \
-                 stale) — quickly, don't try to be exhaustive, there isn't much new in an hour. Also check \
+                 stale; one topic per file, aiming to keep each under ~{} tokens — start a new, more specific \
+                 note rather than growing one past that) — quickly, don't try to be exhaustive, there isn't much new in an hour. Also check \
                  /workspace/memory/ yourself (list_dir, then read_file anything in there — the log delta above \
                  only tells you a file like that *exists*, not what's actually in it; that's the one place \
                  short-term notes/reminders are expected to live, so that's all you need to check, not all of \
@@ -1027,6 +1038,7 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String], retrieved_skills: 
                  delete_path it — leaving it behind means the same content gets re-noticed and re-considered \
                  every future cycle for no reason. Then write_file a report to \
                  /maintenance_reports/hourly/{}.md summarizing what you did before calling done.\n",
+                note_soft_max_tokens(),
                 crate::time::maintenance_run_id(now_unix())
             )
         }
@@ -1047,9 +1059,10 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String], retrieved_skills: 
                  it (delete_path) if it's not worth keeping. Also merge skills whose descriptions overlap enough \
                  that they're really the same capability. Don't touch skills that have hits, however few.\n\n\
                  Write a consolidated /maintenance_reports/summary/{}.md when done (mention any skill changes \
-                 too), then call done.\n",
+                 too), then call done.\n{}",
                 if since_ts == 0 { "the beginning".to_string() } else { human_timestamp(since_ts) },
-                crate::time::maintenance_run_id(now_unix())
+                crate::time::maintenance_run_id(now_unix()),
+                oversized_notes_section()
             )
         }
         Some("core_distillation") => {
@@ -1415,26 +1428,7 @@ fn recent_staging_entries(max_entries: usize, exclude_session_key: Option<&str>)
 /// ships/documents the setting.
 fn cross_session_staging_entries_config() -> usize {
     const DEFAULT: usize = 5;
-    let config_text = fs::read_to_string("/config.toml").unwrap_or_default();
-    let mut in_chat_section = false;
-    for line in config_text.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            in_chat_section = line == "[chat]";
-            continue;
-        }
-        if !in_chat_section {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("cross_session_staging_entries").map(str::trim_start) {
-            if let Some(value) = rest.strip_prefix('=') {
-                if let Ok(n) = value.trim().parse::<usize>() {
-                    return n;
-                }
-            }
-        }
-    }
-    DEFAULT
+    config_u64("chat", "cross_session_staging_entries").map(|n| n as usize).unwrap_or(DEFAULT)
 }
 
 
@@ -1806,52 +1800,145 @@ const DEFAULT_DISK_QUOTA_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Cargo.toml after the `exec_wasm` detour: one scalar doesn't need a real
 /// TOML parser on the guest side).
 fn disk_quota_bytes() -> u64 {
-    let config_text = fs::read_to_string("/config.toml").unwrap_or_default();
-    let mut in_disk_section = false;
-    for line in config_text.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            in_disk_section = line == "[disk]";
-            continue;
-        }
-        if !in_disk_section {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("quota_bytes").map(str::trim_start) {
-            if let Some(value) = rest.strip_prefix('=') {
-                if let Ok(n) = value.trim().parse::<u64>() {
-                    return n;
-                }
-            }
-        }
-    }
-    DEFAULT_DISK_QUOTA_BYTES
+    config_u64("disk", "quota_bytes").unwrap_or(DEFAULT_DISK_QUOTA_BYTES)
 }
 
-/// Same hand-rolled `[section] key = N` extraction as `disk_quota_bytes` —
-/// see its doc comment for why this doesn't pull in a real TOML parser.
-const DEFAULT_IN_RUN_COMPACT_TOKENS: u64 = 150_000;
-fn in_run_compact_tokens() -> u64 {
+/// Hand-rolled `[section] key = N` extraction from `/config.toml` — flat,
+/// known-shape text, so a real TOML parser isn't worth pulling in (see
+/// `disk_quota_bytes`'s doc comment). `None` if the key is missing or
+/// doesn't parse; each caller supplies its own default, matching the
+/// kernel-side `config.rs` default for the same key.
+fn config_u64(section: &str, key: &str) -> Option<u64> {
     let config_text = fs::read_to_string("/config.toml").unwrap_or_default();
-    let mut in_runtime_section = false;
+    let header = format!("[{section}]");
+    let mut in_section = false;
     for line in config_text.lines() {
         let line = line.trim();
         if line.starts_with('[') {
-            in_runtime_section = line == "[runtime]";
+            in_section = line == header;
             continue;
         }
-        if !in_runtime_section {
+        if !in_section {
             continue;
         }
-        if let Some(rest) = line.strip_prefix("in_run_compact_tokens").map(str::trim_start) {
-            if let Some(value) = rest.strip_prefix('=') {
-                if let Ok(n) = value.trim().parse::<u64>() {
-                    return n;
-                }
-            }
+        if let Some(value) = line.strip_prefix(key).map(str::trim_start).and_then(|rest| rest.strip_prefix('=')) {
+            return value.trim().parse().ok();
         }
     }
-    DEFAULT_IN_RUN_COMPACT_TOKENS
+    None
+}
+
+const DEFAULT_NOTE_SOFT_MAX_TOKENS: u64 = 2000;
+const DEFAULT_NOTE_MAX_TOKENS: u64 = 4000;
+
+/// `[memory] note_soft_max_tokens` — the size a curated `memory/notes/`
+/// file is meant to stay under. Going past it is allowed (the write goes
+/// through with a warning) but lands the note on `maintenance_summary`'s
+/// distillation list. The point is `write_file`'s whole-file rewrite: every
+/// edit to a note regenerates all of it, so a sprawling note costs more
+/// output tokens per edit and is likelier to lose a fact in the rewrite.
+fn note_soft_max_tokens() -> u64 {
+    config_u64("memory", "note_soft_max_tokens").unwrap_or(DEFAULT_NOTE_SOFT_MAX_TOKENS)
+}
+
+/// `[memory] note_max_tokens` — hard per-note cap; a write that would end
+/// up over it is refused outright.
+fn note_max_tokens() -> u64 {
+    config_u64("memory", "note_max_tokens").unwrap_or(DEFAULT_NOTE_MAX_TOKENS)
+}
+
+/// Rough token count without a tokenizer: each non-ASCII char (CJK text
+/// tokenizes at roughly one token per character) counts 1, ASCII counts
+/// 1 per 4 chars (typical English BPE ratio). Deliberately a bit
+/// pessimistic for mixed text — it's a cap, not a bill.
+fn estimate_tokens(text: &str) -> u64 {
+    let (ascii, other) = text.chars().fold((0u64, 0u64), |(a, o), c| if c.is_ascii() { (a + 1, o) } else { (a, o + 1) });
+    other + ascii.div_ceil(4)
+}
+
+fn is_note_path(path: &str) -> bool {
+    path.strip_prefix(NOTES_DIR).is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// `Some(error)` when writing `resulting` (the whole file as it would be
+/// after this write/append) to a `memory/notes/` file would put it over the
+/// hard `note_max_tokens` cap — refused the same retry-able way as
+/// core.md's cap.
+fn note_size_denial(path: &str, resulting: &str) -> Option<String> {
+    if !is_note_path(path) {
+        return None;
+    }
+    let cap = note_max_tokens();
+    let tokens = estimate_tokens(resulting);
+    (tokens > cap).then(|| {
+        format!(
+            "{path} would be ~{tokens} tokens, over the {cap}-token per-note cap — notes are one topic per file: \
+             split this into separate, more specific notes (each its own write_file) or condense it, \
+             don't just truncate"
+        )
+    })
+}
+
+/// `Some(warning)` attached to a successful note write that left the file
+/// past the soft cap — the write already happened; this just tells the
+/// model it'll be distilled later (and that splitting now is welcome).
+fn note_size_warning(path: &str, resulting: &str) -> Option<String> {
+    if !is_note_path(path) {
+        return None;
+    }
+    let soft = note_soft_max_tokens();
+    let tokens = estimate_tokens(resulting);
+    (tokens > soft).then(|| {
+        format!(
+            "{path} is now ~{tokens} tokens, past the {soft}-token target size — written anyway; it'll be \
+             queued for distillation in the next maintenance_summary. Splitting it into more specific notes \
+             now is better if the topic has clearly grown into several."
+        )
+    })
+}
+
+/// Notes past the soft cap — listed in `maintenance_summary` for
+/// distillation, whether they got there through writes or were already
+/// that big (written before the cap existed, or by hand).
+fn oversized_notes() -> Vec<(String, u64)> {
+    let cap = note_soft_max_tokens();
+    let Ok(entries) = fs::read_dir(NOTES_DIR) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, u64)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path().to_string_lossy().into_owned();
+            let tokens = estimate_tokens(&fs::read_to_string(&path).ok()?);
+            (tokens > cap).then_some((path, tokens))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+fn oversized_notes_section() -> String {
+    let oversized = oversized_notes();
+    if oversized.is_empty() {
+        return String::new();
+    }
+    let list: Vec<String> = oversized.iter().map(|(p, t)| format!("- {p} (~{t} tokens)")).collect();
+    format!(
+        "\nDistill these memory/notes/ files — they're past the {}-token target size per note:\n{}\n\
+         For each: read_file it, then drop what's no longer true or useful (superseded facts, events whose \
+         date has passed and no longer matter going forward, repeated corrections — keep only the corrected \
+         version), condense what's left, and if it still covers several distinct topics, split it into \
+         separate, more specific notes (write_file each, then write_file or delete_path the original). \
+         Keep every fact that's still true and relevant — distilling is pruning and restructuring, not \
+         summarizing away detail. Mention what you did in the report.\n",
+        note_soft_max_tokens(),
+        list.join("\n")
+    )
+}
+
+const DEFAULT_IN_RUN_COMPACT_TOKENS: u64 = 150_000;
+fn in_run_compact_tokens() -> u64 {
+    config_u64("runtime", "in_run_compact_tokens").unwrap_or(DEFAULT_IN_RUN_COMPACT_TOKENS)
 }
 
 /// Sums every regular file's size under `/` — the whole of agent-home, not
@@ -1874,4 +1961,43 @@ fn agent_home_size() -> u64 {
         total
     }
     walk(std::path::Path::new("/"))
+}
+
+#[cfg(test)]
+mod note_cap_tests {
+    use super::*;
+
+    #[test]
+    fn cjk_counts_per_char_and_ascii_per_four() {
+        assert_eq!(estimate_tokens(""), 0);
+        assert_eq!(estimate_tokens("蚵仔煎"), 3);
+        assert_eq!(estimate_tokens("abcd"), 1);
+        assert_eq!(estimate_tokens("abcde"), 2);
+        assert_eq!(estimate_tokens("夜市 abc"), 3);
+    }
+
+    #[test]
+    fn only_files_under_notes_dir_are_capped() {
+        assert!(is_note_path("/memory/notes/x.md"));
+        assert!(is_note_path("/memory/notes/sub/x.md"));
+        assert!(!is_note_path("/memory/notes"));
+        assert!(!is_note_path("/memory/notes_old/x.md"));
+        assert!(!is_note_path("/workspace/memory/x.md"));
+        assert!(note_size_denial("/workspace/x.md", &"字".repeat(100_000)).is_none());
+    }
+
+    #[test]
+    fn soft_cap_warns_and_hard_cap_refuses() {
+        // no /config.toml in the test process — falls back to the defaults
+        let at_soft = "字".repeat(DEFAULT_NOTE_SOFT_MAX_TOKENS as usize);
+        let past_soft = "字".repeat(DEFAULT_NOTE_SOFT_MAX_TOKENS as usize + 1);
+        let at_hard = "字".repeat(DEFAULT_NOTE_MAX_TOKENS as usize);
+        let past_hard = "字".repeat(DEFAULT_NOTE_MAX_TOKENS as usize + 1);
+        let p = "/memory/notes/a.md";
+        assert!(note_size_warning(p, &at_soft).is_none());
+        assert!(note_size_warning(p, &past_soft).is_some());
+        assert!(note_size_denial(p, &past_soft).is_none());
+        assert!(note_size_denial(p, &at_hard).is_none());
+        assert!(note_size_denial(p, &past_hard).is_some());
+    }
 }
