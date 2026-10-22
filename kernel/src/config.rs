@@ -231,10 +231,29 @@ pub struct NetworkConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct NetworkCredential {
     pub host: String,
-    /// `"{secrets.NAME}"` — same reference form as an `api_key` field (a
-    /// bare `"NAME"` still works for older configs), see
-    /// `secrets::secret_ref_name`
-    pub secret: String,
+    /// `"{secrets.NAME}"` — same reference form as an `api_key` field
+    pub secret: SecretRef,
+}
+
+/// A config field naming a vault secret, written `"{secrets.NAME}"` — the
+/// one form every secret reference in `config.toml` uses. Anything else
+/// (e.g. a bare `"NAME"`) fails at parse time, so `Config::load` and
+/// `POST /api/config` both reject it with a clear error instead of the
+/// reference silently never matching.
+#[derive(Debug, Clone)]
+pub struct SecretRef(String);
+
+impl SecretRef {
+    pub fn name(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretRef {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let spec = String::deserialize(deserializer)?;
+        crate::secrets::parse_secret_ref(&spec).map(|name| SecretRef(name.to_string())).map_err(serde::de::Error::custom)
+    }
 }
 
 impl Default for NetworkConfig {
@@ -376,8 +395,8 @@ pub struct SshConfig {
     /// every other syscall's output cap, so a chatty/looping remote command
     /// can't blow up the LLM context or the log file
     pub max_output_bytes: usize,
-    /// Vault secrets (by reference — `"{secrets.NAME}"`, or a bare `"NAME"`
-    /// in older configs; never a value) `ssh_exec` is allowed to
+    /// Vault secrets (by reference, `"{secrets.NAME}"` — never a value)
+    /// `ssh_exec` is allowed to
     /// substitute a `{secrets.NAME}` placeholder for inside a `command`
     /// string (`secrets::resolve_placeholders_in`) — empty by default,
     /// meaning no secret is usable this way until explicitly named here.
@@ -389,7 +408,7 @@ pub struct SshConfig {
     /// agent could put `{secrets.<llm-api-key-name>}` (or anything else in
     /// the vault) into an `ssh_exec` command just as easily as the one
     /// secret actually meant to be used this way.
-    pub allowed_secrets: Vec<String>,
+    pub allowed_secrets: Vec<SecretRef>,
 }
 
 impl Default for SshConfig {
@@ -454,5 +473,30 @@ pub struct MemoryConfig {
 impl Default for MemoryConfig {
     fn default() -> Self {
         MemoryConfig { note_soft_max_tokens: 2000, note_max_tokens: 4000 }
+    }
+}
+
+#[cfg(test)]
+mod secret_ref_tests {
+    use super::*;
+
+    #[test]
+    fn credentials_and_ssh_allowlist_require_placeholder_form() {
+        let ok = r#"
+[ssh]
+allowed_secrets = ["{secrets.gh_token}"]
+
+[[network.credentials]]
+host = "discord.com"
+secret = "{secrets.discord_bot_token}"
+"#;
+        let config: Config = toml::from_str(ok).unwrap();
+        assert_eq!(config.network.credentials[0].secret.name(), "discord_bot_token");
+        assert_eq!(config.ssh.allowed_secrets[0].name(), "gh_token");
+
+        let bare_credential = "[[network.credentials]]\nhost = \"discord.com\"\nsecret = \"discord_bot_token\"\n";
+        assert!(toml::from_str::<Config>(bare_credential).is_err());
+        let bare_allowlist = "[ssh]\nallowed_secrets = [\"gh_token\"]\n";
+        assert!(toml::from_str::<Config>(bare_allowlist).is_err());
     }
 }

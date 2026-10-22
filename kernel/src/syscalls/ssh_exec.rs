@@ -65,7 +65,7 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
     } else if let Some(key_path) = state.secrets.get("ssh_key_path").map(str::to_string) {
         let passphrase = state.secrets.get("ssh_key_passphrase").map(str::to_string);
         let cfg = state.config.ssh.clone();
-        let allowed: Vec<String> = cfg.allowed_secrets.iter().map(|s| crate::secrets::secret_ref_name(s).to_string()).collect();
+        let allowed: Vec<String> = cfg.allowed_secrets.iter().map(|s| s.name().to_string()).collect();
         match crate::secrets::resolve_placeholders_in(&state.secrets, command, &allowed) {
             Ok(resolved_command) => {
                 let deadline = Instant::now() + Duration::from_secs(cfg.timeout_secs);

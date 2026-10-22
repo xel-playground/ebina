@@ -53,14 +53,14 @@ impl Secrets {
 const PREFIX: &str = "{secrets.";
 const SUFFIX: &str = "}";
 
-/// The vault name a config field refers to — `{secrets.NAME}` (the same
-/// placeholder form `api_key` fields use) or, for older configs, the bare
-/// `NAME`. Used for fields that *name* a secret rather than resolve it
-/// (`[[network.credentials]] secret`, `[ssh] allowed_secrets`), so every
-/// secret reference in `config.toml` can be written one way.
-pub fn secret_ref_name(spec: &str) -> &str {
-    let spec = spec.trim();
-    spec.strip_prefix(PREFIX).and_then(|s| s.strip_suffix(SUFFIX)).unwrap_or(spec)
+/// The vault name inside a `{secrets.NAME}` placeholder — the one form
+/// every secret reference in `config.toml` is written in. Rejects anything
+/// else, including a bare `NAME`.
+pub fn parse_secret_ref(spec: &str) -> Result<&str, String> {
+    spec.strip_prefix(PREFIX)
+        .and_then(|s| s.strip_suffix(SUFFIX))
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| format!("expected a vault placeholder like `{{secrets.name}}`, got: `{spec}`"))
 }
 
 /// Resolves a config field that must be a vault placeholder — `{secrets.NAME}`
@@ -68,10 +68,7 @@ pub fn secret_ref_name(spec: &str) -> &str {
 /// literal key) so a key can never end up sitting in `config.toml` in the
 /// clear, since that file lives inside agent_home and the guest reads it.
 pub fn resolve_placeholder(secrets: &Secrets, spec: &str) -> Result<String, String> {
-    let name = spec
-        .strip_prefix(PREFIX)
-        .and_then(|s| s.strip_suffix(SUFFIX))
-        .ok_or_else(|| format!("expected a vault placeholder like `{{secrets.name}}`, got: {spec}"))?;
+    let name = parse_secret_ref(spec)?;
 
     secrets
         .get(name)
@@ -130,10 +127,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn secret_ref_name_accepts_placeholder_and_bare_forms() {
-        assert_eq!(secret_ref_name("{secrets.discord_bot_token}"), "discord_bot_token");
-        assert_eq!(secret_ref_name(" {secrets.x} "), "x");
-        assert_eq!(secret_ref_name("discord_bot_token"), "discord_bot_token");
+    fn parse_secret_ref_requires_the_placeholder_form() {
+        assert_eq!(parse_secret_ref("{secrets.discord_bot_token}"), Ok("discord_bot_token"));
+        assert!(parse_secret_ref("discord_bot_token").is_err());
+        assert!(parse_secret_ref("{secrets.}").is_err());
+        assert!(parse_secret_ref("{secret.x}").is_err());
     }
 
     fn secrets_with(name: &str, value: &str) -> Secrets {
