@@ -219,18 +219,30 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
             // usage at all — most such APIs (this one included) only add a
             // final usage-only chunk when this is explicitly requested
             map.insert("stream_options".to_string(), serde_json::json!({"include_usage": true}));
+            if let Some(effort) = &state.config.llm.reasoning_effort {
+                map.entry("reasoning_effort").or_insert_with(|| Value::String(effort.clone()));
+            }
         }
         // see `RuntimeConfig::max_output_tokens` — bounds a runaway
-        // generation regardless of provider; ollama's native API doesn't
-        // recognize `max_tokens` at all (`options.num_predict` instead), so
-        // it needs its own field
-        if provider == "ollama" {
-            map.entry("options").or_insert_with(|| serde_json::json!({}));
-            if let Some(options) = map.get_mut("options").and_then(|o| o.as_object_mut()) {
-                options.entry("num_predict").or_insert_with(|| Value::from(state.config.runtime.max_output_tokens));
+        // generation regardless of provider, under each API's own name:
+        // ollama's native API wants `options.num_predict`; OpenAI's
+        // reasoning models reject `max_tokens` outright and need
+        // `max_completion_tokens` (Kimi/Moonshot honors it too); Anthropic
+        // keeps `max_tokens`
+        let cap = Value::from(state.config.runtime.max_output_tokens);
+        match provider.as_str() {
+            "ollama" => {
+                map.entry("options").or_insert_with(|| serde_json::json!({}));
+                if let Some(options) = map.get_mut("options").and_then(|o| o.as_object_mut()) {
+                    options.entry("num_predict").or_insert(cap);
+                }
             }
-        } else {
-            map.entry("max_tokens").or_insert_with(|| Value::from(state.config.runtime.max_output_tokens));
+            "openai" => {
+                map.entry("max_completion_tokens").or_insert(cap);
+            }
+            _ => {
+                map.entry("max_tokens").or_insert(cap);
+            }
         }
     }
     if provider == "anthropic" {
@@ -239,7 +251,16 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
         collapse_content_blocks(&mut body);
     }
 
-    let client = reqwest::blocking::Client::new();
+    // reqwest's blocking default (30s per read) cuts off a reasoning model
+    // that's silently thinking — see `LlmConfig::read_timeout_secs`
+    let client = match reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(state.config.llm.read_timeout_secs))
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => return error_json("client_error", &e.to_string()),
+    };
     let mut request = client.post(&state.config.llm.base_url).header("content-type", "application/json");
     request = match provider.as_str() {
         "ollama" | "openai" => request.bearer_auth(&api_key),

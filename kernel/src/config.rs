@@ -51,7 +51,7 @@ pub struct LlmConfig {
     /// request/response shape), "ollama" (Bearer auth, /api/chat NDJSON
     /// streaming shape), or "openai" (Bearer auth, standard OpenAI chat
     /// completions shape — `choices[].message.content` +
-    /// `usage.prompt_tokens/completion_tokens`, non-streaming; covers any
+    /// `usage.prompt_tokens/completion_tokens`; covers OpenAI itself and any
     /// OpenAI-compatible API such as Kimi/Moonshot, DeepSeek, etc.)
     pub provider: String,
     /// no reliable way to auto-detect vision support on an arbitrary
@@ -62,6 +62,19 @@ pub struct LlmConfig {
     /// `read_file` itself instead, so a non-vision model never receives a
     /// content shape it can't handle.
     pub supports_vision: bool,
+    /// longest the stream may go without delivering a single byte before
+    /// the call counts as failed (and gets retried). Reasoning models that
+    /// hide their reasoning (OpenAI's) send *nothing* while they think —
+    /// one real `gpt-6-luna` call at high effort was silent for 53s before
+    /// its first chunk — so this has to cover the longest silent think, not
+    /// just network latency. Kimi/Anthropic/Ollama stream their reasoning
+    /// as they go and never come close.
+    pub read_timeout_secs: u64,
+    /// `reasoning_effort` sent to an `openai` provider (e.g. `"low"`,
+    /// `"medium"`, `"high"`) — unset sends nothing and the model uses its
+    /// own default. Lower effort also means shorter silent stretches, see
+    /// `read_timeout_secs`.
+    pub reasoning_effort: Option<String>,
 }
 
 impl Default for LlmConfig {
@@ -72,6 +85,8 @@ impl Default for LlmConfig {
             model: "claude-sonnet-5".to_string(),
             provider: "anthropic".to_string(),
             supports_vision: false,
+            read_timeout_secs: 300,
+            reasoning_effort: None,
         }
     }
 }

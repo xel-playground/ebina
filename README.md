@@ -406,6 +406,26 @@ provider = "openai"
 api_key = "{secrets.kimi}"
 ```
 
+OpenAI itself works the same way. Its reasoning models need two things the
+`openai` provider now handles: the output cap is sent as
+`max_completion_tokens` (they reject `max_tokens`; Kimi accepts either), and
+they think *silently* — no reasoning is streamed, so a hard question can go
+a minute without a single byte. `[llm] read_timeout_secs` (default 300) is
+how long a stream may stay silent before the call counts as failed;
+`reasoning_effort` (optional) is passed through as-is:
+
+```toml
+[llm]
+base_url = "https://api.openai.com/v1/chat/completions"
+model = "gpt-6-luna"
+provider = "openai"
+api_key = "{secrets.openai}"
+reasoning_effort = "medium"
+```
+
+With OpenAI the Live Log panel shows no reasoning, only the final output —
+OpenAI doesn't expose it over Chat Completions.
+
 ### No embed provider available? Run one locally
 
 Some API keys (e.g. an Ollama Cloud key on the free tier) only cover chat
