@@ -436,7 +436,7 @@ pub struct MemoryConfig {
     /// (`agent/src/agent_loop.rs`'s `estimate_tokens`: 1 per non-ASCII
     /// char, 1 per 4 ASCII chars). A note write past it still goes through
     /// (with a warning), and the note is listed for distillation in the
-    /// next `maintenance_summary`.
+    /// next `core_distillation`.
     pub note_soft_max_tokens: u64,
     /// hard per-note cap — `write_file`/`append_file` refuse a note write
     /// that would end up over it.

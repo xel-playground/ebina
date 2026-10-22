@@ -261,6 +261,21 @@ impl ScheduleLog {
         true
     }
 
+    /// For host-only jobs that run synchronously inside the tick (no agent
+    /// run to claim/spawn): records the occurrence as already succeeded.
+    /// Same idempotency as `schedule` — returns `true` only the first time,
+    /// which is the caller's cue to actually do the work.
+    pub fn complete_inline(&self, job: &str, slot: i64, now: i64) -> bool {
+        let id = occurrence_id(job, slot);
+        let mut p = self.lock();
+        if p.occurrences.contains_key(&id) {
+            return false;
+        }
+        self.append(&mut p, now, Event::Scheduled { occurrence: id.clone(), job: job.to_string(), slot });
+        self.append(&mut p, now, Event::Succeeded { occurrence: id, attempt: 0, run_file: None });
+        true
+    }
+
     /// Atomically moves every claimable `pending` occurrence to `running`
     /// (writing its `started` event) and returns them, oldest slot first.
     /// At most one running occurrence per job.
@@ -441,6 +456,14 @@ mod tests {
         assert!(!log.skip("daily_maintenance", 780, 800, "nothing new"));
         assert_eq!(log.get(&occurrence_id("daily_maintenance", 780)).unwrap().state, State::Skipped);
         assert!(log.claim_ready(800).is_empty());
+    }
+
+    #[test]
+    fn complete_inline_runs_once_per_slot() {
+        let (_, log) = temp_log("inline");
+        assert!(log.complete_inline("housekeeping", 1080, 1090));
+        assert!(!log.complete_inline("housekeeping", 1080, 1120));
+        assert_eq!(log.get(&occurrence_id("housekeeping", 1080)).unwrap().state, State::Succeeded);
     }
 
     #[test]

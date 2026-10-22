@@ -17,13 +17,13 @@ const NOTES_DIR: &str = "/memory/notes";
 /// curated topic notes.
 const RUN_LOG_DIR: &str = "/logs/run_log";
 /// `write_memory_note` logs every run unconditionally, including
-/// `daily_maintenance`/`maintenance_summary`/`core_distillation`'s own
+/// `daily_maintenance`/`core_distillation`'s own
 /// completions — those are bookkeeping about a previous review, not new
 /// material to review. Excluded here (mirrors `kernel/src/gateway.rs`'s
 /// `MAINTENANCE_TRIGGER_TYPES`, a separate crate so this can't just be
 /// shared) so a maintenance tier's own past "nothing new" entry doesn't
 /// show up in its *own* next delta as if it were something that happened.
-const MAINTENANCE_TRIGGER_TYPES: &[&str] = &["daily_maintenance", "maintenance_summary", "core_distillation"];
+const MAINTENANCE_TRIGGER_TYPES: &[&str] = &["daily_maintenance", "core_distillation"];
 const WORKSPACE_DIR: &str = "/workspace";
 const RETRIEVAL_TOP_K: usize = 5;
 /// adr/002-skill-v2.md §2: skills get their own, smaller quota (2-3, not
@@ -1015,8 +1015,8 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String], retrieved_skills: 
             let delta = recent_log_entries(since_ts);
             format!(
                 "\nThis is a daily_maintenance run — despite the name, a *light*, frequent \
-                 pass (hourly) now, not a deep review; a separate maintenance_summary run handles \
-                 consolidation every 6h. Only what's new since the last run:\n\n{delta}\n\n\
+                 pass (hourly), not a deep review; the daily core_distillation run handles consolidation. \
+                 Only what's new since the last run:\n\n{delta}\n\n\
                  Distill anything worth keeping into memory/notes/ (write_file — merge duplicates, prune what's \
                  stale; one topic per file, aiming to keep each under ~{} tokens — start a new, more specific \
                  note rather than growing one past that) — quickly, don't try to be exhaustive, there isn't much new in an hour. Also check \
@@ -1042,38 +1042,27 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String], retrieved_skills: 
                 crate::time::maintenance_run_id(now_unix())
             )
         }
-        Some("maintenance_summary") => {
-            let since_ts = trigger.get("since_ts").and_then(Value::as_u64).unwrap_or(0);
-            format!(
-                "\nThis is a maintenance_summary run (every 6h) — the deeper pass the hourly daily_maintenance \
-                 one deliberately skips. list_dir /maintenance_reports/hourly/ and read_file the ones \
-                 written since {} (roughly the last 6 hourly passes). Use them to: merge/dedupe anything in \
-                 memory/notes/ that ended up fragmented or contradictory across several of those hourly passes; \
-                 and — the part that actually matters here — if the same \"needs attention\" item (a pending \
-                 human-only action) has shown up across 3 or more of those reports with nothing changing, stop \
-                 just re-noting it and actually chat_send the human about it instead. A report nobody reads \
-                 isn't an escalation, it's a place things go to be silently repeated forever.\n\n\
-                 Also do the skill quality gate here: read_file skills under /skills/ whose `retrieval_hit_count` \
-                 is 0 (never surfaced by search — check the frontmatter) and either rewrite the description (use \
-                 save_skill, not write_file, so usage stats survive and the index updates immediately) or retire \
-                 it (delete_path) if it's not worth keeping. Also merge skills whose descriptions overlap enough \
-                 that they're really the same capability. Don't touch skills that have hits, however few.\n\n\
-                 Write a consolidated /maintenance_reports/summary/{}.md when done (mention any skill changes \
-                 too), then call done.\n{}",
-                if since_ts == 0 { "the beginning".to_string() } else { human_timestamp(since_ts) },
-                crate::time::maintenance_run_id(now_unix()),
-                oversized_notes_section()
-            )
-        }
         Some("core_distillation") => {
             let since_ts = trigger.get("since_ts").and_then(Value::as_u64).unwrap_or(0);
             format!(
-                "\nThis is a core_distillation run (every 24h) — the third and slowest waterfall tier, the only \
-                 one that ever touches /core.md. list_dir /maintenance_reports/summary/ \
-                 and read_file the ones written since {} (roughly the last 4 maintenance_summary passes) — that's \
-                 your primary input, not a fresh scan of memory/notes/. /core.md's current content is already \
-                 shown above (\"## What you know\").\n\n\
-                 **Core promotion/demotion.** Only two kinds of content belong in core.md: (a) current focus — \
+                "\nThis is a core_distillation run (every 24h) — the deep, slow pass above the hourly \
+                 daily_maintenance, and the only run that ever touches /core.md. Your primary input is the \
+                 hourly reports: list_dir /maintenance_reports/hourly/ and read_file the ones written since {} \
+                 (up to a day's worth) — not a fresh scan of all of memory/notes/; read_file a note only when a \
+                 report points at it. /core.md's current content is already shown above (\"## What you know\"). \
+                 Do these, in order:\n\n\
+                 1. **Notes upkeep.** Merge/dedupe anything in memory/notes/ that ended up fragmented or \
+                 contradictory across those hourly passes.{}\n\n\
+                 2. **Escalate what's stuck.** If the same \"needs attention\" item (a pending human-only action) \
+                 shows up across 3 or more of those reports with nothing changing, stop just re-noting it and \
+                 chat_send the human about it instead. A report nobody reads isn't an escalation, it's a place \
+                 things go to be silently repeated forever.\n\n\
+                 3. **Skill quality gate.** read_file skills under /skills/ whose `retrieval_hit_count` is 0 \
+                 (never surfaced by search — check the frontmatter) and either rewrite the description (use \
+                 save_skill, not write_file, so usage stats survive and the index updates immediately) or retire \
+                 it (delete_path) if it's not worth keeping. Also merge skills whose descriptions overlap enough \
+                 that they're really the same capability. Don't touch skills that have hits, however few.\n\n\
+                 4. **Core promotion/demotion.** Only two kinds of content belong in core.md: (a) current focus — \
                  2-3 lines, the things actively in flight right now (the fastest-changing part); (b) durable \
                  agent responsibilities — daily tasks, standing things to watch for, the kind that stay true going \
                  forward, not a one-off todo. Everything else — \"talked about X last week\", a specific incident, \
@@ -1086,10 +1075,11 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String], retrieved_skills: 
                  with exactly \"run aborted: \" (this is load-bearing: it's the only way the host's automatic \
                  retry logic can tell a real failure from a normal, safe completion — a normal-looking summary \
                  here would silently look like success with nothing actually written).\n\n\
-                 Write a report to /maintenance_reports/core/{}.md summarizing what changed (promoted/demoted, or \
-                 \"no changes this cycle\") before calling done. Skills are not this run's job anymore — see the \
-                 maintenance_summary (6h) trigger instead.\n",
+                 Write a report to /maintenance_reports/core/{}.md covering all four (notes merged/distilled, \
+                 anything escalated, skill changes, core promoted/demoted — or \"no changes\" for each) before \
+                 calling done.\n",
                 if since_ts == 0 { "the beginning".to_string() } else { human_timestamp(since_ts) },
+                oversized_notes_section(),
                 crate::time::maintenance_run_id(now_unix())
             )
         }
@@ -1314,9 +1304,9 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String], retrieved_skills: 
     // `daily_maintenance` already gets the fuller delta-since-last-run via
     // `recent_log_entries` in its own `trigger_note` below — this would
     // just be a redundant, more-truncated view of the same data for that
-    // one trigger type, so skip it there. `maintenance_summary` reviews
-    // maintenance reports directly, same reasoning.
-    let staging_section = if matches!(trigger_type, Some("daily_maintenance") | Some("maintenance_summary")) {
+    // one trigger type, so skip it there. `core_distillation` reviews the
+    // hourly maintenance reports directly, same reasoning.
+    let staging_section = if matches!(trigger_type, Some("daily_maintenance") | Some("core_distillation")) {
         String::new()
     } else {
         // this session's own turns are already fully visible via `history`
@@ -1728,7 +1718,7 @@ fn write_action_denial(path: &str, trigger: &Value) -> Option<String> {
     // is a stricter, trigger-type-specific gate than the message/workspace
     // one below (which only fires for `message`); core.md is refused for
     // *every* trigger type except `core_distillation`, including
-    // `daily_maintenance`/`maintenance_summary`/`cron`, which the
+    // `daily_maintenance`/`cron`, which the
     // workspace-only rule below would otherwise let write anywhere. Reusing
     // the "当场改 core 打断 prompt cache 前缀" reasoning from that same ADR
     // section: an exception path here isn't just a security boundary
@@ -1737,7 +1727,7 @@ fn write_action_denial(path: &str, trigger: &Value) -> Option<String> {
     if path == CORE_MD_PATH && trigger_type != Some("core_distillation") {
         return Some(format!(
             "{CORE_MD_PATH} can only be written during a core_distillation run — no exception path, even for \
-             daily_maintenance/maintenance_summary. Anything worth keeping belongs in memory/notes/ instead; it \
+             daily_maintenance. Anything worth keeping belongs in memory/notes/ instead; it \
              reaches core.md on its own once it survives the full waterfall."
         ));
     }
@@ -1833,7 +1823,7 @@ const DEFAULT_NOTE_MAX_TOKENS: u64 = 4000;
 
 /// `[memory] note_soft_max_tokens` — the size a curated `memory/notes/`
 /// file is meant to stay under. Going past it is allowed (the write goes
-/// through with a warning) but lands the note on `maintenance_summary`'s
+/// through with a warning) but lands the note on `core_distillation`'s
 /// distillation list. The point is `write_file`'s whole-file rewrite: every
 /// edit to a note regenerates all of it, so a sprawling note costs more
 /// output tokens per edit and is likelier to lose a fact in the rewrite.
@@ -1891,13 +1881,13 @@ fn note_size_warning(path: &str, resulting: &str) -> Option<String> {
     (tokens > soft).then(|| {
         format!(
             "{path} is now ~{tokens} tokens, past the {soft}-token target size — written anyway; it'll be \
-             queued for distillation in the next maintenance_summary. Splitting it into more specific notes \
+             queued for distillation in the next core_distillation. Splitting it into more specific notes \
              now is better if the topic has clearly grown into several."
         )
     })
 }
 
-/// Notes past the soft cap — listed in `maintenance_summary` for
+/// Notes past the soft cap — listed in `core_distillation` for
 /// distillation, whether they got there through writes or were already
 /// that big (written before the cap existed, or by hand).
 fn oversized_notes() -> Vec<(String, u64)> {

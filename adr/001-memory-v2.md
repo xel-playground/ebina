@@ -1,5 +1,12 @@
 # ebina — 記憶與技能子系統設計 v2
 
+> **2026-10-22 更新:三層瀑布精簡為兩層。** 6h 的 `maintenance_summary` 已移除,
+> 它的工作(notes 合併去重、超標 note 蒸餾、needs-attention 連續 3 次升級通知、skill 品質關卡)
+> 併入 24h 的 `core_distillation`,改讀每小時報告(`maintenance_reports/hourly/`)。
+> 閒置 session 重置與蒸餾健康檢查改為獨立的 6h host-only housekeeping。
+> 現行架構:run_log →(每小時 daily_maintenance)→ notes →(每天 core_distillation)→ core.md。
+> 下文提到 6h/summary 層的段落為原設計紀錄,實作以 README 為準。
+
 **三層瀑布式蒸餾 + 檢索式技能。**
 核心:資訊單向沉澱,每層只吃下層的**產物**而非原始資料 → context 成本恆定,時間本身成為品質過濾器。
 

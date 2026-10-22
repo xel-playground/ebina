@@ -130,11 +130,11 @@ tick's `scheduled_task` due-check, so an exact-minute cron task (e.g.
 `rss_tech_report`'s `17 9 * * *`) due a few minutes later could silently
 miss its entire day with no error at all. Found because a user-configured
 task actually missed a day in production. Fixed by having the tick loop
-`tokio::spawn` each fired trigger instead of awaiting it — `daily_maintenance`
-and `maintenance_summary` each keep an `AtomicBool` guard so only one of the
-same tier is ever in flight (the one invariant that still needs enforcing;
-everything else was already documented as safe to run concurrently, just
-never actually exploited).
+`tokio::spawn` each fired trigger instead of awaiting it — the scheduler's
+event log (see [Scheduler](#scheduler-event-sourced-idempotent)) keeps at
+most one occurrence of each maintenance tier in flight (the one invariant
+that still needs enforcing; everything else was already documented as safe
+to run concurrently, just never actually exploited).
 `POST /api/abort?session=<key>` (the webui's Stop button, defaulting to the
 webui session) is cooperative: it sets a flag `llm_call` checks between
 streamed chunks, scoped per session so aborting one doesn't touch another
@@ -297,75 +297,67 @@ anything else at `/SOUL.md`; a human can do the same via `GET`/`POST
 /api/soul` (raw text, same shape as `/api/config`) or the webui's Soul tab.
 It's fine for the file not to exist yet.
 
-## Memory (`memory/notes/` RAG + `daily_maintenance`)
+## Memory
 
-Two layers, deliberately kept separate:
+Three layers, two distillation passes:
 
-- **Curated notes** — `memory/notes/*.md` (one topic per file, e.g.
-  `pet.md`). These are the only thing embedded and searched (`hybrid_search`
-  — BM25 + cosine similarity, reciprocal rank fusion) every turn.
-  `write_file`/`append_file` can only touch these on a `daily_maintenance`
-  run — a live chat turn's `write_file`/`append_file` is scoped to
-  `/workspace/` only (see below), so an ad-hoc mid-conversation edit can't
-  silently re-clobber an already-corrected fact the way an unrestricted
-  write once did. Background-triggered runs (`cron`/`scheduled_task`/
-  `manual`) keep full access, since a scheduled task can legitimately
-  maintain its own state file under `memory/notes/`.
-- **The raw daily log** — `memory/notes/<date>/log.md`, one entry per
-  *every* run (any trigger type, success or abort), written automatically —
-  never embedded/searched. Embedding it once meant an old, since-corrected
-  fact stayed permanently retrievable (a user message quoting wrong data
-  while correcting it, indexed verbatim) and, in a small note corpus, log
-  entries drowned out anything actually relevant.
+```
+logs/run_log/<date>/log.md   raw log, one entry per run (written automatically)
+   │  hourly  daily_maintenance
+   ▼
+memory/notes/*.md            deep memory — curated facts, searched every turn
+   │  daily   core_distillation
+   ▼
+core.md                      summary — shown in full every turn
+```
 
-`daily_maintenance` is what bridges the two: a built-in self-driven wake,
-on an hourly cycle (2026-07-12: shrunk from 6h — a fact could sit unfolded
-for up to 6h, and worse, a "needs attention" item that wasn't acted on just
-got silently re-noted every cycle after with nothing escalating; see the
-avatar-reminder incident in PROJECT.md), reviewing only what's new since
-its own last successful run (`since_ts`, tracked in
-`memory/maintenance_reports/.last_run` — a run that hard-aborts does *not*
-advance this, so a transient failure can't silently skip a whole window),
-also checking `/workspace/memory/` — the designated spot for short-term
-notes/reminders, not the whole `/workspace/` tree — for standalone notes
-(the log delta alone only says one *exists*, not what's in it — durable
-facts go into the curated notes above, a pending human-only action item
-stays in `/workspace/memory/` and gets called out in the report instead,
-and a fully-distilled note gets `delete_path`'d so it isn't re-considered
-forever). One report per run lands in
-`memory/maintenance_reports/hourly/<date>_<HHMM>.md`.
+- **Raw log** — `logs/run_log/<date>/log.md`, one entry per *every* run
+  (any trigger type, success or abort), tagged with session and sender.
+  Never embedded/searched (embedding it once meant an old, since-corrected
+  fact stayed permanently retrievable). Every run's prompt does get the
+  last few `message` entries from *other* sessions
+  (`[chat] cross_session_staging_entries`, default 5) — the cross-session
+  short-term memory, so a Discord chat knows what was just said in the
+  webui without waiting for distillation.
+- **Notes** — `memory/notes/*.md`, one topic per file. Embedded and
+  searched (`hybrid_search` — BM25 + vectors, reciprocal rank fusion)
+  every turn. A live chat turn can't write them (its `write_file`/
+  `append_file` is scoped to `/workspace/`), so an ad-hoc mid-conversation
+  edit can't silently re-clobber an already-corrected fact.
+  Background-triggered runs (`cron`/`scheduled_task`/`manual`) keep full
+  access. Note size (estimated as 1 token per non-ASCII char + 1 per 4
+  ASCII chars) has a soft and a hard cap under `[memory]`: past
+  `note_soft_max_tokens` (default 2000) a write still goes through with a
+  warning and the note gets listed for distillation in the next
+  `core_distillation`; past `note_max_tokens` (default 4000) the write is
+  refused.
+- **`core.md`** — the summary layer, shown in full in every run's prompt
+  (2000-char cap). Only `core_distillation` can write it.
 
-Both this tier and `maintenance_summary` below only actually fire at
-minute 13 of the hour, not on the hour — offset away from the `:00` mark a
-lot of other cron-style jobs cluster on. Both are also gated by a
-host-side, no-LLM pre-check first: if there's nothing new in the log delta
-and nothing changed under `/workspace/memory/` (for `daily_maintenance`) or
-no new hourly reports since the last summary (for `maintenance_summary`),
-the LLM call is skipped entirely — the checkpoint still advances, since the
-check itself is as complete a review of that window as a real run would
-have given, just without paying for one that would only come back saying
-"nothing new".
+**`daily_maintenance`** (hourly, at :13) — raw log → notes. Reviews only
+what's new since its own last successful run (`since_ts`, tracked in
+`maintenance_reports/.last_run` — a run that fails doesn't advance it, so a
+transient failure can't silently skip a window), plus
+`/workspace/memory/` — the spot for short-term notes and pending
+human-only action items. Durable facts and real research/analysis go into
+notes; a pending human-only item stays in `/workspace/memory/` and gets
+called out in the report. One report per run lands in
+`maintenance_reports/hourly/<date>_<HHMM>.md`. Skipped without an LLM call
+when nothing new was logged and `/workspace/memory/` is empty.
 
-A separate `maintenance_summary` wake runs every 6h (its own checkpoint,
-`memory/maintenance_reports/.last_summary_run`) — the deeper pass the
-hourly one deliberately skips: reviews the reports written since the last
-summary under `memory/maintenance_reports/hourly/`, merges/dedupes
-anything that ended up fragmented across several of them, and is where a
-"needs attention" item that's shown up 3+ times running with nothing
-changing is supposed to actually `chat_send` the human instead of just
-getting silently re-mentioned. Its own consolidated report lands in
-`memory/maintenance_reports/summary/<date>_<HHMM>.md`. This is also when
-`sweep_idle_sessions` (resetting a conversation nobody's touched in 6h)
-runs, and a host-side, no-LLM sanity check: did `memory/notes/` actually
-get any git commits in the last 6h despite real new activity in that
-window, or is `daily_maintenance` just self-reporting distillation without
-anything landing on disk? `notify()` if so — a genuinely quiet window with
-no activity at all is expected to produce no commits and isn't checked;
-this is only about a window that had something to react to and still
-didn't write anything, a discrepancy worth surfacing rather than only ever
-trusting a run's own word for it. Both `sweep_idle_sessions` and this check
-always run on this tier's own 6h cadence regardless of whether the
-summary's own LLM pass above got skipped.
+**`core_distillation`** (daily, at :23) — notes → core. Reads the hourly
+reports written since its last run (bounded at ~24, never the raw log) and
+from those: merges/dedupes fragmented notes and distills over-cap ones,
+`chat_send`s the human about a "needs attention" item that's shown up in
+3+ reports unchanged, runs the skill quality gate, and promotes/demotes
+what belongs in `core.md`. Report lands in
+`maintenance_reports/core/<date>_<HHMM>.md`. Skipped when there were no
+hourly reports in the window.
+
+**Housekeeping** (every 6h, no LLM) — resets chat sessions idle for over
+6h, and checks that `memory/notes/` actually got git commits in the last
+6h if anything was logged (`notify()` if not — catches a maintenance pass
+self-reporting distillation without anything landing on disk).
 
 ### Mid-run compaction (`runtime.in_run_compact_tokens`)
 

@@ -77,7 +77,7 @@ pub(crate) struct AppState {
     /// directories no longer overlap between trigger types (see
     /// `agent_loop.rs`'s `write_action_denial`): a `message` run can only
     /// touch `/workspace/`, curated `memory/notes/` is `daily_maintenance`-
-    /// only, and only one `daily_maintenance` (same for `maintenance_summary`)
+    /// only, and only one `daily_maintenance` (same for `core_distillation`)
     /// is ever in flight at a time (`schedule_log` runs at most one occurrence per job,
     /// not just gating — 2026-07-12: `scheduler_loop` used to `.await` each
     /// fired trigger inline, one giant sequential loop body, which
@@ -240,37 +240,22 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
 ///   ever escalating (a real incident: a "please update the bot's avatar"
 ///   reminder got rediscovered and reported on for over a day, never
 ///   distilled, never escalated). Shrinking the light pass to 1h reduces
-///   how long anything sits unprocessed; see `maintenance_summary` below
-///   for what replaced the escalation half of the old 6h job. Both tiers
-///   are additionally gated by `MAINTENANCE_WALL_CLOCK_SPEC` to only ever
-///   actually fire at minute 13 of the hour, not on the hour — see that
-///   const's doc comment.
-/// - `maintenance_summary`, every `MAINTENANCE_SUMMARY_INTERVAL_SECS` (6h,
-///   its own separate checkpoint) — a deeper pass the light hourly one
-///   deliberately doesn't do: reviews the maintenance reports written since
-///   the last summary, merges/dedupes anything that ended up fragmented
-///   across several hourly passes, and is where a repeatedly-unresolved
-///   "needs attention" item is supposed to actually escalate (`chat_send`)
-///   instead of just getting silently re-mentioned forever. Also where
-///   `sweep_idle_sessions` and `verify_recent_distillation` (a host-side,
-///   no-LLM sanity check — did `memory/notes/` actually get any git commits
-///   in the last window, or is `daily_maintenance` just claiming to
-///   distill things without anything really landing on disk) run — both
-///   were tied to the old 6h cadence and would otherwise have started
-///   firing every 1h once the light pass shrank, which is wrong for both
-///   (an idle-session threshold of 1h is far too aggressive, and there's
-///   no point re-checking git history that fast). Also where the skill
-///   quality gate (adr/002-skill-v2.md §3) runs now — never-retrieved
-///   skills get rewritten/retired/merged here, not in `core_distillation`;
-///   the two don't depend on each other, and 6h keeps an unused skill from
-///   sitting unreviewed for a whole day.
+///   how long anything sits unprocessed; see `core_distillation` below for
+///   what replaced the escalation half of the old 6h job. Gated by
+///   `MAINTENANCE_WALL_CLOCK_SPEC` to only ever actually fire at minute 13
+///   of the hour, not on the hour — see that const's doc comment.
 /// - `core_distillation`, every `CORE_DISTILLATION_INTERVAL_SECS` (24h, its
-///   own checkpoint) — adr/001-memory-v2.md's third waterfall tier. Reads
-///   `maintenance_reports/summary/` since the last core run (not `hourly/`
-///   directly — one tier up from `maintenance_summary`, same "eat the layer
-///   below's *product*, not raw data" waterfall shape) and the current
-///   `/core.md`, decides what's durable enough to promote/demote, rewrites
-///   `/core.md` (capped, `agent/src/agent_loop.rs`'s `CORE_MD_MAX_CHARS`).
+///   own checkpoint) — the deep pass above the hourly one. Reads
+///   `maintenance_reports/hourly/` since the last core run (the hourly
+///   tier's *product*, not raw logs — bounded at ~24 reports), and from
+///   that: merges/dedupes fragmented notes and distills oversized ones,
+///   escalates (`chat_send`) a "needs attention" item that's stayed
+///   unresolved across 3+ reports, runs the skill quality gate
+///   (adr/002-skill-v2.md §3), and decides what's durable enough to
+///   promote/demote in `/core.md` (capped, `agent/src/agent_loop.rs`'s
+///   `CORE_MD_MAX_CHARS`). This used to be split across a separate 6h
+///   `maintenance_summary` tier; folded in here to keep just two layers —
+///   hourly writes notes, daily writes core.
 ///   `/core.md` itself can only ever be written during this trigger type
 ///   (`agent_loop.rs`'s `write_action_denial`) — no exception path, by
 ///   design (staleness gets fixed by the next distillation cycle rereading
@@ -280,6 +265,8 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
 ///   `crate::scheduler_tasks` — user/agent-defined jobs (`data_path` points
 ///   the woken session at its own instructions), independent of the two
 ///   built-in wakes above.
+/// - host-only housekeeping every `HOUSEKEEPING_INTERVAL_SECS` (6h, no LLM):
+///   `sweep_idle_sessions` and `verify_recent_distillation`.
 ///
 /// Every one of these goes through `crate::schedule_log` — the loop only
 /// ever *schedules* an occurrence (`<job>@<slot>`, idempotent: noticing the
@@ -292,7 +279,11 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
 /// its fire) and the 2026-07-15 one (one retry spawned four times) for why
 /// each of those used to need its own ad-hoc fix here.
 const MAINTENANCE_INTERVAL_SECS: i64 = 3600;
-const MAINTENANCE_SUMMARY_INTERVAL_SECS: i64 = 6 * 3600;
+/// Idle-session sweep + distillation sanity check cadence — and the
+/// idle threshold `sweep_idle_sessions` uses.
+const HOUSEKEEPING_INTERVAL_SECS: i64 = 6 * 3600;
+/// Fires at :18 on every 6th hour; deduped per slot by `schedule_log`.
+const HOUSEKEEPING_SPEC: &str = "18 */6 * * *";
 /// Both maintenance tiers only actually fire at minute 13 of the hour, never
 /// on the hour itself — deliberately offset from the common `:00` mark other
 /// cron-style jobs tend to cluster on (e.g. `morning_report`'s `0 2 * * *`),
@@ -302,40 +293,18 @@ const MAINTENANCE_SUMMARY_INTERVAL_SECS: i64 = 6 * 3600;
 /// checks above already gate *whether* a run is due; this just constrains
 /// *when within the hour* a due run is allowed to actually execute.
 const MAINTENANCE_WALL_CLOCK_SPEC: &str = "13 * * * *";
-/// `maintenance_summary` (6h) fires 5 minutes after `MAINTENANCE_WALL_CLOCK_SPEC`
-/// rather than the same `:13` — both used to share one spec, which meant on
-/// every 6h boundary tick the two could race: `tokio::spawn` runs both
-/// concurrently, so `maintenance_summary` could start reading
-/// `maintenance_reports/hourly/` before that same tick's `daily_maintenance`
-/// had finished writing its report. Not a correctness bug (the existing
-/// mtime-based `has_new_maintenance_reports` checkpoint still picks it up
-/// next time), but it meant that specific report waited a full extra 6h
-/// cycle to be consumed. A 5-minute stagger is a normal `daily_maintenance`
-/// run's entire duration several times over — this isn't a hard guarantee
-/// (an unusually slow run, e.g. one eating retry backoff, could still
-/// straddle it), just cheap, lock-free insurance for the common case; the
-/// existing checkpoint is still the real safety net for the rare case this
-/// doesn't cover. See `adr/001-memory-v2.md`'s "上下層錯開 fire 分鐘" note.
-const MAINTENANCE_SUMMARY_WALL_CLOCK_SPEC: &str = "18 * * * *";
-/// Third waterfall tier (adr/001-memory-v2.md): reads the last ~4
-/// `maintenance_summary` reports and `/core.md` itself, decides what's
-/// durable enough to promote/demote, rewrites `/core.md` (capped, see
-/// `agent/src/agent_loop.rs`'s `CORE_MD_MAX_CHARS`). The skill quality gate
-/// (adr/002-skill-v2.md §3) used to run here too but moved to
-/// `maintenance_summary` (6h) instead — core/notes promotion and skill
-/// review don't actually depend on each other, and 6h is frequent enough
-/// that an unused skill doesn't sit unreviewed for a whole day. 24h
-/// interval, own checkpoint (`last_core_marker_path`) — same "fire hourly
+/// Daily deep tier — see `scheduler_loop`'s doc comment for what it does.
+/// 24h interval, own checkpoint (`last_core_marker_path`) — same "fire hourly
 /// at a fixed minute, checkpoint gates whether it's actually due" pattern
 /// as the other two tiers, not a once-a-day-only cron match, so a missed
 /// tick still self-heals on the next one rather than waiting a full day.
 const CORE_DISTILLATION_INTERVAL_SECS: i64 = 24 * 3600;
-/// 5 minutes after `MAINTENANCE_SUMMARY_WALL_CLOCK_SPEC`, same lock-free
-/// stagger reasoning as that const's own doc comment — `core_distillation`
-/// reads `maintenance_summary`'s output, so on any tick where both are due
-/// (same 6h-boundary alignment happens once a day), this gives
-/// `maintenance_summary` a normal run's length of head start before core
-/// distillation starts reading `maintenance_reports/summary/`.
+/// 10 minutes after `MAINTENANCE_WALL_CLOCK_SPEC` — `core_distillation`
+/// reads `daily_maintenance`'s reports, so this gives that hour's hourly
+/// pass a normal run's length of head start before core distillation
+/// starts reading `maintenance_reports/hourly/`. Lock-free insurance for
+/// the common case, not a guarantee; the mtime checkpoint picks up a late
+/// report next cycle anyway.
 const CORE_DISTILLATION_WALL_CLOCK_SPEC: &str = "23 * * * *";
 /// `run_trigger`'s outcome shape: `{"ok":true,"result":{"summary":..},...}`
 /// on a completed run, `{"ok":false,"error":..}` only on a panic/spawn
@@ -414,22 +383,6 @@ fn write_last_maintenance(agent_home: &Path, now: i64) {
     let _ = std::fs::write(path, now.to_string());
 }
 
-fn last_maintenance_summary_marker_path(agent_home: &Path) -> PathBuf {
-    agent_home.join("maintenance_reports/.last_summary_run")
-}
-
-fn read_last_maintenance_summary(agent_home: &Path) -> i64 {
-    std::fs::read_to_string(last_maintenance_summary_marker_path(agent_home)).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
-}
-
-fn write_last_maintenance_summary(agent_home: &Path, now: i64) {
-    let path = last_maintenance_summary_marker_path(agent_home);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(path, now.to_string());
-}
-
 fn last_core_marker_path(agent_home: &Path) -> PathBuf {
     agent_home.join("maintenance_reports/.last_core_run")
 }
@@ -462,8 +415,6 @@ struct TierRunCounts {
 struct MaintenanceRunCounts {
     #[serde(default)]
     daily_maintenance: TierRunCounts,
-    #[serde(default)]
-    maintenance_summary: TierRunCounts,
     #[serde(default)]
     core_distillation: TierRunCounts,
 }
@@ -537,7 +488,7 @@ fn verify_recent_distillation(agent_home: &Path, window_secs: i64) {
 /// next check, making the short-circuit below never actually engage: a
 /// tier that ran once would keep re-triggering itself forever purely from
 /// its own bookkeeping, independent of whether anything real ever happened.
-const MAINTENANCE_TRIGGER_TYPES: &[&str] = &["daily_maintenance", "maintenance_summary", "core_distillation"];
+const MAINTENANCE_TRIGGER_TYPES: &[&str] = &["daily_maintenance", "core_distillation"];
 
 fn has_new_log_entries(agent_home: &Path, since_ts: i64) -> bool {
     let today_day = crate::logs::now_unix_secs() / 86_400;
@@ -571,8 +522,8 @@ fn has_new_log_entries(agent_home: &Path, since_ts: i64) -> bool {
 /// Used to gate `daily_maintenance` short-circuiting (combined with
 /// `has_new_log_entries`) — deliberately **not** mtime-only: an untouched
 /// pending item (e.g. a still-unresolved "needs attention" reminder nobody's
-/// acted on) must keep showing up in every hourly report, or the 6h
-/// escalation in `adr/001-memory-v2.md` §4 ("same item appears 3+ times
+/// acted on) must keep showing up in every hourly report, or the daily
+/// `core_distillation` escalation (`adr/001-memory-v2.md` §4 ("same item appears 3+ times
 /// unchanged → chat_send the human") can never accumulate past 1 — the item
 /// gets noted once, then the following hours short-circuit on stale mtime
 /// and the item silently stops being re-surfaced, exactly during the quiet
@@ -595,26 +546,10 @@ fn workspace_memory_has_new_files(agent_home: &Path, since_ts: i64) -> bool {
 }
 
 /// Whether `maintenance_reports/hourly/` has any `daily_maintenance`
-/// report written since `since_ts` — that's the only material
-/// `maintenance_summary` merges/escalates from; its own output lives in the
-/// separate `maintenance_reports/summary/` folder, see
-/// `agent_loop.rs`'s trigger_note for both.
+/// report written since `since_ts` — that's `core_distillation`'s primary
+/// input; with none, there's nothing new to consolidate or promote.
 fn has_new_maintenance_reports(agent_home: &Path, since_ts: i64) -> bool {
     let Ok(entries) = std::fs::read_dir(agent_home.join("maintenance_reports/hourly")) else { return false };
-    entries.flatten().any(|e| {
-        e.metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .is_some_and(|d| d.as_secs() as i64 > since_ts)
-    })
-}
-
-/// Same shape as `has_new_maintenance_reports`, one tier up —
-/// `core_distillation`'s primary input is `maintenance_reports/summary/`,
-/// not `hourly/` (adr/001-memory-v2.md §1: 24h eats 6h's output, not 1h's).
-fn has_new_summary_reports(agent_home: &Path, since_ts: i64) -> bool {
-    let Ok(entries) = std::fs::read_dir(agent_home.join("maintenance_reports/summary")) else { return false };
     entries.flatten().any(|e| {
         e.metadata()
             .and_then(|m| m.modified())
@@ -654,7 +589,7 @@ async fn sweep_idle_sessions(state: &Arc<AppState>, idle_after: Duration) {
 }
 
 const JOB_DAILY_MAINTENANCE: &str = "daily_maintenance";
-const JOB_MAINTENANCE_SUMMARY: &str = "maintenance_summary";
+const JOB_HOUSEKEEPING: &str = "housekeeping";
 const JOB_CORE_DISTILLATION: &str = "core_distillation";
 const JOB_CRON: &str = "cron";
 const TASK_JOB_PREFIX: &str = "task:";
@@ -726,41 +661,21 @@ async fn schedule_due_occurrences(state: &Arc<AppState>, gap_start: i64, now: i6
         }
     }
 
-    let last_summary = read_last_maintenance_summary(&state.agent_home);
-    if now - last_summary >= MAINTENANCE_SUMMARY_INTERVAL_SECS && crate::cron::matches(MAINTENANCE_SUMMARY_WALL_CLOCK_SPEC, now) {
-        let has_reports = has_new_maintenance_reports(&state.agent_home, last_summary);
-        let newly_due = if has_reports {
-            log.schedule(JOB_MAINTENANCE_SUMMARY, slot, now)
-        } else {
-            // no hourly reports since last summary — likely every hour in
-            // this window was itself skipped for lack of activity; nothing
-            // to merge or escalate from, so this counts as a full review of
-            // [last_summary, now) same as a real run.
-            log.skip(JOB_MAINTENANCE_SUMMARY, slot, now, "no new hourly maintenance reports")
-        };
-        if newly_due {
-            // host-only, cheap — once per due summary slot, regardless of
-            // whether there's a summary LLM pass to do (idle-session
-            // sweeping and the distillation sanity check aren't about
-            // *this* tier's own output)
-            sweep_idle_sessions(state, Duration::from_secs(MAINTENANCE_SUMMARY_INTERVAL_SECS as u64)).await;
-            verify_recent_distillation(&state.agent_home, MAINTENANCE_SUMMARY_INTERVAL_SECS);
-            if has_reports {
-                record_maintenance_tier(&state.agent_home, |c| &mut c.maintenance_summary, true);
-            } else {
-                write_last_maintenance_summary(&state.agent_home, slot);
-                record_maintenance_tier(&state.agent_home, |c| &mut c.maintenance_summary, false);
-            }
-        }
+    // host-only, no LLM — recorded as an already-finished occurrence so
+    // the two ticks inside the :18 minute (or a restart) run it once
+    if crate::cron::matches(HOUSEKEEPING_SPEC, now) && log.complete_inline(JOB_HOUSEKEEPING, slot, now) {
+        sweep_idle_sessions(state, Duration::from_secs(HOUSEKEEPING_INTERVAL_SECS as u64)).await;
+        verify_recent_distillation(&state.agent_home, HOUSEKEEPING_INTERVAL_SECS);
     }
 
     let last_core_run = read_last_core_run(&state.agent_home);
     if now - last_core_run >= CORE_DISTILLATION_INTERVAL_SECS && crate::cron::matches(CORE_DISTILLATION_WALL_CLOCK_SPEC, now) {
-        if !has_new_summary_reports(&state.agent_home, last_core_run) {
-            // no maintenance_summary reports since last core run — nothing
-            // new to promote/demote from; same "the check itself is a full
-            // review" reasoning as the other two tiers.
-            if log.skip(JOB_CORE_DISTILLATION, slot, now, "no new maintenance_summary reports") {
+        if !has_new_maintenance_reports(&state.agent_home, last_core_run) {
+            // no hourly reports since last core run — every hour in this
+            // window was itself skipped for lack of activity; nothing new to
+            // consolidate or promote, same "the check itself is a full
+            // review" reasoning as the hourly tier.
+            if log.skip(JOB_CORE_DISTILLATION, slot, now, "no new hourly maintenance reports") {
                 write_last_core_run(&state.agent_home, slot);
                 record_maintenance_tier(&state.agent_home, |c| &mut c.core_distillation, false);
             }
@@ -833,7 +748,6 @@ async fn execute_occurrence(state: Arc<AppState>, occ: crate::schedule_log::Occu
     // was in flight still lands in the next window.
     match occ.job.as_str() {
         JOB_DAILY_MAINTENANCE => write_last_maintenance(&state.agent_home, occ.slot),
-        JOB_MAINTENANCE_SUMMARY => write_last_maintenance_summary(&state.agent_home, occ.slot),
         JOB_CORE_DISTILLATION => write_last_core_run(&state.agent_home, occ.slot),
         _ => {}
     }
@@ -844,7 +758,6 @@ fn build_occurrence_trigger(state: &Arc<AppState>, occ: &crate::schedule_log::Oc
     let home = &state.agent_home;
     match occ.job.as_str() {
         JOB_DAILY_MAINTENANCE => Ok(json!({"type": JOB_DAILY_MAINTENANCE, "since_ts": read_last_maintenance(home)})),
-        JOB_MAINTENANCE_SUMMARY => Ok(json!({"type": JOB_MAINTENANCE_SUMMARY, "since_ts": read_last_maintenance_summary(home)})),
         JOB_CORE_DISTILLATION => Ok(json!({"type": JOB_CORE_DISTILLATION, "since_ts": read_last_core_run(home)})),
         JOB_CRON => Ok(json!({"type": "cron", "recent_chat": recent_chat_context(home, DEFAULT_SESSION_KEY)})),
         job => {
@@ -1552,11 +1465,11 @@ fn collect_notes(dir: &Path, base: &Path) -> Vec<Value> {
 }
 
 /// One report per maintenance run — `hourly/` (`daily_maintenance`, every
-/// 1h), `summary/` (`maintenance_summary`, every 6h), and `core/`
-/// (`core_distillation`, every 24h, adr/001-memory-v2.md) are separate
+/// 1h) and `core/` (`core_distillation`, every 24h) — plus `summary/` from
+/// the since-removed 6h tier, still listed if present — are separate
 /// subfolders, not one flat directory distinguished only by a filename
 /// suffix. `date` is `"<kind>/<filename stem>"` (e.g.
-/// `"hourly/2026-07-05_1830"`) — the kind prefix keeps all three tiers'
+/// `"hourly/2026-07-05_1830"`) — the kind prefix keeps every tier's
 /// keys unique even on the rare tick where more than one fires with the same
 /// `maintenance_run_id`, at the cost of sorting the tiers as separate
 /// newest-first blocks rather than fully interleaved by time; `.last_run`/
@@ -2525,7 +2438,7 @@ mod has_new_log_entries_tests {
             &today,
             "\n## run at 2026-07-21 19:13:00 UTC (ts=2000)\ntrigger: daily_maintenance — nothing new\nsummary: nothing new\n",
         );
-        assert!(!has_new_log_entries(&dir, 1000), "a tier's own daily_maintenance/maintenance_summary/core_distillation entry must not count as new activity");
+        assert!(!has_new_log_entries(&dir, 1000), "a tier's own daily_maintenance/core_distillation entry must not count as new activity");
     }
 
     #[test]
