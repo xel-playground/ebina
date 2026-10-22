@@ -231,6 +231,9 @@ pub struct NetworkConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct NetworkCredential {
     pub host: String,
+    /// `"{secrets.NAME}"` — same reference form as an `api_key` field (a
+    /// bare `"NAME"` still works for older configs), see
+    /// `secrets::secret_ref_name`
     pub secret: String,
 }
 
@@ -373,7 +376,8 @@ pub struct SshConfig {
     /// every other syscall's output cap, so a chatty/looping remote command
     /// can't blow up the LLM context or the log file
     pub max_output_bytes: usize,
-    /// Names (not values) of vault secrets `ssh_exec` is allowed to
+    /// Vault secrets (by reference — `"{secrets.NAME}"`, or a bare `"NAME"`
+    /// in older configs; never a value) `ssh_exec` is allowed to
     /// substitute a `{secrets.NAME}` placeholder for inside a `command`
     /// string (`secrets::resolve_placeholders_in`) — empty by default,
     /// meaning no secret is usable this way until explicitly named here.

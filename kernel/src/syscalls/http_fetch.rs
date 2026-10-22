@@ -94,7 +94,7 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
     // unbound placeholder means the request never goes out at all, rather
     // than going out with the literal placeholder text still in it.
     let allowed_secrets: Vec<String> =
-        state.config.network.credentials.iter().filter(|c| c.host == host).map(|c| c.secret.clone()).collect();
+        state.config.network.credentials.iter().filter(|c| c.host == host).map(|c| crate::secrets::secret_ref_name(&c.secret).to_string()).collect();
     let raw_headers = req.get("headers").and_then(|h| h.as_object()).cloned().unwrap_or_default();
     let mut resolved_headers: Vec<(String, String)> = Vec::with_capacity(raw_headers.len());
     for (name, value) in &raw_headers {

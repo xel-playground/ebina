@@ -53,6 +53,16 @@ impl Secrets {
 const PREFIX: &str = "{secrets.";
 const SUFFIX: &str = "}";
 
+/// The vault name a config field refers to — `{secrets.NAME}` (the same
+/// placeholder form `api_key` fields use) or, for older configs, the bare
+/// `NAME`. Used for fields that *name* a secret rather than resolve it
+/// (`[[network.credentials]] secret`, `[ssh] allowed_secrets`), so every
+/// secret reference in `config.toml` can be written one way.
+pub fn secret_ref_name(spec: &str) -> &str {
+    let spec = spec.trim();
+    spec.strip_prefix(PREFIX).and_then(|s| s.strip_suffix(SUFFIX)).unwrap_or(spec)
+}
+
 /// Resolves a config field that must be a vault placeholder — `{secrets.NAME}`
 /// — into the actual secret value. Rejects anything else (including a bare
 /// literal key) so a key can never end up sitting in `config.toml` in the
@@ -118,6 +128,13 @@ pub fn resolve_placeholders_in(secrets: &Secrets, text: &str, allowed: &[String]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_ref_name_accepts_placeholder_and_bare_forms() {
+        assert_eq!(secret_ref_name("{secrets.discord_bot_token}"), "discord_bot_token");
+        assert_eq!(secret_ref_name(" {secrets.x} "), "x");
+        assert_eq!(secret_ref_name("discord_bot_token"), "discord_bot_token");
+    }
 
     fn secrets_with(name: &str, value: &str) -> Secrets {
         let mut map = HashMap::new();

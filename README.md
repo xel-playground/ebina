@@ -548,7 +548,7 @@ full regardless of outcome, gated by `[network] get_mode` (`"open"` default
 A header or body value may reference `{secrets.NAME}` — resolved host-side
 (`secrets::resolve_placeholders_in`, same function `ssh_exec` uses), the
 guest only ever sees the placeholder text. Gated by `[network].credentials`
-(`[[network.credentials]] host = "..."`, `secret = "..."`) — `NAME` must be
+(`[[network.credentials]] host = "..."`, `secret = "{secrets.NAME}"`) — `NAME` must be
 bound to the *exact* host the request's URL resolves to, or the whole
 request fails closed with `bad_secret_placeholder` before anything is sent.
 Deliberately a static, human-edited list rather than anything reachable
