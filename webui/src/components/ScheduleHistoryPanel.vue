@@ -5,6 +5,10 @@ import { api } from '../api'
 const status = ref(null)
 const wakeResult = ref('')
 const runs = ref([])
+// one entry per scheduled occurrence (`<job>@<slot>`), newest slot first —
+// the event-sourced pending/running/succeeded/failed/skipped state from
+// kernel/src/schedule_log.rs
+const occurrences = ref([])
 // `/api/scheduler/runs` already sorts newest first server-side
 // (kernel/src/gateway.rs `get_scheduled_runs`) — reversing here undid that
 const rows = computed(() => runs.value)
@@ -19,6 +23,19 @@ let interval = null
 async function refresh() {
   status.value = (await api('/status')).body
   runs.value = (await api('/scheduler/runs')).body.runs || []
+  occurrences.value = (await api('/scheduler/occurrences')).body.occurrences || []
+}
+const STATE_COLOR = { pending: 'var(--muted)', running: 'var(--accent)', succeeded: 'var(--ok)', failed: 'var(--err)', skipped: 'var(--muted)' }
+function fmt(ts) {
+  return ts ? new Date(ts * 1000).toLocaleString() : '—'
+}
+// a pending occurrence with attempts behind it is waiting out a retry backoff
+function retryNote(o) {
+  return o.state === 'pending' && o.attempts > 0 ? `retry at ${fmt(o.not_before)}` : ''
+}
+async function retryOccurrence(o) {
+  await api('/scheduler/occurrences/' + encodeURIComponent(o.id) + '/retry', { method: 'POST' })
+  refresh()
 }
 async function wakeNow() {
   if (busy.value) return
@@ -61,9 +78,10 @@ defineExpose({ refresh })
   <div>
     <h2>Schedule history <button class="secondary" @click="refresh">Refresh</button></h2>
     <div class="card">
-      <p class="hint">Background loop ticks every 30s: fires a fresh (no chat history) `daily_maintenance`
-        session once today's report is missing, a fresh `cron` session once the agent's own last
-        `sleep_until` has passed, and one fresh session per matching Scheduler task. "Wake now" is manual/dev use.</p>
+      <p class="hint">Background loop ticks every 30s and schedules each due slot exactly once (maintenance tiers,
+        the agent's own `sleep_until` wake, each matching Scheduler task) — duplicates across ticks or restarts are
+        no-ops. Failed attempts retry after 15 min, up to 3 times; a run cut off by a kernel restart counts as a failed
+        attempt. "Wake now" is manual/dev use and isn't tracked as an occurrence.</p>
       <dl class="kv">
         <dt>next requested wake</dt>
         <dd>{{ status?.last_run?.sleep_until ? new Date(status.last_run.sleep_until * 1000).toLocaleString() : '—' }}</dd>
@@ -72,6 +90,24 @@ defineExpose({ refresh })
       </dl>
       <div class="row"><button @click="wakeNow" :disabled="busy">{{ busy ? '⏳ scheduler running…' : 'Wake now' }}</button></div>
       <pre v-if="wakeResult">{{ wakeResult }}</pre>
+    </div>
+
+    <h3>Occurrences</h3>
+    <div class="hint" v-if="occurrences.length === 0">nothing scheduled yet</div>
+    <div class="card" v-else style="margin-bottom:1rem; overflow-x:auto">
+      <table class="occurrences">
+        <thead><tr><th>job</th><th>slot</th><th>state</th><th>attempts</th><th>detail</th><th></th></tr></thead>
+        <tbody>
+          <tr v-for="o in occurrences" :key="o.id">
+            <td><code>{{ o.job }}</code></td>
+            <td>{{ fmt(o.slot) }}</td>
+            <td :style="{ color: STATE_COLOR[o.state] }">{{ o.state }}</td>
+            <td>{{ o.attempts }}</td>
+            <td class="hint" style="margin:0">{{ retryNote(o) || o.last_error || '' }}</td>
+            <td><button v-if="o.state === 'failed'" class="secondary" @click="retryOccurrence(o)">Retry</button></td>
+          </tr>
+        </tbody>
+      </table>
     </div>
 
     <h3>Scheduled run history</h3>
@@ -88,3 +124,9 @@ defineExpose({ refresh })
     </div>
   </div>
 </template>
+
+<style scoped>
+.occurrences { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+.occurrences th { text-align: left; color: var(--muted); font-weight: 500; padding: 0.3rem 0.5rem; }
+.occurrences td { padding: 0.3rem 0.5rem; border-top: 1px solid var(--border); vertical-align: top; }
+</style>

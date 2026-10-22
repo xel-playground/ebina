@@ -170,6 +170,36 @@ arbitrary text — read [Web fetch](#web-fetch-http_fetch-syscall)'s
 "untrusted content from the open internet, same as a tool's stdout" framing
 for how the agent itself is told to treat it.
 
+## Scheduler (event-sourced, idempotent)
+
+Every self-driven run — the three maintenance tiers, the agent's own
+`sleep_until` wake (`cron`), and each `scheduled_task` — is an
+*occurrence* `<job>@<slot>` (e.g. `task:abc@1783328400`), and its whole
+lifecycle is an append-only event log, `logs/scheduler_events.jsonl`
+(`kernel/src/schedule_log.rs`):
+
+- **Idempotent scheduling** — the occurrence id is the key; the 30s tick
+  noticing the same due slot twice, or again after a restart, is a no-op.
+  A job with an open (pending/running) occurrence doesn't get a newer one
+  stacked on top.
+- **Exclusive execution** — a pending occurrence is claimed by writing its
+  `started` event under the same lock that checks its state, so it can
+  never start twice; at most one running occurrence per job.
+- **States** — `pending` → `running` → `succeeded` / `failed`, or
+  `skipped` (due, but nothing to do). A failed attempt goes back to
+  `pending` with a 15-minute backoff, up to 3 retries; then it's terminal
+  until its next natural slot (or a manual Retry from the webui).
+- **Restart recovery** — the state is rebuilt by replaying the log; an
+  occurrence still `running` at boot was cut off mid-run and is recorded as
+  a failed attempt, so the normal retry policy re-runs it (this can repeat
+  side effects like `chat_send` that the cut-off attempt already made).
+
+`GET /api/scheduler/occurrences` returns the projected state (the
+Schedule history panel shows it); `POST
+/api/scheduler/occurrences/{id}/retry` re-queues a terminally failed one.
+Per-attempt details (trigger + outcome) still land in
+`logs/scheduled_runs/`, linked from each occurrence's `run_file`.
+
 ## Quick start (`ebinactl`)
 
 This is the normal way to run an agent — build once, then everything else

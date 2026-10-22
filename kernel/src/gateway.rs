@@ -14,7 +14,6 @@ use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -79,7 +78,7 @@ pub(crate) struct AppState {
     /// `agent_loop.rs`'s `write_action_denial`): a `message` run can only
     /// touch `/workspace/`, curated `memory/notes/` is `daily_maintenance`-
     /// only, and only one `daily_maintenance` (same for `maintenance_summary`)
-    /// is ever in flight at a time (an `AtomicBool` guard in `scheduler_loop`,
+    /// is ever in flight at a time (`schedule_log` runs at most one occurrence per job,
     /// not just gating — 2026-07-12: `scheduler_loop` used to `.await` each
     /// fired trigger inline, one giant sequential loop body, which
     /// accidentally *serialized* everything this comment already claimed was
@@ -110,6 +109,9 @@ pub(crate) struct AppState {
     /// per-session; this is trigger-type-agnostic so the webui still gets a
     /// meaningful "something's running right now" signal.
     active_runs: std::sync::atomic::AtomicUsize,
+    /// every scheduler-driven occurrence's event-sourced state — see
+    /// `crate::schedule_log`
+    schedule_log: Arc<crate::schedule_log::ScheduleLog>,
 }
 
 impl AppState {
@@ -153,6 +155,7 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
         anyhow::bail!("agent binary {} doesn't exist", cfg.agent_path.display());
     }
 
+    let schedule_log = Arc::new(crate::schedule_log::ScheduleLog::load(crate::schedule_log::ScheduleLog::path_for(&cfg.agent_home)));
     let state = Arc::new(AppState {
         agent_home: cfg.agent_home,
         agent_path: cfg.agent_path,
@@ -160,6 +163,7 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
         session_locks: KeyedLocks::new(),
         task_run_locks: KeyedLocks::new(),
         active_runs: std::sync::atomic::AtomicUsize::new(0),
+        schedule_log,
     });
 
     let api = Router::new()
@@ -194,6 +198,8 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
         .route("/discord/pairing", get(get_discord_pairing))
         .route("/llm/logs", get(get_llm_logs))
         .route("/scheduler/runs", get(get_scheduled_runs))
+        .route("/scheduler/occurrences", get(get_scheduler_occurrences))
+        .route("/scheduler/occurrences/{id}/retry", post(post_scheduler_occurrence_retry))
         .route("/scheduler/tasks", get(get_scheduler_tasks).post(post_scheduler_task))
         .route("/scheduler/tasks/{id}", axum::routing::put(put_scheduler_task).delete(delete_scheduler_task))
         .route("/scheduler/task_file", get(get_task_file).put(put_task_file))
@@ -273,18 +279,18 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
 /// - one `scheduled_task` wake per enabled, cron-matching entry under
 ///   `crate::scheduler_tasks` — user/agent-defined jobs (`data_path` points
 ///   the woken session at its own instructions), independent of the two
-///   built-in wakes above. A run that aborts (an `llm_call` failure chain —
-///   see the 2026-07-12 Moonshot content-filter incident, a morning-report
-///   task that silently missed its one daily fire and only got noticed
-///   because the agent happened to catch it on its own during a later
-///   `cron` wake) gets retried on the same
-///   `SCHEDULED_TASK_RETRY_BACKOFF_SECS` in-memory backoff `daily_maintenance`
-///   already uses, up to `SCHEDULED_TASK_MAX_RETRIES` times, rather than
-///   waiting for the cron string's next natural match (which could be a
-///   full day away for a once-daily task) — tracked in-memory only
-///   (`task_retry_state`), same as `last_daily_maintenance_attempt`, so a
-///   kernel restart resets any in-flight retry streak rather than persisting
-///   it forever.
+///   built-in wakes above.
+///
+/// Every one of these goes through `crate::schedule_log` — the loop only
+/// ever *schedules* an occurrence (`<job>@<slot>`, idempotent: noticing the
+/// same due slot on several ticks or across a restart schedules it once),
+/// then claims whatever is ready and spawns it. Pending/running/succeeded/
+/// failed state, retries (`schedule_log::RETRY_BACKOFF_SECS`, up to
+/// `schedule_log::MAX_RETRIES`) and restart recovery all live in that
+/// append-only event log, not in this loop's memory — see the 2026-07-12
+/// Moonshot content-filter incident (a once-daily task that silently missed
+/// its fire) and the 2026-07-15 one (one retry spawned four times) for why
+/// each of those used to need its own ad-hoc fix here.
 const MAINTENANCE_INTERVAL_SECS: i64 = 3600;
 const MAINTENANCE_SUMMARY_INTERVAL_SECS: i64 = 6 * 3600;
 /// Both maintenance tiers only actually fire at minute 13 of the hour, never
@@ -331,43 +337,18 @@ const CORE_DISTILLATION_INTERVAL_SECS: i64 = 24 * 3600;
 /// `maintenance_summary` a normal run's length of head start before core
 /// distillation starts reading `maintenance_reports/summary/`.
 const CORE_DISTILLATION_WALL_CLOCK_SPEC: &str = "23 * * * *";
-/// Same 15-minute backoff `daily_maintenance` already retries a failed run
-/// on — see `scheduler_loop`'s doc comment.
-const SCHEDULED_TASK_RETRY_BACKOFF_SECS: i64 = 900;
-/// After this many consecutive failed attempts at the same due occurrence,
-/// stop retrying and wait for the cron string's next natural match instead
-/// — an indefinitely-retrying task (e.g. a persistent provider-side content
-/// filter rejection that isn't going to resolve itself within the hour)
-/// would otherwise burn `llm_call` attempts and budget forever.
-const SCHEDULED_TASK_MAX_RETRIES: u32 = 3;
-
 /// `run_trigger`'s outcome shape: `{"ok":true,"result":{"summary":..},...}`
 /// on a completed run, `{"ok":false,"error":..}` only on a panic/spawn
 /// failure — a plain `llm_call` failure chain (`agent_loop.rs` aborts the
 /// whole run rather than continuing with a broken turn) still comes back
 /// `ok:true` with `result.summary` starting `"run aborted"`, so both need
 /// checking to catch every way a self-driven run can fail to actually
-/// finish its job. Shared by `daily_maintenance` (skip advancing its
-/// checkpoint) and `scheduled_task` (retry) — same failure shape, two
-/// different recoveries.
+/// finish its job. Decides whether `schedule_log` records the attempt as
+/// succeeded or failed (and so whether a maintenance tier's checkpoint
+/// advances).
 fn outcome_aborted(outcome: &Value) -> bool {
     !outcome.get("ok").and_then(Value::as_bool).unwrap_or(false)
         || outcome.get("result").and_then(|r| r.get("summary")).and_then(Value::as_str).is_some_and(|s| s.starts_with("run aborted"))
-}
-
-/// Pure decision logic for whether `scheduler_loop` should run a
-/// `scheduled_task` this tick — split out from the loop itself so the
-/// backoff/retry-cap math is unit-testable without waiting on real
-/// wall-clock time through the actual 30s-tick loop (`SCHEDULED_TASK_
-/// RETRY_BACKOFF_SECS` is 15 minutes). `retry_state` is `(last_attempt_ts,
-/// consecutive_failures)` for this task id, if any attempt has happened
-/// yet.
-fn scheduled_task_should_run(due_now: bool, retry_state: Option<(i64, u32)>, now: i64) -> bool {
-    if due_now {
-        return true;
-    }
-    retry_state
-        .is_some_and(|(last_attempt, failures)| failures > 0 && failures <= SCHEDULED_TASK_MAX_RETRIES && now - last_attempt >= SCHEDULED_TASK_RETRY_BACKOFF_SECS)
 }
 
 fn scheduler_tick_marker_path(agent_home: &Path) -> PathBuf {
@@ -399,20 +380,22 @@ fn write_scheduler_last_tick(agent_home: &Path, now: i64) {
 /// inside a long `.await` — during which `scheduled_task`'s own `due_now`
 /// check, tied to *this* tick's current minute alone, never got a chance to
 /// see an exact-minute cron match that fell inside the gap and is gone
-/// forever once the minute passes. Fires the task once to catch up rather
+/// forever once the minute passes. Returns the *latest* matching minute
+/// (as that occurrence's slot) so the task fires once to catch up rather
 /// than once per missed minute in the gap — a long outage spanning several
 /// of a daily task's matching minutes should bring it current, not replay
 /// a backlog of stale runs.
-fn missed_in_gap(cron_spec: &str, gap_start: i64, now: i64) -> bool {
+fn missed_in_gap(cron_spec: &str, gap_start: i64, now: i64) -> Option<i64> {
     let mut t = gap_start + 60;
     let cutoff = now - 60; // this tick's own current minute is due_now's job, not this
+    let mut latest = None;
     while t < cutoff {
         if crate::cron::matches(cron_spec, t) {
-            return true;
+            latest = Some(t - t.rem_euclid(60));
         }
         t += 60;
     }
-    false
+    latest
 }
 
 fn last_maintenance_marker_path(agent_home: &Path) -> PathBuf {
@@ -670,28 +653,27 @@ async fn sweep_idle_sessions(state: &Arc<AppState>, idle_after: Duration) {
     }
 }
 
+const JOB_DAILY_MAINTENANCE: &str = "daily_maintenance";
+const JOB_MAINTENANCE_SUMMARY: &str = "maintenance_summary";
+const JOB_CORE_DISTILLATION: &str = "core_distillation";
+const JOB_CRON: &str = "cron";
+const TASK_JOB_PREFIX: &str = "task:";
+
+/// The minute `ts` falls in — every slot is minute-aligned, so the two
+/// 30s ticks inside one cron minute agree on the same occurrence id.
+fn minute_slot(ts: i64) -> i64 {
+    ts - ts.rem_euclid(60)
+}
+
 async fn scheduler_loop(state: Arc<AppState>) {
-    let mut last_daily_maintenance_attempt: Option<i64> = None;
-    let mut last_maintenance_summary_attempt: Option<i64> = None;
-    let mut last_core_distillation_attempt: Option<i64> = None;
-    let mut last_handled_sleep_until: Option<i64> = None;
-    // (last_attempt_ts, consecutive_failures) per task id — see this fn's
-    // doc comment and `SCHEDULED_TASK_RETRY_BACKOFF_SECS`/`_MAX_RETRIES`.
-    // Behind a `Mutex` now, not a plain local — spawned task runs (below)
-    // update it from outside this loop's own stack frame.
-    let task_retry_state: Arc<tokio::sync::Mutex<std::collections::HashMap<String, (i64, u32)>>> = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-    // Guards against a *second* daily_maintenance/maintenance_summary spawn
-    // starting while one of the same tier is still running — the one
-    // invariant `AppState`'s own doc comment on background-trigger
-    // concurrency still requires ("only one daily_maintenance is ever in
-    // flight at a time"). Nothing analogous is needed for scheduled_task or
-    // the cron self-wake below: two different scheduled_tasks (or a
-    // scheduled_task racing daily_maintenance) running concurrently is an
-    // already-accepted risk (same doc comment), and the cron self-wake is
-    // deduped by `last_handled_sleep_until` before it ever spawns.
-    let daily_maintenance_running = Arc::new(AtomicBool::new(false));
-    let maintenance_summary_running = Arc::new(AtomicBool::new(false));
-    let core_distillation_running = Arc::new(AtomicBool::new(false));
+    let log = state.schedule_log.clone();
+    let recovered = log.recover_interrupted(crate::logs::now_unix_secs());
+    if !recovered.is_empty() {
+        let _ = crate::logs::notify(
+            &state.agent_home,
+            &format!("scheduler: {} run(s) were cut off by a kernel restart, retrying: {}", recovered.len(), recovered.join(", ")),
+        );
+    }
     // Persisted (not a local `Option`) — a plain local would reset to "no
     // gap" on every kernel restart, exactly the case (downtime spanning an
     // exact-minute cron match) this is meant to catch. 0 sentinel means
@@ -706,194 +688,170 @@ async fn scheduler_loop(state: Arc<AppState>) {
         write_scheduler_last_tick(&state.agent_home, now);
         scheduler_last_tick = now;
 
-        let last_maintenance = read_last_maintenance(&state.agent_home);
-        if now - last_maintenance >= MAINTENANCE_INTERVAL_SECS
-            && crate::cron::matches(MAINTENANCE_WALL_CLOCK_SPEC, now)
-            && last_daily_maintenance_attempt.is_none_or(|last| now - last >= 900)
-            && !daily_maintenance_running.load(Ordering::SeqCst)
-        {
-            last_daily_maintenance_attempt = Some(now);
-            if !has_new_log_entries(&state.agent_home, last_maintenance) && !workspace_memory_has_new_files(&state.agent_home, last_maintenance) {
-                // nothing logged and nothing changed under workspace/memory/
-                // since last time — an LLM pass here would just come back
-                // saying so. The check itself *is* a full, deterministic
-                // review of [last_maintenance, now), so it's safe to advance
-                // the checkpoint same as a real completed run would.
-                write_last_maintenance(&state.agent_home, now);
-                record_maintenance_tier(&state.agent_home, |c| &mut c.daily_maintenance, false);
-            } else {
-                record_maintenance_tier(&state.agent_home, |c| &mut c.daily_maintenance, true);
-                // `tokio::spawn`, not `.await` — a real LLM-driven pass here
-                // has taken several minutes in practice, and this loop is
-                // the *only* place a `scheduled_task`'s exact-minute cron
-                // match gets checked. Blocking the whole tick loop on this
-                // await meant an exact-minute task (e.g. `rss_tech_report`
-                // at `17 9 * * *`) due a few minutes after this fires could
-                // silently miss its entire day — the loop simply never got
-                // back around to checking it until the minute had passed,
-                // no error, no retry, nothing (the 2026-07-12 incident this
-                // comment is about). `AppState`'s own doc comment already
-                // documents background triggers as safe to run fully
-                // concurrently with everything else; this just actually
-                // exploits that instead of accidentally serializing on the
-                // single loop task.
-                daily_maintenance_running.store(true, Ordering::SeqCst);
-                let spawn_state = state.clone();
-                let running = daily_maintenance_running.clone();
-                tokio::spawn(async move {
-                    let outcome = run_scheduled(spawn_state.clone(), json!({"type": "daily_maintenance", "since_ts": last_maintenance})).await;
-                    // only advance the checkpoint on a real completion — `run()`'s
-                    // one hard-failure path (agent_loop.rs: an `llm_call` error
-                    // aborts the whole run) still reports a `summary`, just one
-                    // starting with "run aborted". Advancing on that would silently
-                    // skip whatever happened in `[last_maintenance, now)` forever:
-                    // the next run's `since_ts` moves past it with nothing ever
-                    // having actually reviewed that window (this is exactly what
-                    // happened during the 2026-07-08 Moonshot API outage — a failed
-                    // run's checkpoint write ate a whole window's worth of activity).
-                    if !outcome_aborted(&outcome) {
-                        write_last_maintenance(&spawn_state.agent_home, now);
-                    }
-                    running.store(false, Ordering::SeqCst);
-                });
-            }
-        }
+        schedule_due_occurrences(&state, gap_start, now).await;
 
-        let last_summary = read_last_maintenance_summary(&state.agent_home);
-        if now - last_summary >= MAINTENANCE_SUMMARY_INTERVAL_SECS
-            && crate::cron::matches(MAINTENANCE_SUMMARY_WALL_CLOCK_SPEC, now)
-            && last_maintenance_summary_attempt.is_none_or(|last| now - last >= 900)
-            && !maintenance_summary_running.load(Ordering::SeqCst)
-        {
-            last_maintenance_summary_attempt = Some(now);
-            // host-only, cheap — run regardless of whether there's a
-            // summary LLM pass to do below (idle-session sweeping and the
-            // distillation sanity check aren't about *this* tier's own
-            // output)
-            sweep_idle_sessions(&state, Duration::from_secs(MAINTENANCE_SUMMARY_INTERVAL_SECS as u64)).await;
-            verify_recent_distillation(&state.agent_home, MAINTENANCE_SUMMARY_INTERVAL_SECS);
-            if !has_new_maintenance_reports(&state.agent_home, last_summary) {
-                // no hourly reports since last summary — likely every hour
-                // in this window was itself skipped for lack of activity;
-                // nothing to merge or escalate from, so this counts as a
-                // full review of [last_summary, now) same as a real run.
-                write_last_maintenance_summary(&state.agent_home, now);
-                record_maintenance_tier(&state.agent_home, |c| &mut c.maintenance_summary, false);
-            } else {
-                record_maintenance_tier(&state.agent_home, |c| &mut c.maintenance_summary, true);
-                // spawned for the same reason as daily_maintenance above —
-                // see that block's comment.
-                maintenance_summary_running.store(true, Ordering::SeqCst);
-                let spawn_state = state.clone();
-                let running = maintenance_summary_running.clone();
-                tokio::spawn(async move {
-                    let outcome = run_scheduled(spawn_state.clone(), json!({"type": "maintenance_summary", "since_ts": last_summary})).await;
-                    if !outcome_aborted(&outcome) {
-                        write_last_maintenance_summary(&spawn_state.agent_home, now);
-                    }
-                    running.store(false, Ordering::SeqCst);
-                });
-            }
-        }
-
-        let last_core_run = read_last_core_run(&state.agent_home);
-        if now - last_core_run >= CORE_DISTILLATION_INTERVAL_SECS
-            && crate::cron::matches(CORE_DISTILLATION_WALL_CLOCK_SPEC, now)
-            && last_core_distillation_attempt.is_none_or(|last| now - last >= 900)
-            && !core_distillation_running.load(Ordering::SeqCst)
-        {
-            last_core_distillation_attempt = Some(now);
-            if !has_new_summary_reports(&state.agent_home, last_core_run) {
-                // no maintenance_summary reports since last core run —
-                // nothing new to promote/demote from; same "the check itself
-                // is a full review" reasoning as the other two tiers.
-                write_last_core_run(&state.agent_home, now);
-                record_maintenance_tier(&state.agent_home, |c| &mut c.core_distillation, false);
-            } else {
-                record_maintenance_tier(&state.agent_home, |c| &mut c.core_distillation, true);
-                core_distillation_running.store(true, Ordering::SeqCst);
-                let spawn_state = state.clone();
-                let running = core_distillation_running.clone();
-                tokio::spawn(async move {
-                    let outcome = run_scheduled(spawn_state.clone(), json!({"type": "core_distillation", "since_ts": last_core_run})).await;
-                    if !outcome_aborted(&outcome) {
-                        write_last_core_run(&spawn_state.agent_home, now);
-                    }
-                    running.store(false, Ordering::SeqCst);
-                });
-            }
-        }
-
-        let last_run: Option<Value> = std::fs::read_to_string(state.agent_home.join("logs/last_run.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok());
-        if let Some(sleep_until) = last_run.and_then(|v| v.get("sleep_until").and_then(Value::as_i64)) {
-            if now >= sleep_until && last_handled_sleep_until != Some(sleep_until) {
-                last_handled_sleep_until = Some(sleep_until);
-                let trigger = json!({"type": "cron", "recent_chat": recent_chat_context(&state.agent_home, DEFAULT_SESSION_KEY)});
-                let spawn_state = state.clone();
-                tokio::spawn(async move {
-                    run_scheduled(spawn_state, trigger).await;
-                });
-            }
-        }
-
-        for task in crate::scheduler_tasks::load_tasks(&state.agent_home) {
-            if !task.enabled {
-                continue;
-            }
-            // one fire per matching minute — a tick every 30s would
-            // otherwise double-fire any spec that matches for a whole minute
-            let due_now = crate::cron::matches(&task.cron, now) && !task.last_run.is_some_and(|last| last / 60 == now / 60);
-            // caught up separately from `due_now` — a gap since the last
-            // tick (kernel downtime, or a stuck loop before 2026-07-12's
-            // spawn fix) can mean this exact minute isn't the one that
-            // matched, the match already happened somewhere inside the gap
-            // and would otherwise be gone forever. See `missed_in_gap`.
-            let missed = !due_now && missed_in_gap(&task.cron, gap_start, now);
-            let retry_state = { task_retry_state.lock().await.get(&task.id).copied() };
-            if !scheduled_task_should_run(due_now || missed, retry_state, now) {
-                continue;
-            }
-            if due_now || missed {
-                crate::scheduler_tasks::mark_run(&state.agent_home, &task.id, now);
-            }
-            // Bumped *before* spawning, not just after the run completes —
-            // 2026-07-15 incident: a retry attempt (`morning_report`, a
-            // content_filter failure) took ~20-30s to actually run, longer
-            // than one 30s tick. `task_retry_state` only used to get written
-            // back once the spawned future below finished, so every
-            // intervening tick re-read the *stale* pre-retry state (still
-            // "overdue since >900s ago") and independently decided a retry
-            // was due too, spawning another one — task_run_lock (see
-            // `run_trigger`) serializes their *execution* so they don't
-            // corrupt shared state, but does nothing to stop the scheduler
-            // from having already decided to spawn 4 redundant attempts in
-            // the first place, each of which actually completed and
-            // re-fired `chat_send` to Discord on its own. Writing `now` here
-            // synchronously closes that window: the very next tick sees a
-            // last_attempt only seconds old, `scheduled_task_should_run`
-            // requires the full `SCHEDULED_TASK_RETRY_BACKOFF_SECS` (900s)
-            // to have passed, so it can't re-fire until long after any
-            // single attempt (success or failure) could plausibly still be
-            // running.
-            {
-                let failures = retry_state.map(|(_, f)| f).unwrap_or(0);
-                task_retry_state.lock().await.insert(task.id.clone(), (now, failures));
-            }
-            // spawned, not awaited — same reasoning as daily_maintenance
-            // above: this is the loop iteration that also needs to notice
-            // *other* tasks due around the same wall-clock minute, and a
-            // slow run here shouldn't delay that.
+        // spawned, not awaited — a real LLM-driven pass has taken several
+        // minutes in practice, and this loop is also what notices every
+        // *other* job's exact-minute slot; blocking on one run here is how
+        // `rss_tech_report` silently missed a whole day on 2026-07-12.
+        for occ in log.claim_ready(now) {
             let spawn_state = state.clone();
-            let task_retry_state = task_retry_state.clone();
-            let task_id = task.id.clone();
-            let data_path = task.data_path.clone();
-            tokio::spawn(async move {
-                let outcome = run_scheduled(spawn_state, json!({"type": "scheduled_task", "task_id": task_id, "data_path": data_path})).await;
-                let failures = if outcome_aborted(&outcome) { retry_state.map(|(_, f)| f + 1).unwrap_or(1) } else { 0 };
-                task_retry_state.lock().await.insert(task_id, (now, failures));
-            });
+            tokio::spawn(async move { execute_occurrence(spawn_state, occ).await });
+        }
+    }
+}
+
+/// Decides which slots are due this tick and records them in the schedule
+/// log. Pure bookkeeping — nothing runs here; a slot that's already been
+/// scheduled (earlier tick, before a restart) is a no-op inside
+/// `schedule`/`skip`.
+async fn schedule_due_occurrences(state: &Arc<AppState>, gap_start: i64, now: i64) {
+    let log = &state.schedule_log;
+    let slot = minute_slot(now);
+
+    let last_maintenance = read_last_maintenance(&state.agent_home);
+    if now - last_maintenance >= MAINTENANCE_INTERVAL_SECS && crate::cron::matches(MAINTENANCE_WALL_CLOCK_SPEC, now) {
+        if !has_new_log_entries(&state.agent_home, last_maintenance) && !workspace_memory_has_new_files(&state.agent_home, last_maintenance) {
+            // nothing logged and nothing changed under workspace/memory/
+            // since last time — an LLM pass here would just come back
+            // saying so. The check itself *is* a full, deterministic review
+            // of [last_maintenance, now), so it's safe to advance the
+            // checkpoint same as a real completed run would.
+            if log.skip(JOB_DAILY_MAINTENANCE, slot, now, "no new log entries or workspace memory files") {
+                write_last_maintenance(&state.agent_home, slot);
+                record_maintenance_tier(&state.agent_home, |c| &mut c.daily_maintenance, false);
+            }
+        } else if log.schedule(JOB_DAILY_MAINTENANCE, slot, now) {
+            record_maintenance_tier(&state.agent_home, |c| &mut c.daily_maintenance, true);
+        }
+    }
+
+    let last_summary = read_last_maintenance_summary(&state.agent_home);
+    if now - last_summary >= MAINTENANCE_SUMMARY_INTERVAL_SECS && crate::cron::matches(MAINTENANCE_SUMMARY_WALL_CLOCK_SPEC, now) {
+        let has_reports = has_new_maintenance_reports(&state.agent_home, last_summary);
+        let newly_due = if has_reports {
+            log.schedule(JOB_MAINTENANCE_SUMMARY, slot, now)
+        } else {
+            // no hourly reports since last summary — likely every hour in
+            // this window was itself skipped for lack of activity; nothing
+            // to merge or escalate from, so this counts as a full review of
+            // [last_summary, now) same as a real run.
+            log.skip(JOB_MAINTENANCE_SUMMARY, slot, now, "no new hourly maintenance reports")
+        };
+        if newly_due {
+            // host-only, cheap — once per due summary slot, regardless of
+            // whether there's a summary LLM pass to do (idle-session
+            // sweeping and the distillation sanity check aren't about
+            // *this* tier's own output)
+            sweep_idle_sessions(state, Duration::from_secs(MAINTENANCE_SUMMARY_INTERVAL_SECS as u64)).await;
+            verify_recent_distillation(&state.agent_home, MAINTENANCE_SUMMARY_INTERVAL_SECS);
+            if has_reports {
+                record_maintenance_tier(&state.agent_home, |c| &mut c.maintenance_summary, true);
+            } else {
+                write_last_maintenance_summary(&state.agent_home, slot);
+                record_maintenance_tier(&state.agent_home, |c| &mut c.maintenance_summary, false);
+            }
+        }
+    }
+
+    let last_core_run = read_last_core_run(&state.agent_home);
+    if now - last_core_run >= CORE_DISTILLATION_INTERVAL_SECS && crate::cron::matches(CORE_DISTILLATION_WALL_CLOCK_SPEC, now) {
+        if !has_new_summary_reports(&state.agent_home, last_core_run) {
+            // no maintenance_summary reports since last core run — nothing
+            // new to promote/demote from; same "the check itself is a full
+            // review" reasoning as the other two tiers.
+            if log.skip(JOB_CORE_DISTILLATION, slot, now, "no new maintenance_summary reports") {
+                write_last_core_run(&state.agent_home, slot);
+                record_maintenance_tier(&state.agent_home, |c| &mut c.core_distillation, false);
+            }
+        } else if log.schedule(JOB_CORE_DISTILLATION, slot, now) {
+            record_maintenance_tier(&state.agent_home, |c| &mut c.core_distillation, true);
+        }
+    }
+
+    // the agent's own last-requested wake — its `sleep_until` value *is*
+    // the slot, so the same request is only ever woken once, restart or not
+    let last_run: Option<Value> = std::fs::read_to_string(state.agent_home.join("logs/last_run.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    if let Some(sleep_until) = last_run.and_then(|v| v.get("sleep_until").and_then(Value::as_i64)) {
+        if now >= sleep_until {
+            log.schedule(JOB_CRON, sleep_until, now);
+        }
+    }
+
+    for task in crate::scheduler_tasks::load_tasks(&state.agent_home) {
+        if !task.enabled {
+            continue;
+        }
+        // the current minute if it matches, else (after a real gap —
+        // kernel downtime spanning the match) the latest matching minute
+        // inside the gap, which would otherwise be gone forever. See
+        // `missed_in_gap`.
+        let due_slot = if crate::cron::matches(&task.cron, now) { Some(slot) } else { missed_in_gap(&task.cron, gap_start, now) };
+        if let Some(due_slot) = due_slot {
+            log.schedule(&format!("{TASK_JOB_PREFIX}{}", task.id), due_slot, now);
+        }
+    }
+}
+
+/// Runs one claimed occurrence (already `running` in the schedule log) and
+/// records how it ended. The trigger is built here, at run time, not when
+/// the slot was scheduled — a retry 15 minutes later should see the
+/// current checkpoint/chat context/task file, not a stale snapshot.
+async fn execute_occurrence(state: Arc<AppState>, occ: crate::schedule_log::Occurrence) {
+    let log = state.schedule_log.clone();
+    let trigger = match build_occurrence_trigger(&state, &occ) {
+        Ok(trigger) => trigger,
+        Err(e) => {
+            log.fail(&occ.id, occ.attempts, crate::logs::now_unix_secs(), &e, None);
+            return;
+        }
+    };
+    let (outcome, run_file) = run_scheduled(state.clone(), trigger, Some(&occ)).await;
+    let now = crate::logs::now_unix_secs();
+    if outcome_aborted(&outcome) {
+        let error = outcome
+            .get("error")
+            .and_then(Value::as_str)
+            .or_else(|| outcome.get("result").and_then(|r| r.get("summary")).and_then(Value::as_str))
+            .unwrap_or("run failed")
+            .to_string();
+        let retry_at = log.fail(&occ.id, occ.attempts, now, &error, run_file);
+        if retry_at.is_none() {
+            let _ = crate::logs::notify(
+                &state.agent_home,
+                &format!("scheduler: {} failed {} times, giving up until its next slot: {error}", occ.id, occ.attempts),
+            );
+        }
+        return;
+    }
+    // only advance a maintenance checkpoint on a real completion — an
+    // aborted run that advanced it would silently skip whatever happened in
+    // that window forever (the 2026-07-08 Moonshot outage did exactly
+    // this). The slot, not `now`: anything logged while a slow/retried run
+    // was in flight still lands in the next window.
+    match occ.job.as_str() {
+        JOB_DAILY_MAINTENANCE => write_last_maintenance(&state.agent_home, occ.slot),
+        JOB_MAINTENANCE_SUMMARY => write_last_maintenance_summary(&state.agent_home, occ.slot),
+        JOB_CORE_DISTILLATION => write_last_core_run(&state.agent_home, occ.slot),
+        _ => {}
+    }
+    log.succeed(&occ.id, occ.attempts, now, run_file);
+}
+
+fn build_occurrence_trigger(state: &Arc<AppState>, occ: &crate::schedule_log::Occurrence) -> Result<Value, String> {
+    let home = &state.agent_home;
+    match occ.job.as_str() {
+        JOB_DAILY_MAINTENANCE => Ok(json!({"type": JOB_DAILY_MAINTENANCE, "since_ts": read_last_maintenance(home)})),
+        JOB_MAINTENANCE_SUMMARY => Ok(json!({"type": JOB_MAINTENANCE_SUMMARY, "since_ts": read_last_maintenance_summary(home)})),
+        JOB_CORE_DISTILLATION => Ok(json!({"type": JOB_CORE_DISTILLATION, "since_ts": read_last_core_run(home)})),
+        JOB_CRON => Ok(json!({"type": "cron", "recent_chat": recent_chat_context(home, DEFAULT_SESSION_KEY)})),
+        job => {
+            let task_id = job.strip_prefix(TASK_JOB_PREFIX).ok_or_else(|| format!("unknown scheduler job `{job}`"))?;
+            let task = crate::scheduler_tasks::load_task(home, task_id).ok_or_else(|| format!("task {task_id} no longer exists"))?;
+            crate::scheduler_tasks::mark_run(home, task_id, crate::logs::now_unix_secs());
+            Ok(json!({"type": "scheduled_task", "task_id": task.id, "data_path": task.data_path}))
         }
     }
 }
@@ -902,13 +860,20 @@ async fn scheduler_loop(state: Arc<AppState>) {
 /// `/api/wake`) and, since nothing else logs these, records `{trigger,
 /// outcome}` to `logs/scheduled_runs/<ts>-<type>.json` — "要有 session 紀錄"
 /// for scheduler-driven wakes, browsable via `GET /api/scheduler/runs`.
-async fn run_scheduled(state: Arc<AppState>, trigger: Value) -> Value {
+/// Returns that file's name alongside the outcome so the schedule log can
+/// point at it.
+async fn run_scheduled(state: Arc<AppState>, trigger: Value, occ: Option<&crate::schedule_log::Occurrence>) -> (Value, Option<String>) {
     let ts = crate::logs::now_unix_secs();
     let trigger_type = trigger.get("type").and_then(|t| t.as_str()).unwrap_or("cron").to_string();
     let outcome = run_trigger(state.clone(), trigger.clone()).await;
     let dir = state.agent_home.join("logs/scheduled_runs");
+    let mut run_file = None;
     if std::fs::create_dir_all(&dir).is_ok() {
-        let record = json!({"ts": ts, "trigger": trigger, "outcome": outcome});
+        let mut record = json!({"ts": ts, "trigger": trigger, "outcome": outcome});
+        if let Some(occ) = occ {
+            record["occurrence"] = json!(occ.id);
+            record["attempt"] = json!(occ.attempts);
+        }
         // filename keyed by nanos, not `ts` (whole seconds) — background
         // triggers aren't serialized by any lock (only message/
         // compact_session are, see `AppState::session_locks`), so two of
@@ -917,9 +882,25 @@ async fn run_scheduled(state: Arc<AppState>, trigger: Value) -> Value {
         // file content, not the filename, so nanosecond precision here only
         // has to be unique, not human-readable
         let file_name = format!("{}-{trigger_type}.json", crate::logs::now_unix_nanos());
-        let _ = std::fs::write(dir.join(file_name), serde_json::to_vec_pretty(&record).unwrap_or_default());
+        if std::fs::write(dir.join(&file_name), serde_json::to_vec_pretty(&record).unwrap_or_default()).is_ok() {
+            run_file = Some(file_name);
+        }
     }
-    outcome
+    (outcome, run_file)
+}
+
+async fn get_scheduler_occurrences(State(state): State<Arc<AppState>>) -> Json<Value> {
+    Json(json!({"occurrences": state.schedule_log.list()}))
+}
+
+/// Re-queues a terminally failed occurrence — the scheduler's next tick
+/// claims and runs it like any other pending one, so it still goes through
+/// the same one-running-per-job rule and records its outcome in the log.
+async fn post_scheduler_occurrence_retry(State(state): State<Arc<AppState>>, AxumPath(id): AxumPath<String>) -> Json<Value> {
+    match state.schedule_log.request_retry(&id, crate::logs::now_unix_secs()) {
+        Ok(()) => Json(json!({"ok": true})),
+        Err(e) => Json(json!({"ok": false, "error": e})),
+    }
 }
 
 async fn get_scheduled_runs(State(state): State<Arc<AppState>>) -> Json<Value> {
@@ -2507,41 +2488,8 @@ fn logs_stream(path: PathBuf) -> impl Stream<Item = Result<Event, Infallible>> {
 }
 
 #[cfg(test)]
-mod scheduled_task_retry_tests {
+mod outcome_aborted_tests {
     use super::*;
-
-    #[test]
-    fn runs_when_due_now_regardless_of_retry_state() {
-        assert!(scheduled_task_should_run(true, None, 1_000));
-        assert!(scheduled_task_should_run(true, Some((999, SCHEDULED_TASK_MAX_RETRIES + 5)), 1_000));
-    }
-
-    #[test]
-    fn does_not_run_when_not_due_and_no_prior_failure() {
-        assert!(!scheduled_task_should_run(false, None, 1_000));
-        assert!(!scheduled_task_should_run(false, Some((900, 0)), 1_000));
-    }
-
-    #[test]
-    fn retries_once_backoff_has_elapsed() {
-        let last_attempt = 1_000;
-        let now = last_attempt + SCHEDULED_TASK_RETRY_BACKOFF_SECS;
-        assert!(scheduled_task_should_run(false, Some((last_attempt, 1)), now));
-    }
-
-    #[test]
-    fn does_not_retry_before_backoff_elapses() {
-        let last_attempt = 1_000;
-        let now = last_attempt + SCHEDULED_TASK_RETRY_BACKOFF_SECS - 1;
-        assert!(!scheduled_task_should_run(false, Some((last_attempt, 1)), now));
-    }
-
-    #[test]
-    fn stops_retrying_once_max_retries_exceeded() {
-        let last_attempt = 1_000;
-        let now = last_attempt + SCHEDULED_TASK_RETRY_BACKOFF_SECS;
-        assert!(!scheduled_task_should_run(false, Some((last_attempt, SCHEDULED_TASK_MAX_RETRIES + 1)), now));
-    }
 
     #[test]
     fn outcome_aborted_detects_both_failure_shapes() {
@@ -2630,21 +2578,21 @@ mod missed_in_gap_tests {
     fn catches_an_exact_minute_that_fell_inside_the_gap() {
         let gap_start = NINE_AM; // 09:00:00
         let now = NINE_AM + 20 * 60; // 09:20:00 — 09:17 is strictly inside
-        assert!(missed_in_gap(SPEC, gap_start, now));
+        assert!(missed_in_gap(SPEC, gap_start, now).is_some());
     }
 
     #[test]
     fn no_match_found_when_the_gap_never_touches_the_matching_minute() {
         let gap_start = NINE_AM; // 09:00:00
         let now = NINE_AM + 5 * 60; // 09:05:00 — well before 09:17
-        assert!(!missed_in_gap(SPEC, gap_start, now));
+        assert!(missed_in_gap(SPEC, gap_start, now).is_none());
     }
 
     #[test]
     fn ordinary_30s_tick_gap_never_false_positives() {
         let gap_start = NINE_AM + 17 * 60; // last tick was exactly at 09:17
         let now = gap_start + 30; // this tick, 30s later
-        assert!(!missed_in_gap(SPEC, gap_start, now));
+        assert!(missed_in_gap(SPEC, gap_start, now).is_none());
     }
 
     #[test]
@@ -2653,6 +2601,6 @@ mod missed_in_gap_tests {
         // function's; missed_in_gap must not double-report it.
         let gap_start = NINE_AM; // 09:00:00
         let now = NINE_AM + 17 * 60 + 30; // 09:17:30, mid-way through minute 17
-        assert!(!missed_in_gap(SPEC, gap_start, now));
+        assert!(missed_in_gap(SPEC, gap_start, now).is_none());
     }
 }

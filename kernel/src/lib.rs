@@ -9,6 +9,7 @@ pub mod gateway;
 pub mod grants;
 pub mod logs;
 pub mod ratelimit;
+pub mod schedule_log;
 pub mod scheduler_tasks;
 pub mod secrets;
 pub mod state;
