@@ -58,16 +58,3 @@ defineExpose({ refresh })
     </div>
   </div>
 </template>
-
-<style scoped>
-.tab-row {
-  display: flex;
-  gap: 0.4rem;
-  padding: 0.4rem 0;
-  margin-bottom: 0.4rem;
-}
-.tab-row button.active {
-  font-weight: bold;
-  text-decoration: underline;
-}
-</style>

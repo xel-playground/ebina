@@ -55,7 +55,37 @@ pub fn state(text: &str, today: &str) -> ItemState {
     }
 }
 
-fn items(agent_home: &Path) -> Vec<PathBuf> {
+/// The item's text without its `expires:` line (and the blank line after
+/// it) — what the webui edits.
+pub fn body(text: &str) -> &str {
+    if expires(text).is_none() {
+        return text;
+    }
+    let trimmed = text.trim_start();
+    let after = trimmed.split_once('\n').map_or("", |(_, rest)| rest);
+    after.trim_start_matches(['\n', '\r'])
+}
+
+/// Inverse of `expires` + `body`.
+pub fn compose(expires: Option<&str>, body: &str) -> String {
+    match expires {
+        Some(date) => format!("expires: {date}\n\n{}", body.trim_start()),
+        None => body.to_string(),
+    }
+}
+
+pub fn valid_date(date: &str) -> bool {
+    expires(&format!("expires: {date}")).is_some()
+}
+
+/// Item file names are plain `name.md` — no path separators, no dotfiles —
+/// so a name from the webui can never point outside the directory.
+pub fn valid_name(name: &str) -> bool {
+    let stem = name.strip_suffix(".md").unwrap_or("");
+    !stem.is_empty() && !stem.starts_with('.') && stem.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+pub fn items(agent_home: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir(agent_home)) else { return Vec::new() };
     entries.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect()
 }
@@ -114,6 +144,26 @@ mod tests {
         assert_eq!(expires("expires: soon"), None);
         assert_eq!(expires("expires: 2026-1-25"), None);
         assert_eq!(expires(""), None);
+    }
+
+    #[test]
+    fn body_and_compose_round_trip() {
+        let text = compose(Some("2026-10-25"), "# watch\nthing");
+        assert_eq!(expires(&text), Some("2026-10-25"));
+        assert_eq!(body(&text), "# watch\nthing");
+        assert_eq!(body("no deadline here"), "no deadline here");
+        assert_eq!(compose(None, "x"), "x");
+    }
+
+    #[test]
+    fn names_stay_inside_the_directory() {
+        assert!(valid_name("cat-vaccine.md"));
+        assert!(valid_name("貓咪疫苗.md"));
+        assert!(!valid_name("../x.md"));
+        assert!(!valid_name("a/b.md"));
+        assert!(!valid_name(".hidden.md"));
+        assert!(!valid_name("x.txt"));
+        assert!(!valid_name(".md"));
     }
 
     #[test]

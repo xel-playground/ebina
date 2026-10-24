@@ -7,6 +7,7 @@ const items = [
   ['status', '📊', 'Status'],
   ['scheduler', '🗓️', 'Scheduler'],
   ['schedule-history', '🕓', 'Schedule history'],
+  ['todos', '📌', 'Todos'],
   ['notes', '🗒️', 'Memory notes'],
   ['soul', '🫧', 'Soul'],
   ['core', '💠', 'Core'],

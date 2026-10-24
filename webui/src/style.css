@@ -68,6 +68,9 @@ pre {
 .split-item.active { background: var(--accent); color: white; }
 .split-item.dir { color: var(--text); font-weight: 600; }
 .split-content { flex: 1; overflow-y: auto; }
+/* filter/tab buttons above a split view (reports tiers, schedule history) */
+.tab-row { display: flex; gap: 0.4rem; padding: 0.4rem 0; margin-bottom: 0.4rem; }
+.tab-row button.active { font-weight: bold; text-decoration: underline; }
 .kv { display: grid; grid-template-columns: auto 1fr; gap: 0.35rem 1rem; font-size: 0.85rem; }
 .kv dt { color: var(--muted); }
 .kv dd { margin: 0; font-family: ui-monospace, monospace; }

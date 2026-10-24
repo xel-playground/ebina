@@ -4,70 +4,109 @@ import { api } from '../api'
 
 const status = ref(null)
 const wakeResult = ref('')
-const runs = ref([])
 // one entry per scheduled occurrence (`<job>@<slot>`), newest slot first —
-// the event-sourced pending/running/succeeded/failed/skipped state from
-// kernel/src/schedule_log.rs
+// the event-sourced state from kernel/src/schedule_log.rs
 const occurrences = ref([])
-// `/api/scheduler/runs` already sorts newest first server-side
-// (kernel/src/gateway.rs `get_scheduled_runs`) — reversing here undid that
-const rows = computed(() => runs.value)
-// the kernel only ever runs one trigger at a time (`run_lock` in
-// gateway.rs) — `status.busy` is true for *any* in-flight run, not just a
-// scheduler-driven one, so "Wake now" would otherwise queue behind
-// whatever's already running (a long ssh_exec chain, another wake, ...)
-// with no feedback until it suddenly unblocks
+const taskNames = ref({})
+const filter = ref('active')
+const selectedId = ref(null)
+const detail = ref(null)
+// `status.busy` is true for *any* in-flight run, not just a scheduler-driven
+// one, so "Wake now" would otherwise queue behind whatever's already
+// running with no feedback until it suddenly unblocks
 const busy = computed(() => status.value?.busy ?? false)
 let interval = null
 
-async function refresh() {
-  status.value = (await api('/status')).body
-  runs.value = (await api('/scheduler/runs')).body.runs || []
-  occurrences.value = (await api('/scheduler/occurrences')).body.occurrences || []
+const STATE = {
+  pending: { icon: '🕒', color: 'var(--muted)' },
+  running: { icon: '▶️', color: 'var(--accent)' },
+  succeeded: { icon: '✅', color: 'var(--ok)' },
+  failed: { icon: '❌', color: 'var(--err)' },
+  skipped: { icon: '⏭️', color: 'var(--muted)' },
 }
-const STATE_COLOR = { pending: 'var(--muted)', running: 'var(--accent)', succeeded: 'var(--ok)', failed: 'var(--err)', skipped: 'var(--muted)' }
+const FILTERS = [
+  ['active', 'Ran'],
+  ['problems', 'Failed / pending'],
+  ['all', 'All'],
+]
+// "skipped" is the hourly tier's no-op check and housekeeping is host-only
+// bookkeeping — both are noise by default
+const shown = computed(() => occurrences.value.filter(o => {
+  if (filter.value === 'all') return true
+  if (filter.value === 'problems') return ['failed', 'pending', 'running'].includes(o.state)
+  return o.state !== 'skipped' && o.job !== 'housekeeping'
+}))
+
 function fmt(ts) {
   return ts ? new Date(ts * 1000).toLocaleString() : '—'
 }
-// a pending occurrence with attempts behind it is waiting out a retry backoff
-function retryNote(o) {
-  return o.state === 'pending' && o.attempts > 0 ? `retry at ${fmt(o.not_before)}` : ''
+function jobLabel(job) {
+  if (job.startsWith('task:')) {
+    const id = job.slice(5)
+    return taskNames.value[id] || `task ${id}`
+  }
+  return job
 }
-async function retryOccurrence(o) {
-  await api('/scheduler/occurrences/' + encodeURIComponent(o.id) + '/retry', { method: 'POST' })
-  refresh()
+
+async function refresh() {
+  const [s, occ, tasks] = await Promise.all([api('/status'), api('/scheduler/occurrences'), api('/scheduler/tasks')])
+  status.value = s.body
+  occurrences.value = occ.body.occurrences || []
+  taskNames.value = Object.fromEntries((tasks.body.tasks || []).map(t => [t.id, t.description || t.data_path]))
+  if (selectedId.value) {
+    const current = occurrences.value.find(o => o.id === selectedId.value)
+    // re-fetch the detail only while it can still change
+    if (!detail.value || ['pending', 'running'].includes(current?.state) || current?.state !== detail.value.occurrence.state) {
+      await loadDetail(selectedId.value)
+    }
+  }
 }
+
+async function loadDetail(id) {
+  const { body } = await api('/scheduler/occurrences/' + encodeURIComponent(id))
+  detail.value = body.ok ? body : null
+}
+
+async function select(o) {
+  selectedId.value = o.id
+  detail.value = null
+  await loadDetail(o.id)
+}
+
+async function retry() {
+  await api('/scheduler/occurrences/' + encodeURIComponent(selectedId.value) + '/retry', { method: 'POST' })
+  await refresh()
+  await loadDetail(selectedId.value)
+}
+
 async function wakeNow() {
   if (busy.value) return
   const { body } = await api('/wake', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ type: 'manual', text: 'manual wake-up check' }),
   })
-  wakeResult.value = JSON.stringify(body, null, 2)
+  wakeResult.value = body?.result?.summary || JSON.stringify(body)
   refresh()
 }
-// a failed run's `trigger` is stored right alongside its `outcome` in the
-// same history entry — re-firing it is just re-POSTing that same trigger
-// to `/api/wake`, no separate "resume" mechanism needed (there's no
-// execution state left to resume anyway, see kernel/src/lib.rs's
-// `RunOutcome.trapped` doc comment: a trapped run's in-memory progress is
-// gone the moment the agent process is killed)
-function isFailed(r) {
-  const summary = r.outcome?.result?.summary || ''
-  return r.outcome?.ok === false || summary.startsWith('run aborted') || summary.startsWith('(run timed out')
+
+function eventText(e) {
+  switch (e.event) {
+    case 'scheduled': return 'scheduled'
+    case 'started': return `attempt ${e.attempt} started`
+    case 'succeeded': return `attempt ${e.attempt} succeeded`
+    case 'failed': return `attempt ${e.attempt} failed${e.retry_at ? ` — retry at ${fmt(e.retry_at)}` : ' — giving up'}`
+    case 'skipped': return `skipped — ${e.reason}`
+    case 'retry_requested': return 'retry requested'
+    default: return e.event
+  }
 }
-async function rerun(entry) {
-  if (busy.value) return
-  await api('/wake', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(entry.trigger),
-  })
-  refresh()
+function runSummary(r) {
+  const o = r.outcome || {}
+  return o.result?.summary || (o.ok === false ? o.error : '(no summary)')
 }
+
 onMounted(() => {
   refresh()
-  // poll for `busy` clearing (or a scheduler-driven run landing) — same
-  // 5s cadence as AppsPanel's pairing-code poll
   interval = setInterval(refresh, 5000)
 })
 onUnmounted(() => clearInterval(interval))
@@ -75,58 +114,101 @@ defineExpose({ refresh })
 </script>
 
 <template>
-  <div>
-    <h2>Schedule history <button class="secondary" @click="refresh">Refresh</button></h2>
-    <div class="card">
-      <p class="hint">Background loop ticks every 30s and schedules each due slot exactly once (maintenance tiers,
-        the agent's own `sleep_until` wake, each matching Scheduler task) — duplicates across ticks or restarts are
-        no-ops. Failed attempts retry after 15 min, up to 3 times; a run cut off by a kernel restart counts as a failed
-        attempt. "Wake now" is manual/dev use and isn't tracked as an occurrence.</p>
-      <dl class="kv">
-        <dt>next requested wake</dt>
-        <dd>{{ status?.last_run?.sleep_until ? new Date(status.last_run.sleep_until * 1000).toLocaleString() : '—' }}</dd>
-        <dt>last run</dt>
-        <dd>{{ status?.last_run ? new Date(status.last_run.ts * 1000).toLocaleString() : '—' }}</dd>
-      </dl>
-      <div class="row"><button @click="wakeNow" :disabled="busy">{{ busy ? '⏳ scheduler running…' : 'Wake now' }}</button></div>
-      <pre v-if="wakeResult">{{ wakeResult }}</pre>
+  <div class="split-section">
+    <h2>
+      Schedule history
+      <span class="row" style="margin:0; gap:0.4rem;">
+        <button @click="wakeNow" :disabled="busy">{{ busy ? '⏳ running…' : 'Wake now' }}</button>
+        <button class="secondary" @click="refresh">Refresh</button>
+      </span>
+    </h2>
+    <div class="sched-bar hint">
+      <span>next requested wake: <b>{{ fmt(status?.last_run?.sleep_until) }}</b></span>
+      <span>last run: <b>{{ fmt(status?.last_run?.ts) }}</b></span>
+      <span v-if="wakeResult">wake: {{ wakeResult }}</span>
     </div>
-
-    <h3>Occurrences</h3>
-    <div class="hint" v-if="occurrences.length === 0">nothing scheduled yet</div>
-    <div class="card" v-else style="margin-bottom:1rem; overflow-x:auto">
-      <table class="occurrences">
-        <thead><tr><th>job</th><th>slot</th><th>state</th><th>attempts</th><th>detail</th><th></th></tr></thead>
-        <tbody>
-          <tr v-for="o in occurrences" :key="o.id">
-            <td><code>{{ o.job }}</code></td>
-            <td>{{ fmt(o.slot) }}</td>
-            <td :style="{ color: STATE_COLOR[o.state] }">{{ o.state }}</td>
-            <td>{{ o.attempts }}</td>
-            <td class="hint" style="margin:0">{{ retryNote(o) || o.last_error || '' }}</td>
-            <td><button v-if="o.state === 'failed'" class="secondary" @click="retryOccurrence(o)">Retry</button></td>
-          </tr>
-        </tbody>
-      </table>
+    <div class="tab-row">
+      <button v-for="[key, label] in FILTERS" :key="key" class="secondary"
+              :class="{ active: filter === key }" @click="filter = key">{{ label }}</button>
     </div>
-
-    <h3>Scheduled run history</h3>
-    <div class="hint" v-if="rows.length === 0">no scheduler-driven runs yet</div>
-    <div class="card" v-for="r in rows" :key="r.ts" style="margin-bottom:0.5rem">
-      <div class="row" style="justify-content:space-between">
-        <strong>{{ r.trigger?.type }}</strong>
-        <span class="hint">{{ new Date(r.ts * 1000).toLocaleString() }}</span>
+    <div class="split-body">
+      <div class="split-list sched-list">
+        <div class="hint" v-if="shown.length === 0">nothing here</div>
+        <div v-for="o in shown" :key="o.id" class="split-item"
+             :class="{ active: selectedId === o.id }" @click="select(o)">
+          {{ STATE[o.state].icon }} {{ jobLabel(o.job) }}
+          <div class="sched-meta">{{ fmt(o.slot) }}<span v-if="o.attempts > 1"> · {{ o.attempts }} attempts</span></div>
+        </div>
       </div>
-      <div>{{ r.outcome?.result?.summary || (r.outcome?.ok === false ? r.outcome.error : '(no summary)') }}</div>
-      <div class="row" v-if="isFailed(r)" style="margin-top:0.5rem">
-        <button class="secondary" @click="rerun(r)" :disabled="busy">{{ busy ? '⏳ running…' : 'Re-run' }}</button>
+      <div class="split-content">
+        <div v-if="detail">
+          <div class="sched-head">
+            <strong>{{ jobLabel(detail.occurrence.job) }}</strong>
+            <span :style="{ color: STATE[detail.occurrence.state].color }">{{ detail.occurrence.state }}</span>
+            <button v-if="detail.occurrence.state === 'failed'" class="secondary" @click="retry">Retry</button>
+          </div>
+          <dl class="kv card">
+            <dt>occurrence</dt><dd>{{ detail.occurrence.id }}</dd>
+            <dt>slot</dt><dd>{{ fmt(detail.occurrence.slot) }}</dd>
+            <dt>attempts</dt><dd>{{ detail.occurrence.attempts }}</dd>
+            <template v-if="detail.occurrence.state === 'pending' && detail.occurrence.attempts > 0">
+              <dt>next retry</dt><dd>{{ fmt(detail.occurrence.not_before) }}</dd>
+            </template>
+            <template v-if="detail.occurrence.last_error">
+              <dt>{{ detail.occurrence.state === 'skipped' ? 'reason' : 'last error' }}</dt>
+              <dd>{{ detail.occurrence.last_error }}</dd>
+            </template>
+          </dl>
+
+          <h3>Timeline</h3>
+          <ul class="timeline">
+            <li v-for="(e, i) in detail.events" :key="i">
+              <span class="hint">{{ fmt(e.ts) }}</span>
+              <span :class="{ 'err-text': e.event === 'failed' }">{{ eventText(e) }}</span>
+              <div v-if="e.event === 'failed'" class="hint">{{ e.error }}</div>
+            </li>
+          </ul>
+
+          <h3 v-if="detail.runs.length">Runs</h3>
+          <div v-for="r in detail.runs" :key="r.file" class="card">
+            <div class="sched-head">
+              <strong>attempt {{ r.attempt ?? '?' }}</strong>
+              <span class="hint">{{ fmt(r.ts) }}</span>
+            </div>
+            <div class="raw-text">{{ runSummary(r) }}</div>
+            <details>
+              <summary class="hint">trigger</summary>
+              <pre>{{ JSON.stringify(r.trigger, null, 2) }}</pre>
+            </details>
+            <details v-if="r.outcome?.stdout">
+              <summary class="hint">agent stdout (tail)</summary>
+              <pre>{{ r.outcome.stdout }}</pre>
+            </details>
+          </div>
+        </div>
+        <div class="hint" v-else-if="selectedId">loading…</div>
+        <div class="hint" v-else>Select an occurrence. Every due slot (maintenance tiers, the agent's own
+          `sleep_until` wake, each Scheduler task) is scheduled exactly once; failed attempts retry after 15 min,
+          up to 3 times, and a run cut off by a kernel restart counts as a failed attempt. "Wake now" is manual/dev
+          use and isn't tracked here.</div>
       </div>
     </div>
   </div>
 </template>
 
 <style scoped>
-.occurrences { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
-.occurrences th { text-align: left; color: var(--muted); font-weight: 500; padding: 0.3rem 0.5rem; }
-.occurrences td { padding: 0.3rem 0.5rem; border-top: 1px solid var(--border); vertical-align: top; }
+.sched-bar { display: flex; gap: 1.5rem; flex-wrap: wrap; }
+.sched-bar b { color: var(--text); font-weight: 500; }
+.sched-list { width: 280px; }
+.sched-meta { font-size: 0.72rem; opacity: 0.75; margin-top: 0.15rem; }
+.sched-head { display: flex; gap: 0.8rem; align-items: center; margin-bottom: 0.6rem; }
+.sched-head button { margin-left: auto; }
+.timeline { list-style: none; padding: 0; margin: 0 0 1rem; font-size: 0.85rem; }
+.timeline li { padding: 0.35rem 0; border-bottom: 1px solid var(--border); display: grid; grid-template-columns: 11rem 1fr; gap: 0.2rem 0.8rem; }
+.timeline li .hint { margin: 0; }
+.timeline li > div { grid-column: 2; }
+.err-text { color: var(--err); }
+details { margin-top: 0.5rem; }
+summary { cursor: pointer; }
+h3 { font-size: 0.95rem; margin: 1rem 0 0.5rem; }
 </style>

@@ -197,9 +197,11 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
         .route("/egress", get(get_egress))
         .route("/discord/pairing", get(get_discord_pairing))
         .route("/llm/logs", get(get_llm_logs))
-        .route("/scheduler/runs", get(get_scheduled_runs))
         .route("/scheduler/occurrences", get(get_scheduler_occurrences))
+        .route("/scheduler/occurrences/{id}", get(get_scheduler_occurrence))
         .route("/scheduler/occurrences/{id}/retry", post(post_scheduler_occurrence_retry))
+        .route("/todos", get(get_todos))
+        .route("/todos/{name}", axum::routing::put(put_todo).delete(delete_todo))
         .route("/scheduler/tasks", get(get_scheduler_tasks).post(post_scheduler_task))
         .route("/scheduler/tasks/{id}", axum::routing::put(put_scheduler_task).delete(delete_scheduler_task))
         .route("/scheduler/task_file", get(get_task_file).put(put_task_file))
@@ -761,9 +763,9 @@ fn build_occurrence_trigger(state: &Arc<AppState>, occ: &crate::schedule_log::Oc
 /// Runs a self-driven trigger (as opposed to a human hitting `/api/message`/
 /// `/api/wake`) and, since nothing else logs these, records `{trigger,
 /// outcome}` to `logs/scheduled_runs/<ts>-<type>.json` — "要有 session 紀錄"
-/// for scheduler-driven wakes, browsable via `GET /api/scheduler/runs`.
-/// Returns that file's name alongside the outcome so the schedule log can
-/// point at it.
+/// for scheduler-driven wakes. Returns that file's name alongside the
+/// outcome so the schedule log can point at it — `GET
+/// /api/scheduler/occurrences/{id}` serves it from there.
 async fn run_scheduled(state: Arc<AppState>, trigger: Value, occ: Option<&crate::schedule_log::Occurrence>) -> (Value, Option<String>) {
     let ts = crate::logs::now_unix_secs();
     let trigger_type = trigger.get("type").and_then(|t| t.as_str()).unwrap_or("cron").to_string();
@@ -780,9 +782,9 @@ async fn run_scheduled(state: Arc<AppState>, trigger: Value, occ: Option<&crate:
         // triggers aren't serialized by any lock (only message/
         // compact_session are, see `AppState::session_locks`), so two of
         // them starting in the same scheduler_loop tick can share the same
-        // *second*; `get_scheduled_runs` sorts by the `ts` field inside the
-        // file content, not the filename, so nanosecond precision here only
-        // has to be unique, not human-readable
+        // *second*; nanosecond precision here only has to be unique, not
+        // human-readable — files are found through the schedule log's
+        // `run_file`, never by listing or sorting this directory
         let file_name = format!("{}-{trigger_type}.json", crate::logs::now_unix_nanos());
         if std::fs::write(dir.join(&file_name), serde_json::to_vec_pretty(&record).unwrap_or_default()).is_ok() {
             run_file = Some(file_name);
@@ -795,6 +797,36 @@ async fn get_scheduler_occurrences(State(state): State<Arc<AppState>>) -> Json<V
     Json(json!({"occurrences": state.schedule_log.list()}))
 }
 
+/// One occurrence's full story for the webui's detail view: its current
+/// state, every event in its log, and — for each attempt that got as far as
+/// running — the recorded trigger and outcome from `logs/scheduled_runs/`
+/// (stdout trimmed to its tail; the summary/error is what matters there).
+async fn get_scheduler_occurrence(State(state): State<Arc<AppState>>, AxumPath(id): AxumPath<String>) -> Json<Value> {
+    let Some(occurrence) = state.schedule_log.get(&id) else {
+        return Json(json!({"ok": false, "error": "no such occurrence"}));
+    };
+    let events = state.schedule_log.events_for(&id);
+    let runs_dir = state.agent_home.join("logs/scheduled_runs");
+    let runs: Vec<Value> = events
+        .iter()
+        .filter_map(|e| e.get("run_file").and_then(Value::as_str))
+        // our own log wrote these, but they still end up in a path
+        .filter(|f| !f.contains('/') && !f.contains(".."))
+        .filter_map(|f| {
+            let mut record: Value = serde_json::from_str(&std::fs::read_to_string(runs_dir.join(f)).ok()?).ok()?;
+            if let Some(stdout) = record.pointer_mut("/outcome/stdout") {
+                if let Some(text) = stdout.as_str() {
+                    let tail: String = text.chars().rev().take(4000).collect::<Vec<_>>().into_iter().rev().collect();
+                    *stdout = Value::String(tail);
+                }
+            }
+            record["file"] = json!(f);
+            Some(record)
+        })
+        .collect();
+    Json(json!({"ok": true, "occurrence": occurrence, "events": events, "runs": runs}))
+}
+
 /// Re-queues a terminally failed occurrence — the scheduler's next tick
 /// claims and runs it like any other pending one, so it still goes through
 /// the same one-running-per-job rule and records its outcome in the log.
@@ -805,24 +837,77 @@ async fn post_scheduler_occurrence_retry(State(state): State<Arc<AppState>>, Axu
     }
 }
 
-async fn get_scheduled_runs(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let dir = state.agent_home.join("logs/scheduled_runs");
-    let mut runs = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                if let Ok(v) = serde_json::from_str::<Value>(&text) {
-                    runs.push(v);
-                }
-            }
+// ---- todos (`/workspace/memory/` items, see `crate::workspace_memory`) ----
+
+async fn get_todos(State(state): State<Arc<AppState>>) -> Json<Value> {
+    use crate::workspace_memory as wm;
+    let today = crate::logs::today_utc();
+    let mut todos: Vec<Value> = wm::items(&state.agent_home)
+        .into_iter()
+        .filter_map(|path| {
+            let name = path.file_name()?.to_string_lossy().into_owned();
+            let text = std::fs::read_to_string(&path).ok()?;
+            let item_state = match wm::state(&text, &today) {
+                wm::ItemState::Active => "active",
+                wm::ItemState::Expired => "expired",
+                wm::ItemState::OneShot => "one_shot",
+            };
+            let modified = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs());
+            Some(json!({
+                "name": name,
+                "expires": wm::expires(&text),
+                "state": item_state,
+                "body": wm::body(&text),
+                "modified": modified,
+            }))
+        })
+        .collect();
+    // what the next hourly pass will act on first, then by deadline
+    todos.sort_by_key(|t| (t["state"] == "active", t["expires"].as_str().unwrap_or("").to_string(), t["name"].as_str().unwrap_or("").to_string()));
+    Json(json!({"today": today, "todos": todos}))
+}
+
+#[derive(Deserialize)]
+struct TodoBody {
+    body: String,
+    /// `YYYY-MM-DD`; omitted/null makes the item one-shot
+    expires: Option<String>,
+}
+
+async fn put_todo(State(state): State<Arc<AppState>>, AxumPath(name): AxumPath<String>, Json(todo): Json<TodoBody>) -> Json<Value> {
+    use crate::workspace_memory as wm;
+    if !wm::valid_name(&name) {
+        return Json(json!({"ok": false, "error": "name must be a plain `something.md` file name"}));
+    }
+    let expires = todo.expires.as_deref().map(str::trim).filter(|d| !d.is_empty());
+    if let Some(date) = expires {
+        if !wm::valid_date(date) {
+            return Json(json!({"ok": false, "error": "expires must be YYYY-MM-DD"}));
         }
     }
-    runs.sort_by(|a, b| b["ts"].as_i64().cmp(&a["ts"].as_i64())); // newest first
-    Json(json!({"runs": runs}))
+    let dir = wm::dir(&state.agent_home);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return Json(json!({"ok": false, "error": e.to_string()}));
+    }
+    match std::fs::write(dir.join(&name), wm::compose(expires, &todo.body)) {
+        Ok(()) => Json(json!({"ok": true})),
+        Err(e) => Json(json!({"ok": false, "error": e.to_string()})),
+    }
+}
+
+async fn delete_todo(State(state): State<Arc<AppState>>, AxumPath(name): AxumPath<String>) -> Json<Value> {
+    use crate::workspace_memory as wm;
+    if !wm::valid_name(&name) {
+        return Json(json!({"ok": false, "error": "bad name"}));
+    }
+    match std::fs::remove_file(wm::dir(&state.agent_home).join(&name)) {
+        Ok(()) => Json(json!({"ok": true})),
+        Err(e) => Json(json!({"ok": false, "error": e.to_string()})),
+    }
 }
 
 // ---- scheduler tasks (user/agent-defined recurring jobs, CRUD) ----
@@ -1490,7 +1575,7 @@ async fn get_reports(State(state): State<Arc<AppState>>) -> Json<Value> {
 // `LogsPanel`) is purpose-built for one specific on-disk shape and adds real
 // value beyond raw file content — `LlmLogsPanel` parses three different
 // providers' transcript shapes into one summary line, `ScheduleHistoryPanel`
-// bundles a "Wake now"/"Re-run" action panel around `/scheduler/runs`.
+// shows each scheduler occurrence's state, events and recorded runs.
 // Neither is what this is for. This is the fallback for everything *not*
 // already purpose-built: `logs/run_log/`, `logs/chat_sessions/`,
 // `logs/notifications.jsonl`, `stdout.jsonl`, `performance.jsonl`,

@@ -7,6 +7,7 @@ import ChatPanel from './components/ChatPanel.vue'
 import StatusPanel from './components/StatusPanel.vue'
 import SchedulerPanel from './components/SchedulerPanel.vue'
 import ScheduleHistoryPanel from './components/ScheduleHistoryPanel.vue'
+import TodosPanel from './components/TodosPanel.vue'
 import NotesPanel from './components/NotesPanel.vue'
 import SoulPanel from './components/SoulPanel.vue'
 import CorePanel from './components/CorePanel.vue'
@@ -49,6 +50,7 @@ if (token()) {
       <StatusPanel v-if="section === 'status'" />
       <SchedulerPanel v-if="section === 'scheduler'" />
       <ScheduleHistoryPanel v-if="section === 'schedule-history'" />
+      <TodosPanel v-if="section === 'todos'" />
       <NotesPanel v-if="section === 'notes'" />
       <SoulPanel v-if="section === 'soul'" />
       <CorePanel v-if="section === 'core'" />
@@ -60,7 +62,7 @@ if (token()) {
       <FileBrowserPanel v-if="section === 'logs'" key="logs" root="logs" api-base="/logs" title="Logs"
         description="Raw browser over everything under /logs/ not already covered by a dedicated panel (LLM logs, Schedule history) — run logs, chat sessions, budget/rate-limit state, etc." />
       <FileBrowserPanel v-if="section === 'workspace'" key="workspace" root="workspace" api-base="/workspace" title="Workspace"
-        description="Raw browser over /workspace/ — uploads, scheduled task scratch files, and workspace/memory/ (short-term staging notes the hourly maintenance pass folds into memory/notes/)." />
+        description="Raw browser over /workspace/ — uploads, scheduled task scratch files, and workspace/memory/ (todos — see the Todos panel)." />
       <EgressPanel v-if="section === 'egress'" />
       <LlmLogsPanel v-if="section === 'llm-logs'" />
       <AppsPanel v-if="section === 'apps'" />

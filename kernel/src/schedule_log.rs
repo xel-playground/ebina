@@ -358,6 +358,21 @@ impl ScheduleLog {
         all
     }
 
+    /// Every event recorded for one occurrence, oldest first, as
+    /// `{"ts":..,"event":..,...}` — re-read from the log file rather than
+    /// kept in memory, since only the webui's detail view ever asks.
+    pub fn events_for(&self, id: &str) -> Vec<serde_json::Value> {
+        let _guard = self.lock();
+        let Ok(text) = std::fs::read_to_string(&self.path) else {
+            return Vec::new();
+        };
+        text.lines()
+            .filter_map(|line| serde_json::from_str::<Record>(line).ok())
+            .filter(|rec| rec.event.occurrence() == id)
+            .filter_map(|rec| serde_json::to_value(rec).ok())
+            .collect()
+    }
+
     pub fn get(&self, id: &str) -> Option<Occurrence> {
         self.lock().occurrences.get(id).cloned()
     }
@@ -456,6 +471,20 @@ mod tests {
         assert!(!log.skip("daily_maintenance", 780, 800, "nothing new"));
         assert_eq!(log.get(&occurrence_id("daily_maintenance", 780)).unwrap().state, State::Skipped);
         assert!(log.claim_ready(800).is_empty());
+    }
+
+    #[test]
+    fn events_for_returns_only_that_occurrences_history() {
+        let (_, log) = temp_log("events");
+        log.schedule("task:a", 60, 1);
+        log.schedule("task:b", 60, 1);
+        log.claim_ready(2);
+        let id = occurrence_id("task:a", 60);
+        log.fail(&id, 1, 3, "boom", Some("r1.json".into()));
+        let events = log.events_for(&id);
+        let kinds: Vec<&str> = events.iter().map(|e| e["event"].as_str().unwrap()).collect();
+        assert_eq!(kinds, vec!["scheduled", "started", "failed"]);
+        assert_eq!(events[2]["run_file"], "r1.json");
     }
 
     #[test]
