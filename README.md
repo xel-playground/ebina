@@ -337,19 +337,25 @@ core.md                      summary — shown in full every turn
 **`daily_maintenance`** (hourly, at :13) — raw log → notes. Reviews only
 what's new since its own last successful run (`since_ts`, tracked in
 `maintenance_reports/.last_run` — a run that fails doesn't advance it, so a
-transient failure can't silently skip a window), plus
-`/workspace/memory/` — the spot for short-term notes and pending
-human-only action items. Durable facts and real research/analysis go into
-notes; a pending human-only item stays in `/workspace/memory/` and gets
-called out in the report. One report per run lands in
-`maintenance_reports/hourly/<date>_<HHMM>.md`. Skipped without an LLM call
-when nothing new was logged and `/workspace/memory/` is empty.
+transient failure can't silently skip a window). Durable facts and real
+research/analysis go into notes. One report per run lands in
+`maintenance_reports/hourly/<date>_<HHMM>.md`.
+
+It also works through `/workspace/memory/` — short-term items (reminders,
+things to watch, actions only the owner can do), one per file. An item
+that should stay around starts with `expires: YYYY-MM-DD`; until that date
+it's left alone. Once it passes — or right away for an item with no
+`expires` line (one-shot) — the next hourly run reads it, folds any lasting
+fact into notes, and `chat_send`s the owner the outcome; the host then
+deletes it after that run succeeds (the run can keep an item by rewriting
+it with a later date). Skipped without an LLM call when nothing new was
+logged and no item changed, expired or is one-shot — a long-lived active
+item doesn't force an hourly run.
 
 **`core_distillation`** (daily, at :23) — notes → core. Reads the hourly
 reports written since its last run (bounded at ~24, never the raw log) and
 from those: merges/dedupes fragmented notes and distills over-cap ones,
-`chat_send`s the human about a "needs attention" item that's shown up in
-3+ reports unchanged, runs the skill quality gate, and promotes/demotes
+runs the skill quality gate, and promotes/demotes
 what belongs in `core.md`. Report lands in
 `maintenance_reports/core/<date>_<HHMM>.md`. Skipped when there were no
 hourly reports in the window.

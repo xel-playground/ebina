@@ -240,8 +240,11 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
 ///   ever escalating (a real incident: a "please update the bot's avatar"
 ///   reminder got rediscovered and reported on for over a day, never
 ///   distilled, never escalated). Shrinking the light pass to 1h reduces
-///   how long anything sits unprocessed; see `core_distillation` below for
-///   what replaced the escalation half of the old 6h job. Gated by
+///   how long anything sits unprocessed. Items in `/workspace/memory/` carry
+///   their own deadline now (`crate::workspace_memory`) — the run after it
+///   passes reports the outcome and the host deletes the item, which is
+///   what replaced the old "re-noted forever, never escalated" failure.
+///   Gated by
 ///   `MAINTENANCE_WALL_CLOCK_SPEC` to only ever actually fire at minute 13
 ///   of the hour, not on the hour — see that const's doc comment.
 /// - `core_distillation`, every `CORE_DISTILLATION_INTERVAL_SECS` (24h, its
@@ -249,8 +252,7 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
 ///   `maintenance_reports/hourly/` since the last core run (the hourly
 ///   tier's *product*, not raw logs — bounded at ~24 reports), and from
 ///   that: merges/dedupes fragmented notes and distills oversized ones,
-///   escalates (`chat_send`) a "needs attention" item that's stayed
-///   unresolved across 3+ reports, runs the skill quality gate
+///   runs the skill quality gate
 ///   (adr/002-skill-v2.md §3), and decides what's durable enough to
 ///   promote/demote in `/core.md` (capped, `agent/src/agent_loop.rs`'s
 ///   `CORE_MD_MAX_CHARS`). This used to be split across a separate 6h
@@ -514,37 +516,6 @@ fn has_new_log_entries(agent_home: &Path, since_ts: i64) -> bool {
     false
 }
 
-/// Whether anything under `/workspace/memory/` (the designated short-term
-/// notes/reminders staging spot — see `agent_loop.rs`'s prompt) needs
-/// `daily_maintenance` to look at it — either something changed since
-/// `since_ts`, *or* a file is just sitting there un-deleted at all.
-///
-/// Used to gate `daily_maintenance` short-circuiting (combined with
-/// `has_new_log_entries`) — deliberately **not** mtime-only: an untouched
-/// pending item (e.g. a still-unresolved "needs attention" reminder nobody's
-/// acted on) must keep showing up in every hourly report, or the daily
-/// `core_distillation` escalation (`adr/001-memory-v2.md` §4 ("same item appears 3+ times
-/// unchanged → chat_send the human") can never accumulate past 1 — the item
-/// gets noted once, then the following hours short-circuit on stale mtime
-/// and the item silently stops being re-surfaced, exactly during the quiet
-/// stretches (e.g. overnight, nobody chatting) that most need the safety
-/// net. A pending item forcing an hourly LLM pass until it's resolved is
-/// the intended cost, not a regression of the short-circuit optimization —
-/// that optimization is about *nothing happening at all*, not about a known
-/// outstanding item being ignored.
-fn workspace_memory_has_new_files(agent_home: &Path, since_ts: i64) -> bool {
-    let Ok(entries) = std::fs::read_dir(agent_home.join("workspace/memory")) else { return false };
-    entries.flatten().any(|e| {
-        e.metadata().is_ok_and(|m| {
-            m.modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .is_some_and(|d| d.as_secs() as i64 > since_ts)
-                || m.is_file()
-        })
-    })
-}
-
 /// Whether `maintenance_reports/hourly/` has any `daily_maintenance`
 /// report written since `since_ts` — that's `core_distillation`'s primary
 /// input; with none, there's nothing new to consolidate or promote.
@@ -646,13 +617,15 @@ async fn schedule_due_occurrences(state: &Arc<AppState>, gap_start: i64, now: i6
 
     let last_maintenance = read_last_maintenance(&state.agent_home);
     if now - last_maintenance >= MAINTENANCE_INTERVAL_SECS && crate::cron::matches(MAINTENANCE_WALL_CLOCK_SPEC, now) {
-        if !has_new_log_entries(&state.agent_home, last_maintenance) && !workspace_memory_has_new_files(&state.agent_home, last_maintenance) {
-            // nothing logged and nothing changed under workspace/memory/
-            // since last time — an LLM pass here would just come back
+        if !has_new_log_entries(&state.agent_home, last_maintenance)
+            && !crate::workspace_memory::needs_maintenance(&state.agent_home, last_maintenance, &crate::logs::today_utc())
+        {
+            // nothing logged, and nothing under workspace/memory/ changed,
+            // expired or is a one-shot item — an LLM pass here would just come back
             // saying so. The check itself *is* a full, deterministic review
             // of [last_maintenance, now), so it's safe to advance the
             // checkpoint same as a real completed run would.
-            if log.skip(JOB_DAILY_MAINTENANCE, slot, now, "no new log entries or workspace memory files") {
+            if log.skip(JOB_DAILY_MAINTENANCE, slot, now, "no new log entries or workspace memory items to handle") {
                 write_last_maintenance(&state.agent_home, slot);
                 record_maintenance_tier(&state.agent_home, |c| &mut c.daily_maintenance, false);
             }
@@ -723,6 +696,15 @@ async fn execute_occurrence(state: Arc<AppState>, occ: crate::schedule_log::Occu
             return;
         }
     };
+    // one-shot and expired `/workspace/memory/` items this run is about to
+    // read — removed below only if the run succeeds (see
+    // `crate::workspace_memory`)
+    let today = crate::logs::today_utc();
+    let removal_candidates = if occ.job == JOB_DAILY_MAINTENANCE {
+        crate::workspace_memory::removal_candidates(&state.agent_home, &today)
+    } else {
+        Vec::new()
+    };
     let (outcome, run_file) = run_scheduled(state.clone(), trigger, Some(&occ)).await;
     let now = crate::logs::now_unix_secs();
     if outcome_aborted(&outcome) {
@@ -746,6 +728,13 @@ async fn execute_occurrence(state: Arc<AppState>, occ: crate::schedule_log::Occu
     // that window forever (the 2026-07-08 Moonshot outage did exactly
     // this). The slot, not `now`: anything logged while a slow/retried run
     // was in flight still lands in the next window.
+    let removed = crate::workspace_memory::remove_resolved(&removal_candidates, &today);
+    if !removed.is_empty() {
+        let _ = crate::logs::notify(
+            &state.agent_home,
+            &format!("daily_maintenance: removed handled workspace/memory items (one-shot or expired): {}", removed.join(", ")),
+        );
+    }
     match occ.job.as_str() {
         JOB_DAILY_MAINTENANCE => write_last_maintenance(&state.agent_home, occ.slot),
         JOB_CORE_DISTILLATION => write_last_core_run(&state.agent_home, occ.slot),

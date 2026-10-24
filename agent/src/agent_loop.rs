@@ -25,6 +25,7 @@ const RUN_LOG_DIR: &str = "/logs/run_log";
 /// show up in its *own* next delta as if it were something that happened.
 const MAINTENANCE_TRIGGER_TYPES: &[&str] = &["daily_maintenance", "core_distillation"];
 const WORKSPACE_DIR: &str = "/workspace";
+const WORKSPACE_MEMORY_DIR: &str = "/workspace/memory";
 const RETRIEVAL_TOP_K: usize = 5;
 /// adr/002-skill-v2.md §2: skills get their own, smaller quota (2-3, not
 /// notes' top-k) — "各自查完在RRF那層合併,互不搶池", each pool ranked and
@@ -1019,26 +1020,25 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String], retrieved_skills: 
                  Only what's new since the last run:\n\n{delta}\n\n\
                  Distill anything worth keeping into memory/notes/ (write_file — merge duplicates, prune what's \
                  stale; one topic per file, aiming to keep each under ~{} tokens — start a new, more specific \
-                 note rather than growing one past that) — quickly, don't try to be exhaustive, there isn't much new in an hour. Also check \
-                 /workspace/memory/ yourself (list_dir, then read_file anything in there — the log delta above \
-                 only tells you a file like that *exists*, not what's actually in it; that's the one place \
-                 short-term notes/reminders are expected to live, so that's all you need to check, not all of \
-                 /workspace/). Split what you find into three kinds, don't conflate them: a durable fact \
-                 (something true going forward — a preference, a decision, how something works) belongs in \
-                 memory/notes/; a pending action item that only a human can actually do (uploading an image, \
-                 clicking a button somewhere) isn't a fact to memorize, it stays exactly where it is in \
-                 /workspace/memory/ and gets called out in this report's own \"needs attention\" section instead \
-                 — don't write a todo into memory/notes/ just because it showed up during this pass; and real \
-                 research/analysis/organizing work that happened in conversation (actually investigated \
-                 something, worked through a comparison, dug into a problem) also belongs in memory/notes/ — \
-                 write an actual summary of what was found/concluded, not just a pointer noting that it \
-                 happened. The bar is real work occurred, not merely a question got answered — a plain Q&A \
-                 with a one-line answer isn't this; a topic that got actually explored/organized is. Once a \
-                 workspace note's *facts* have been folded into memory/notes/ and nothing pending is left in it, \
-                 delete_path it — leaving it behind means the same content gets re-noticed and re-considered \
-                 every future cycle for no reason. Then write_file a report to \
+                 note rather than growing one past that) — quickly, don't try to be exhaustive, there isn't much new in an hour. Durable facts \
+                 (something true going forward — a preference, a decision, how something works) belong in \
+                 memory/notes/, and so does real research/analysis/organizing work that happened in conversation \
+                 (actually investigated something, worked through a comparison, dug into a problem) — write an \
+                 actual summary of what was found/concluded, not just a pointer noting that it happened. The bar \
+                 is real work occurred, not merely a question got answered — a plain Q&A with a one-line answer \
+                 isn't this; a topic that got actually explored/organized is. A todo/reminder never goes into \
+                 memory/notes/ — those live in /workspace/memory/.\n\n\
+                 /workspace/memory/ (short-term items):\n{}\n\
+                 Handle the items marked **one-shot** or **expired** now, by reading each one: fold any lasting \
+                 fact into memory/notes/, do or check whatever it asked if you can, and chat_send your owner the \
+                 outcome — what was found, or that it's still unresolved — whenever it was something they asked \
+                 for or need to act on. Those items are deleted automatically once this run finishes, so don't \
+                 leave anything only in them. If an expired item genuinely still needs watching, rewrite it with \
+                 a new `expires:` date instead (and say why in the report) — that keeps it. Leave **active** items \
+                 alone unless something in the log above changes them. Then write_file a report to \
                  /maintenance_reports/hourly/{}.md summarizing what you did before calling done.\n",
                 note_soft_max_tokens(),
+                workspace_memory_listing(),
                 crate::time::maintenance_run_id(now_unix())
             )
         }
@@ -1053,16 +1053,12 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String], retrieved_skills: 
                  Do these, in order:\n\n\
                  1. **Notes upkeep.** Merge/dedupe anything in memory/notes/ that ended up fragmented or \
                  contradictory across those hourly passes.{}\n\n\
-                 2. **Escalate what's stuck.** If the same \"needs attention\" item (a pending human-only action) \
-                 shows up across 3 or more of those reports with nothing changing, stop just re-noting it and \
-                 chat_send the human about it instead. A report nobody reads isn't an escalation, it's a place \
-                 things go to be silently repeated forever.\n\n\
-                 3. **Skill quality gate.** read_file skills under /skills/ whose `retrieval_hit_count` is 0 \
+                 2. **Skill quality gate.** read_file skills under /skills/ whose `retrieval_hit_count` is 0 \
                  (never surfaced by search — check the frontmatter) and either rewrite the description (use \
                  save_skill, not write_file, so usage stats survive and the index updates immediately) or retire \
                  it (delete_path) if it's not worth keeping. Also merge skills whose descriptions overlap enough \
                  that they're really the same capability. Don't touch skills that have hits, however few.\n\n\
-                 4. **Core promotion/demotion.** Only two kinds of content belong in core.md: (a) current focus — \
+                 3. **Core promotion/demotion.** Only two kinds of content belong in core.md: (a) current focus — \
                  2-3 lines, the things actively in flight right now (the fastest-changing part); (b) durable \
                  agent responsibilities — daily tasks, standing things to watch for, the kind that stay true going \
                  forward, not a one-off todo. Everything else — \"talked about X last week\", a specific incident, \
@@ -1075,8 +1071,8 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String], retrieved_skills: 
                  with exactly \"run aborted: \" (this is load-bearing: it's the only way the host's automatic \
                  retry logic can tell a real failure from a normal, safe completion — a normal-looking summary \
                  here would silently look like success with nothing actually written).\n\n\
-                 Write a report to /maintenance_reports/core/{}.md covering all four (notes merged/distilled, \
-                 anything escalated, skill changes, core promoted/demoted — or \"no changes\" for each) before \
+                 Write a report to /maintenance_reports/core/{}.md covering all three (notes merged/distilled, \
+                 skill changes, core promoted/demoted — or \"no changes\" for each) before \
                  calling done.\n",
                 if since_ts == 0 { "the beginning".to_string() } else { human_timestamp(since_ts) },
                 oversized_notes_section(),
@@ -1268,9 +1264,12 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String], retrieved_skills: 
          - Memory notes live under `/memory/notes/` — timeless facts go in their own topic file (markdown, \
          one topic per file). The automatic per-run log lives at `/logs/run_log/<YYYY-MM-DD>/log.md` \
          (not indexed, not for you to write to directly) and is written for you.\n\
-         - `/workspace/memory/` is where short-term notes/reminders you want folded into memory/notes/ later \
-         belong — that's the only place the hourly daily_maintenance pass checks, so a note left loose \
-         elsewhere under /workspace/ won't get picked up.\n\
+         - `/workspace/memory/` holds short-term items — reminders, things to watch for a while, actions \
+         only your owner can do. One item per file. If it should stay around, its first line must be \
+         `expires: YYYY-MM-DD` (the last day it's still relevant — turn \"for the next few days\" into an \
+         actual date); the hourly maintenance pass wraps it up after that date. An item without an \
+         `expires:` line is one-shot: handled by the next hourly pass, then deleted. Nothing elsewhere under \
+         /workspace/ gets picked up.\n\
          - Skills live under `/skills/<name>.md`.\n\
          - Scheduled tasks live under `/scheduler/<id>.json` (one file per task, same as skills) — you can \
          read_file one directly too, but use update_task/delete_task so cron gets re-validated.\n\
@@ -1633,6 +1632,49 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 /// WASI has no notion of an initial cwd here (none configured host-side), so
 /// a bare relative path fails capability lookup entirely — normalize
 /// whatever the model gives us to be rooted at guest `/`.
+/// Mirrors `kernel/src/workspace_memory.rs` (a separate crate, so the
+/// classification is duplicated rather than shared): an item's first
+/// non-empty line `expires: YYYY-MM-DD` keeps it until that date; without
+/// one it's one-shot.
+fn workspace_memory_expires(text: &str) -> Option<&str> {
+    let first = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let date = first.strip_prefix("expires:")?.trim();
+    let b = date.as_bytes();
+    let well_formed = b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b.iter().enumerate().all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit());
+    well_formed.then_some(date)
+}
+
+/// One line per `/workspace/memory/` item with its state as of today —
+/// what `daily_maintenance` has to act on.
+fn workspace_memory_listing() -> String {
+    let today = today_utc();
+    let Ok(entries) = fs::read_dir(WORKSPACE_MEMORY_DIR) else {
+        return "(empty)".to_string();
+    };
+    let mut lines: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .map(|e| {
+            let path = e.path().to_string_lossy().into_owned();
+            let text = fs::read_to_string(&path).unwrap_or_default();
+            let state = match workspace_memory_expires(&text) {
+                None => "**one-shot** (no expires line)".to_string(),
+                Some(date) if date < today.as_str() => format!("**expired** ({date})"),
+                Some(date) => format!("active until {date}"),
+            };
+            format!("- {path} — {state}")
+        })
+        .collect();
+    if lines.is_empty() {
+        return "(empty)".to_string();
+    }
+    lines.sort();
+    lines.join("\n")
+}
+
 fn absolute_path(path: &str) -> String {
     if path.starts_with('/') {
         path.to_string()
@@ -1989,5 +2031,18 @@ mod note_cap_tests {
         assert!(note_size_denial(p, &past_soft).is_none());
         assert!(note_size_denial(p, &at_hard).is_none());
         assert!(note_size_denial(p, &past_hard).is_some());
+    }
+}
+
+#[cfg(test)]
+mod workspace_memory_tests {
+    use super::*;
+
+    #[test]
+    fn expires_parsing_matches_the_kernel_side() {
+        assert_eq!(workspace_memory_expires("expires: 2026-10-25\n\n# x"), Some("2026-10-25"));
+        assert_eq!(workspace_memory_expires("\n  expires:2026-10-25  \nbody"), Some("2026-10-25"));
+        assert_eq!(workspace_memory_expires("# title\nexpires: 2026-10-25"), None);
+        assert_eq!(workspace_memory_expires("expires: soon"), None);
     }
 }

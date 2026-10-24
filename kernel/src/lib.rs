@@ -14,6 +14,7 @@ pub mod scheduler_tasks;
 pub mod secrets;
 pub mod state;
 pub mod syscalls;
+pub mod workspace_memory;
 
 use anyhow::{Context, Result};
 use config::Config;
