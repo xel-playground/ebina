@@ -17,7 +17,6 @@ defineExpose({ refresh })
         <dt>tokens used today</dt><dd>{{ status.budget?.tokens_used ?? '—' }}</dd>
         <dt>last run</dt><dd>{{ status.last_run ? new Date(status.last_run.ts * 1000).toLocaleString() : '—' }}</dd>
         <dt>last summary</dt><dd>{{ status.last_run?.result?.summary ?? '—' }}</dd>
-        <dt>next wake</dt><dd>{{ status.last_run?.sleep_until ? new Date(status.last_run.sleep_until * 1000).toLocaleString() : '—' }}</dd>
       </dl>
     </div>
   </div>

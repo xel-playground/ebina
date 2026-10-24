@@ -57,7 +57,7 @@ stdout captured to logs.
 │  ┌─────────────┐   ┌───────────────┐   ┌────────────────────────┐   │
 │  │ Gateway      │   │ Scheduler      │   │ Syscall dispatch        │   │
 │  │ (axum)       │   │ (30s tick:     │   │ llm_call · embed        │   │
-│  │ webui API,   │   │  cron ·        │   │ db_exec (RAG engine —   │   │
+│  │ webui API,   │   │  core_distill ·│   │ db_exec (RAG engine —   │   │
 │  │ SSE, grants  │   │  daily_        │   │  only agent/src/        │   │
 │  │ (tofu domain)│   │  maintenance · │   │  memory.rs calls this,  │   │
 │  │              │   │  scheduled_    │   │  no guest action        │   │
@@ -65,7 +65,7 @@ stdout captured to logs.
 │  └──────┬───────┘   └───────┬────────┘   │ http_fetch (domain-gated)·│   │
 │         │ per-session         │            │  search_web · ssh_exec  │   │
 │         │ + per-task_id        │            │ notify · chat_send      │   │
-│         │ (else concurrent)    │            │ sleep_until ·           │   │
+│         │ (else concurrent)    │            │                         │   │
 │         └──────────┬──────────┘            │  schedule_task family   │   │
 │                     ▼                       └────────────┬─────────────┘
 │         ┌─────────────────────────────────────────────────┐          │
@@ -95,7 +95,7 @@ stdout captured to logs.
 ```
 
 **Every run is stateless, persistent on disk.** Each trigger
-(`message`/`cron`/`daily_maintenance`/`scheduled_task`/`manual`) gets a
+(`message`/`daily_maintenance`/`core_distillation`/`scheduled_task`/`manual`) gets a
 brand-new agent process — nothing survives in memory between runs.
 What *does* persist is entirely on the filesystem, under `agent-home/`:
 `memory/notes/` (RAG-searched curated facts + a raw per-run log, see
@@ -110,7 +110,7 @@ dropped).
 `message`/`compact_session` runs get serialized against their own session —
 two turns on the *same* session queue behind each other (`session.json` is
 a read-modify-write per turn), but two different sessions, or a background
-trigger (`cron`/`daily_maintenance`/`scheduled_task`/`manual`) running
+trigger (`daily_maintenance`/`scheduled_task`/`manual`) running
 alongside a chat reply, run fully concurrently with no lock at all. A
 `scheduled_task` additionally locks per task id, so the same task can't run
 twice at once if a cron tick and a manual `/api/wake` land together. Both
@@ -172,8 +172,8 @@ for how the agent itself is told to treat it.
 
 ## Scheduler (event-sourced, idempotent)
 
-Every self-driven run — the three maintenance tiers, the agent's own
-`sleep_until` wake (`cron`), and each `scheduled_task` — is an
+Every self-driven run — the maintenance tiers and each `scheduled_task` —
+is an
 *occurrence* `<job>@<slot>` (e.g. `task:abc@1783328400`), and its whole
 lifecycle is an append-only event log, `logs/scheduler_events.jsonl`
 (`kernel/src/schedule_log.rs`):
@@ -324,7 +324,7 @@ core.md                      summary — shown in full every turn
   every turn. A live chat turn can't write them (its `write_file`/
   `append_file` is scoped to `/workspace/`), so an ad-hoc mid-conversation
   edit can't silently re-clobber an already-corrected fact.
-  Background-triggered runs (`cron`/`scheduled_task`/`manual`) keep full
+  Background-triggered runs (`scheduled_task`/`manual`) keep full
   access. Note size (estimated as 1 token per non-ASCII char + 1 per 4
   ASCII chars) has a soft and a hard cap under `[memory]`: past
   `note_soft_max_tokens` (default 2000) a write still goes through with a

@@ -28,9 +28,6 @@ async fn main() -> Result<()> {
     })
     .await??;
     print!("{}", outcome.stdout);
-    if let Some(t) = outcome.sleep_until {
-        eprintln!("[kernel] agent asked to sleep until {t}");
-    }
 
     Ok(())
 }

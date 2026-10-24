@@ -74,10 +74,3 @@ fn notify_writes_to_notifications_log() {
     assert!(log.contains("hello from agent guest"));
 }
 
-#[test]
-fn sleep_until_is_reported_back_to_host() {
-    let home = scratch_agent_home("sleep");
-    let outcome = kernel::run_agent(home.to_str().unwrap(), &agent_bin_path(), &["sleep_until"])
-        .expect("run_agent should not error");
-    assert_eq!(outcome.sleep_until, Some(1_900_000_000));
-}

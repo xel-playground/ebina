@@ -28,7 +28,7 @@ function tokens(entry) {
 }
 // `source.session_key` is only set for a "message" trigger (webui or a
 // specific Discord channel/DM — see agent_loop.rs `source_meta`); a
-// cron/daily_maintenance/scheduled_task run just shows its trigger type.
+// daily_maintenance/scheduled_task run just shows its trigger type.
 // `source` itself is missing entirely on transcripts logged before this existed.
 function sourceLabel(entry) {
   const s = entry.source

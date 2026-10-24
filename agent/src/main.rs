@@ -19,7 +19,6 @@ fn main() {
         "abs" => try_read("/etc/passwd"),
         "symlink" => try_read("escape_link/passwd"),
         "notify" => notify_demo(),
-        "sleep_until" => sleep_until_demo(),
         "db_exec" => db_exec_demo(),
         "db_attach_escape" => db_attach_escape(),
         "db_slow_query" => db_slow_query(),
@@ -54,11 +53,6 @@ fn run_mode() {
 
 fn notify_demo() {
     let resp = syscall::call("notify", &serde_json::json!({"message": "hello from agent guest"}));
-    println!("RESULT:{resp}");
-}
-
-fn sleep_until_demo() {
-    let resp = syscall::call("sleep_until", &serde_json::json!({"timestamp": 1_900_000_000i64}));
     println!("RESULT:{resp}");
 }
 

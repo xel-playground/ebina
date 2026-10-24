@@ -123,7 +123,6 @@ defineExpose({ refresh })
       </span>
     </h2>
     <div class="sched-bar hint">
-      <span>next requested wake: <b>{{ fmt(status?.last_run?.sleep_until) }}</b></span>
       <span>last run: <b>{{ fmt(status?.last_run?.ts) }}</b></span>
       <span v-if="wakeResult">wake: {{ wakeResult }}</span>
     </div>
@@ -187,8 +186,8 @@ defineExpose({ refresh })
           </div>
         </div>
         <div class="hint" v-else-if="selectedId">loading…</div>
-        <div class="hint" v-else>Select an occurrence. Every due slot (maintenance tiers, the agent's own
-          `sleep_until` wake, each Scheduler task) is scheduled exactly once; failed attempts retry after 15 min,
+        <div class="hint" v-else>Select an occurrence. Every due slot (maintenance tiers, each Scheduler task) is
+          scheduled exactly once; failed attempts retry after 15 min,
           up to 3 times, and a run cut off by a kernel restart counts as a failed attempt. "Wake now" is manual/dev
           use and isn't tracked here.</div>
       </div>

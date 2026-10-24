@@ -6,7 +6,6 @@ pub mod llm_call;
 pub mod notify;
 pub mod schedule_task;
 pub mod search_web;
-pub mod sleep_until;
 pub mod ssh_exec;
 
 use crate::abi::error_json;
@@ -17,7 +16,6 @@ pub fn dispatch(state: &mut AgentState, name: &str, req: Value) -> Value {
     match name {
         "notify" => notify::call(state, req),
         "chat_send" => chat_send::call(state, req),
-        "sleep_until" => sleep_until::call(state, req),
         "db_exec" => db_exec::call(state, req),
         "llm_call" => llm_call::call(state, req),
         "embed" => embed::call(state, req),

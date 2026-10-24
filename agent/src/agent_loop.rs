@@ -688,7 +688,7 @@ pub fn run(trigger: &Value) {
     }
 
     // gateway's Chat panel shows this as "context window used" — only for
-    // real chat turns, so a daily_maintenance/cron/scheduled_task run (or
+    // real chat turns, so a daily_maintenance/scheduled_task run (or
     // compact_session's own summarization call) never overwrites it with a
     // number that has nothing to do with the chat session (kernel/src/
     // gateway.rs `last_chat_context_tokens`). Keyed by `session_key` (webui
@@ -735,23 +735,13 @@ pub fn run(trigger: &Value) {
     if skills_reindexed > 0 {
         trace(&think_path, &format!("[cleanup] reindexed {skills_reindexed} skill(s)"));
     }
-    // Unconditional, every run, every trigger type — deliberately not an
-    // LLM decision. `sleep_until` isn't even in the "## Actions" list the
-    // model sees; this is the *only* thing that ever sets it. The `cron`
-    // trigger_note used to tell the model to "call sleep_until with your
-    // next check-in time" at the end of its own turn, but that was always
-    // moot — whatever it picked (if anything; it had no documented way to
-    // actually call an undocumented action) got silently overwritten here
-    // regardless. The next `cron` self-wake is always ~1h out, full stop.
-    let sleep_at = now_unix() + 3600;
-    let _ = syscall::call("sleep_until", &serde_json::json!({"timestamp": sleep_at}));
 
     println!("RESULT:{}", serde_json::json!({"summary": summary}));
 }
 
 /// Keeps `messages[0..COMPACT_KEEP_HEAD]` (the system prompt *and* the very
 /// first real task message — for a chat turn, the conversation's opening
-/// message; for cron/scheduled_task/daily_maintenance, the trigger itself,
+/// message; for scheduled_task/daily_maintenance, the trigger itself,
 /// since there's no `history` there and `messages[1]` is the whole task)
 /// and the last `COMPACT_KEEP_TAIL` entries (the turn that just landed, plus
 /// whatever prompted it) verbatim, summarizes everything in between via one
@@ -849,7 +839,7 @@ fn ends_with_newline(path: &str) -> bool {
 }
 
 /// Keyed by session, same reasoning as `kernel/src/syscalls/llm_call.rs`
-/// `thinking_path` — a Discord/cron/daily_maintenance run in the background
+/// `thinking_path` — a Discord/scheduled/daily_maintenance run in the background
 /// shouldn't overwrite what a human is live-watching in the webui Chat
 /// panel. `trigger.session_key` is only present for a `message` trigger;
 /// anything else shares the `_system` bucket (no live audience to protect).
@@ -985,30 +975,6 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String], retrieved_skills: 
             .join("\n")
     };
 
-    // fixed-size regardless of how long the real conversation grows —
-    // kernel/src/gateway.rs `recent_chat_context` sends at most the last few
-    // turns, only on a `cron` trigger; not a substitute for real `history`
-    // (which only a `message` trigger gets), just enough that `chat_send`
-    // doesn't have to speak completely cold
-    let recent_chat_section = match trigger.get("recent_chat").and_then(|r| r.as_array()) {
-        Some(turns) if !turns.is_empty() => {
-            let lines: Vec<String> = turns
-                .iter()
-                .map(|t| {
-                    let role = t.get("role").and_then(|r| r.as_str()).unwrap_or("?");
-                    let content = t.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                    format!("- {role}: {content}")
-                })
-                .collect();
-            format!(
-                "## Recent chat (last {} turns only, not the full conversation — for context, don't reply to it directly)\n\n{}\n\n",
-                turns.len(),
-                lines.join("\n")
-            )
-        }
-        _ => String::new(),
-    };
-
     let trigger_type = trigger.get("type").and_then(|t| t.as_str());
     let trigger_note = match trigger_type {
         Some("daily_maintenance") => {
@@ -1118,23 +1084,6 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String], retrieved_skills: 
                  action needed from you.\n"
             )
         }
-        Some("cron") => {
-            "\nThis is a periodic autonomous check-in — the scheduler woke you because you asked to be, \
-             not because a human is waiting on a reply. There is no `history` here (this is a fresh \
-             session, not a continuation of any chat) — the \"Recent chat\" section above (if present) is \
-             just a peek at the last few turns for context, not something to reply to. Check whatever's \
-             worth checking (unfinished workspace/ work, anything you left yourself a reminder about in \
-             memory/notes/), act on it if there's something to do, otherwise just call `done` right away \
-             with a short summary — don't manufacture work to justify the wake. Do NOT read_file or execute \
-             anything under /workspace/tasks/ — those are `scheduled_task` definitions, already handled on \
-             their own cron schedule; poking at one here and running what it describes (2026-07-16 incident: \
-             a cron check-in read morning_report.md, ran its script, and re-sent that day's already-sent \
-             greeting) duplicates work a different trigger already owns. If you have something genuinely \
-             worth proactively telling the human (not just a silent `notify` log entry), use `chat_send` — \
-             it shows up as a real message next time they open Chat. Just call `done` when finished — the \
-             next check-in is scheduled automatically, not something you need to set yourself.\n"
-                .to_string()
-        }
         Some("scheduled_task") => {
             let data_path = trigger.get("data_path").and_then(|d| d.as_str()).unwrap_or("");
             let task_id = trigger.get("task_id").and_then(|d| d.as_str()).unwrap_or("");
@@ -1192,7 +1141,7 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String], retrieved_skills: 
          - `{{\"action\":\"notify\",\"message\":\"...\"}}` — silent background log (Live log panel), nobody's \
          watching it live\n\
          - `{{\"action\":\"chat_send\",\"message\":\"...\",\"target\":\"webui\"}}` — proactively pushes one \
-         message to a real chat surface; for a background-triggered run (`cron`/`daily_maintenance`/\
+         message to a real chat surface; for a background-triggered run (`daily_maintenance`/\
          `scheduled_task`) with something worth telling the human — a live `message` trigger should just \
          use `done`'s `summary` instead, not this. `target` is `\"webui\"` (default, appends to the \
          browser Chat panel's session) or `\"discord\"` (DMs whichever Discord user has paired as owner — \
@@ -1310,8 +1259,8 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String], retrieved_skills: 
     } else {
         // this session's own turns are already fully visible via `history`
         // (a `message` trigger) — including them again here would just be
-        // duplication, not new cross-session information. `cron`/
-        // `scheduled_task` have no `session_key` of their own, so nothing
+        // duplication, not new cross-session information. Background runs
+        // (`scheduled_task`, maintenance) have no `session_key` of their own, so nothing
         // gets excluded for those (correctly — they have no `history` to
         // already be showing this).
         let own_session_key = trigger.get("session_key").and_then(|s| s.as_str());
@@ -1333,7 +1282,6 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String], retrieved_skills: 
     let volatile = format!(
         "## Current time\n\n\
          {current_time}\n\n\
-         {recent_chat_section}\
          {staging_section}\
          ## Relevant memory for this run\n\n\
          Hybrid BM25 + vector search, best matches first:\n\n\
@@ -1371,7 +1319,7 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String], retrieved_skills: 
 /// counting toward `max_entries`, not after, so excluding a chatty own
 /// session doesn't silently starve this of entries from everywhere else.
 ///
-/// Only ever considers `message`-trigger entries — `cron`/`scheduled_task`/
+/// Only ever considers `message`-trigger entries — `scheduled_task`/
 /// `daily_maintenance` fire on their own schedule regardless of chat
 /// activity, and would otherwise just be routine-wake noise competing for
 /// the same `max_entries` slots as the actual "what did another chat just
@@ -1746,7 +1694,7 @@ fn truncate_bytes_with_marker(s: &str, max_bytes: usize) -> String {
 /// directly). Only `message` (a live human chat turn, webui/Discord) is
 /// restricted now, and only to `/workspace/` — scratch space, task output,
 /// upload-adjacent files, anything a reply needs to persist for itself.
-/// Every *background*-triggered run (`cron`, `daily_maintenance`,
+/// Every *background*-triggered run (`daily_maintenance`,
 /// `scheduled_task`, `manual`) keeps full access exactly as before —
 /// scheduled tasks legitimately maintain their own state files under
 /// `/memory/notes/` (e.g. the RSS task's per-source status tracker), and
@@ -1760,7 +1708,7 @@ fn write_action_denial(path: &str, trigger: &Value) -> Option<String> {
     // is a stricter, trigger-type-specific gate than the message/workspace
     // one below (which only fires for `message`); core.md is refused for
     // *every* trigger type except `core_distillation`, including
-    // `daily_maintenance`/`cron`, which the
+    // `daily_maintenance`/`scheduled_task`, which the
     // workspace-only rule below would otherwise let write anywhere. Reusing
     // the "当场改 core 打断 prompt cache 前缀" reasoning from that same ADR
     // section: an exception path here isn't just a security boundary

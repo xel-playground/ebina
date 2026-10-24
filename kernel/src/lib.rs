@@ -44,7 +44,6 @@ pub const SYSCALL_FD: i32 = 3;
 
 pub struct RunOutcome {
     pub stdout: String,
-    pub sleep_until: Option<i64>,
     /// `true` when the agent never produced a `RESULT:` line — see the
     /// `!stdout.contains("RESULT:")` check below. `gateway.rs`'s
     /// `run_trigger` uses this to hand back an actual "run trapped" summary
@@ -150,7 +149,6 @@ pub fn run_agent_with_epoch_timeout(agent_home: &str, agent_path: &str, args: &[
     drop(cancel_tx);
     let _ = watchdog.join();
     let _ = child.wait();
-    let sleep_until = state.sleep_until;
     drop(state);
     let stdout = String::from_utf8_lossy(&stdout_reader.join().unwrap_or_default()).into_owned();
 
@@ -183,7 +181,7 @@ pub fn run_agent_with_epoch_timeout(agent_home: &str, agent_path: &str, args: &[
         let _ = logs::notify(&agent_home_path, &format!("auto-commit failed: {e}"));
     }
 
-    Ok(RunOutcome { stdout, sleep_until, trapped })
+    Ok(RunOutcome { stdout, trapped })
 }
 
 /// `EBINA_SECRETS` env var if set, else `<parent of agent_home>/secrets.toml`

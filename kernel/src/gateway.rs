@@ -71,7 +71,7 @@ pub(crate) struct AppState {
     /// strict order (`session.json` is a read-modify-write per turn; two
     /// concurrent turns on the same session would race that) and a human
     /// doesn't want two replies interleaving one conversation. Every other
-    /// trigger type (`cron`/`daily_maintenance`/`scheduled_task`/`manual`)
+    /// trigger type (`daily_maintenance`/`scheduled_task`/`manual`)
     /// has no session to protect this way and runs fully concurrently with
     /// everything else — safe now that `write_file`/`append_file`'s target
     /// directories no longer overlap between trigger types (see
@@ -264,7 +264,6 @@ pub async fn serve(cfg: GatewayConfig) -> anyhow::Result<()> {
 ///   (`agent_loop.rs`'s `write_action_denial`) — no exception path, by
 ///   design (staleness gets fixed by the next distillation cycle rereading
 ///   fresh evidence, not by a live-chat shortcut).
-/// - `cron`, once the agent's own last-requested `sleep_until` has passed
 /// - one `scheduled_task` wake per enabled, cron-matching entry under
 ///   `crate::scheduler_tasks` — user/agent-defined jobs (`data_path` points
 ///   the woken session at its own instructions), independent of the two
@@ -564,7 +563,6 @@ async fn sweep_idle_sessions(state: &Arc<AppState>, idle_after: Duration) {
 const JOB_DAILY_MAINTENANCE: &str = "daily_maintenance";
 const JOB_HOUSEKEEPING: &str = "housekeeping";
 const JOB_CORE_DISTILLATION: &str = "core_distillation";
-const JOB_CRON: &str = "cron";
 const TASK_JOB_PREFIX: &str = "task:";
 
 /// The minute `ts` falls in — every slot is minute-aligned, so the two
@@ -659,16 +657,6 @@ async fn schedule_due_occurrences(state: &Arc<AppState>, gap_start: i64, now: i6
         }
     }
 
-    // the agent's own last-requested wake — its `sleep_until` value *is*
-    // the slot, so the same request is only ever woken once, restart or not
-    let last_run: Option<Value> = std::fs::read_to_string(state.agent_home.join("logs/last_run.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok());
-    if let Some(sleep_until) = last_run.and_then(|v| v.get("sleep_until").and_then(Value::as_i64)) {
-        if now >= sleep_until {
-            log.schedule(JOB_CRON, sleep_until, now);
-        }
-    }
 
     for task in crate::scheduler_tasks::load_tasks(&state.agent_home) {
         if !task.enabled {
@@ -750,7 +738,6 @@ fn build_occurrence_trigger(state: &Arc<AppState>, occ: &crate::schedule_log::Oc
     match occ.job.as_str() {
         JOB_DAILY_MAINTENANCE => Ok(json!({"type": JOB_DAILY_MAINTENANCE, "since_ts": read_last_maintenance(home)})),
         JOB_CORE_DISTILLATION => Ok(json!({"type": JOB_CORE_DISTILLATION, "since_ts": read_last_core_run(home)})),
-        JOB_CRON => Ok(json!({"type": "cron", "recent_chat": recent_chat_context(home, DEFAULT_SESSION_KEY)})),
         job => {
             let task_id = job.strip_prefix(TASK_JOB_PREFIX).ok_or_else(|| format!("unknown scheduler job `{job}`"))?;
             let task = crate::scheduler_tasks::load_task(home, task_id).ok_or_else(|| format!("task {task_id} no longer exists"))?;
@@ -768,7 +755,7 @@ fn build_occurrence_trigger(state: &Arc<AppState>, occ: &crate::schedule_log::Oc
 /// /api/scheduler/occurrences/{id}` serves it from there.
 async fn run_scheduled(state: Arc<AppState>, trigger: Value, occ: Option<&crate::schedule_log::Occurrence>) -> (Value, Option<String>) {
     let ts = crate::logs::now_unix_secs();
-    let trigger_type = trigger.get("type").and_then(|t| t.as_str()).unwrap_or("cron").to_string();
+    let trigger_type = trigger.get("type").and_then(|t| t.as_str()).unwrap_or("scheduled").to_string();
     let outcome = run_trigger(state.clone(), trigger.clone()).await;
     let dir = state.agent_home.join("logs/scheduled_runs");
     let mut run_file = None;
@@ -1452,8 +1439,8 @@ async fn run_trigger_inner(state: &Arc<AppState>, trigger: Value) -> Value {
             } else {
                 extract_result(&outcome.stdout)
             };
-            let _ = persist_last_run(&state.agent_home, outcome.sleep_until, &result);
-            json!({"ok": true, "result": result, "sleep_until": outcome.sleep_until, "stdout": outcome.stdout})
+            let _ = persist_last_run(&state.agent_home, &result);
+            json!({"ok": true, "result": result, "stdout": outcome.stdout})
         }
         Ok(Err(e)) => json!({"ok": false, "error": e.to_string()}),
         Err(e) => json!({"ok": false, "error": format!("run panicked: {e}")}),
@@ -1477,15 +1464,15 @@ fn extract_result(stdout: &str) -> Value {
 /// runs finishing close together could interleave writes to the same
 /// `last_run.json` into a torn/corrupt file, same defect class the
 /// `http_get` cache write race was fixed for. Temp file + `rename` instead:
-/// `rename` is atomic on POSIX same-filesystem, so `scheduler_loop`'s read
-/// of this file always sees either the old or the new complete payload,
+/// `rename` is atomic on POSIX same-filesystem, so a reader (`GET
+/// /api/status`) always sees either the old or the new complete payload,
 /// never a mix.
-fn persist_last_run(agent_home: &Path, sleep_until: Option<i64>, result: &Value) -> anyhow::Result<()> {
+fn persist_last_run(agent_home: &Path, result: &Value) -> anyhow::Result<()> {
     let path = agent_home.join("logs/last_run.json");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let payload = json!({"ts": crate::logs::now_unix_secs(), "sleep_until": sleep_until, "result": result});
+    let payload = json!({"ts": crate::logs::now_unix_secs(), "result": result});
     let tmp_path = path.with_extension(format!("json.{}.tmp", crate::logs::now_unix_nanos()));
     std::fs::write(&tmp_path, serde_json::to_vec_pretty(&payload)?)?;
     std::fs::rename(&tmp_path, &path)?;
@@ -1978,32 +1965,7 @@ fn load_session(agent_home: &Path, key: &str) -> Vec<SessionTurn> {
         .unwrap_or_default()
 }
 
-const RECENT_CHAT_TURNS: usize = 6;
-const RECENT_CHAT_MAX_CHARS: usize = 500;
 
-/// Last `RECENT_CHAT_TURNS` turns from the given session, each capped to
-/// `RECENT_CHAT_MAX_CHARS` — fixed-size regardless of how long the real
-/// conversation grows, unlike full `history` (which only a `message`
-/// trigger gets). Gives a `cron` wake enough "what were we just talking
-/// about" for `chat_send` not to feel completely blind, without the prompt
-/// growing forever as the chat session grows. `cron` is a single global
-/// wake (not per-Discord-channel), so it always reads the `"webui"` one.
-fn recent_chat_context(agent_home: &Path, key: &str) -> Vec<Value> {
-    let turns = load_session(agent_home, key);
-    let start = turns.len().saturating_sub(RECENT_CHAT_TURNS);
-    turns[start..].iter().map(|t| json!({"role": t.role, "content": truncate_chars(&t.content, RECENT_CHAT_MAX_CHARS)})).collect()
-}
-
-/// Truncates by *char* count, not bytes — `String::truncate` panics/
-/// corrupts on a non-char-boundary byte offset, which CJK text (this
-/// project's primary chat language) hits constantly.
-fn truncate_chars(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        s.to_string()
-    } else {
-        format!("{}…", s.chars().take(max_chars).collect::<String>())
-    }
-}
 
 fn save_session(agent_home: &Path, key: &str, turns: &[SessionTurn]) -> anyhow::Result<()> {
     let path = session_path(agent_home, key);
@@ -2043,7 +2005,7 @@ fn chat_context_tokens_path(agent_home: &Path, key: &str) -> PathBuf {
 /// last `llm_call` (system prompt + full history + that turn's running
 /// action-loop messages so far) — written by `agent_loop.rs` itself only
 /// when `trigger.type == "message"`, specifically so a `daily_maintenance`/
-/// `cron`/scheduled-task run elsewhere (or a session compact's own
+/// scheduled-task run elsewhere (or a session compact's own
 /// summarization call) never clobbers what the *chat* panel shows; those
 /// aren't the chat session's context at all.
 fn last_chat_context_tokens(agent_home: &Path, key: &str) -> Option<u64> {
@@ -2373,7 +2335,7 @@ fn parse_skill(text: &str) -> Option<Value> {
 /// process-global flag, which stopped being safe once runs went
 /// per-session: a global flag could abort an unrelated concurrent session's
 /// run instead of the intended one. Defaults to `"webui"` (what the Chat
-/// panel's abort button hits); background triggers (cron/daily_maintenance/
+/// panel's abort button hits); background triggers (daily_maintenance/
 /// scheduled_task) have no session of their own and all share `"_system"`.
 async fn post_abort(State(state): State<Arc<AppState>>, Query(q): Query<ThinkingQuery>) -> Json<Value> {
     let key = q.session.unwrap_or_else(|| DEFAULT_SESSION_KEY.to_string());
@@ -2400,7 +2362,7 @@ struct ThinkingQuery {
 /// `chat_sessions/<key>/thinking-live.txt` a running turn writes to
 /// (`agent_loop.rs` `thinking_live_path`, `llm_call.rs` `thinking_path`);
 /// defaults to `"webui"` since that's the only session the webui Chat
-/// panel itself ever watches. Without this, a Discord/cron run in the
+/// panel itself ever watches. Without this, a Discord/scheduled run in the
 /// background would blast its own trace over whatever the webui viewer was
 /// just watching, and vice versa.
 async fn get_thinking_sse(

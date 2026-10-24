@@ -22,8 +22,6 @@ pub struct AgentState {
     pub embed_budget: BudgetTracker,
     pub http_daily: BudgetTracker,
     pub search_daily: BudgetTracker,
-    /// set by the `sleep_until` syscall; read by the host after the agent exits
-    pub sleep_until: Option<i64>,
     db: Option<Connection>,
 }
 
@@ -42,7 +40,6 @@ impl AgentState {
             embed_budget,
             http_daily,
             search_daily,
-            sleep_until: None,
             db: None,
         }
     }
