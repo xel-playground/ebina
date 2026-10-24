@@ -276,8 +276,13 @@ pub fn run(trigger: &Value) {
             compact_run_messages(&mut messages, &think_path, turn);
         }
 
-        let action: Value = match serde_json::from_str(text.trim()) {
-            Ok(v) => v,
+        let action: Value = match parse_action(&text) {
+            Ok((v, recovered)) => {
+                if recovered {
+                    trace(&think_path, &format!("[turn {}] (ignored text around the JSON action)", turn + 1));
+                }
+                v
+            }
             Err(e) => {
                 trace(&think_path, &format!("[turn {}] ✗ not valid JSON ({e}), asking it to retry", turn + 1));
                 messages.push(serde_json::json!({
@@ -1580,6 +1585,30 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 /// WASI has no notion of an initial cwd here (none configured host-side), so
 /// a bare relative path fails capability lookup entirely — normalize
 /// whatever the model gives us to be rooted at guest `/`.
+/// The model's reply as an action object. Tries the strict parse first;
+/// failing that, takes the first complete JSON object in the text and
+/// ignores whatever surrounds it — a ```json fence, a sentence of preamble,
+/// or stray trailing characters (gpt-6-luna once ended six write_file
+/// replies in a row with an extra `"}`, each rejected outright, so the
+/// write never happened). The `bool` is whether that lenient path was
+/// needed. Only an object counts — anything else is still an error the
+/// model gets asked to fix.
+fn parse_action(text: &str) -> Result<(Value, bool), String> {
+    let trimmed = text.trim();
+    let strict_err = match serde_json::from_str::<Value>(trimmed) {
+        Ok(v) if v.is_object() => return Ok((v, false)),
+        Ok(_) => "not a JSON object".to_string(),
+        Err(e) => e.to_string(),
+    };
+    let Some(start) = trimmed.find('{') else {
+        return Err(strict_err);
+    };
+    match serde_json::Deserializer::from_str(&trimmed[start..]).into_iter::<Value>().next() {
+        Some(Ok(v)) if v.is_object() => Ok((v, true)),
+        _ => Err(strict_err),
+    }
+}
+
 /// Mirrors `kernel/src/workspace_memory.rs` (a separate crate, so the
 /// classification is duplicated rather than shared): an item's first
 /// non-empty line `expires: YYYY-MM-DD` keeps it until that date; without
@@ -1992,5 +2021,42 @@ mod workspace_memory_tests {
         assert_eq!(workspace_memory_expires("\n  expires:2026-10-25  \nbody"), Some("2026-10-25"));
         assert_eq!(workspace_memory_expires("# title\nexpires: 2026-10-25"), None);
         assert_eq!(workspace_memory_expires("expires: soon"), None);
+    }
+}
+
+#[cfg(test)]
+mod parse_action_tests {
+    use super::*;
+
+    #[test]
+    fn strict_json_parses_as_is() {
+        let (v, recovered) = parse_action(r#" {"action":"done","summary":"ok"} "#).unwrap();
+        assert_eq!(v["action"], "done");
+        assert!(!recovered);
+    }
+
+    #[test]
+    fn trailing_garbage_is_ignored() {
+        // the real gpt-6-luna failure: an extra `"}` after a complete object
+        let text = r#"{"action":"write_file","path":"/workspace/memory/x.md","content":"expires: 2026-10-28\n# 追蹤"}"}"#;
+        let (v, recovered) = parse_action(text).unwrap();
+        assert_eq!(v["action"], "write_file");
+        assert_eq!(v["content"], "expires: 2026-10-28\n# 追蹤");
+        assert!(recovered);
+    }
+
+    #[test]
+    fn fences_and_preamble_are_ignored() {
+        let (v, _) = parse_action("```json\n{\"action\":\"done\",\"summary\":\"x\"}\n```").unwrap();
+        assert_eq!(v["action"], "done");
+        let (v, _) = parse_action("Sure, here it is: {\"action\":\"list_dir\",\"path\":\"/\"}").unwrap();
+        assert_eq!(v["action"], "list_dir");
+    }
+
+    #[test]
+    fn genuinely_broken_replies_still_fail() {
+        assert!(parse_action("no json here").is_err());
+        assert!(parse_action(r#"{"action":"done","summary":"unterminated"#).is_err());
+        assert!(parse_action("[1,2,3]").is_err());
     }
 }
