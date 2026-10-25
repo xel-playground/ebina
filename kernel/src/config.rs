@@ -62,6 +62,11 @@ pub struct LlmConfig {
     /// `read_file` itself instead, so a non-vision model never receives a
     /// content shape it can't handle.
     pub supports_vision: bool,
+    /// same manual toggle for PDFs — when true, a PDF attachment (chat
+    /// upload, or the agent's own `view_file`) is sent as a base64 `file`
+    /// content block (OpenAI) / `document` block (Anthropic) the model reads
+    /// directly; when false it's only named in the text.
+    pub supports_pdf: bool,
     /// longest the stream may go without delivering a single byte before
     /// the call counts as failed (and gets retried). Reasoning models that
     /// hide their reasoning (OpenAI's) send *nothing* while they think —
@@ -85,6 +90,7 @@ impl Default for LlmConfig {
             model: "claude-sonnet-5".to_string(),
             provider: "anthropic".to_string(),
             supports_vision: false,
+            supports_pdf: false,
             read_timeout_secs: 300,
             reasoning_effort: None,
         }

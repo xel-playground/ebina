@@ -1150,8 +1150,15 @@ pub(crate) async fn handle_chat_message(
     // it's still in flight or if something goes wrong mid-run.
     let mut session = load_session(&state.agent_home, &session_key);
     session.push(user_turn.clone());
-    let supports_vision = Config::load(&state.agent_home).map(|c| c.llm.supports_vision).unwrap_or(false);
-    let history: Vec<Value> = session.iter().map(|t| turn_to_message(&state.agent_home, supports_vision, t)).collect();
+    let support = Config::load(&state.agent_home)
+        .map(|c| AttachmentSupport { images: c.llm.supports_vision, pdf: c.llm.supports_pdf })
+        .unwrap_or_default();
+    // only the last few turns get their files embedded — `history` is resent
+    // in full on every call, and an image/PDF from twenty turns ago would
+    // otherwise be paid for again on every one of them
+    let embed_from = session.len().saturating_sub(EMBED_ATTACHMENT_TURNS);
+    let history: Vec<Value> =
+        session.iter().enumerate().map(|(i, t)| turn_to_message(&state.agent_home, support, i >= embed_from, t)).collect();
     let snapshot_nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let snapshot_path = session_dir(&state.agent_home, &session_key).join(format!("run_snapshot_{snapshot_nanos}.json"));
     if let Some(parent) = snapshot_path.parent() {
@@ -1875,20 +1882,35 @@ struct SessionTurn {
     sender: Option<String>,
 }
 
+/// How many of the most recent chat turns get their attachments embedded.
+const EMBED_ATTACHMENT_TURNS: usize = 3;
+/// Larger files are only named in the text — well under the providers' own
+/// per-file limits, and a sane ceiling on what one turn resends.
+const MAX_EMBED_BYTES: usize = 15 * 1024 * 1024;
+
+/// Which attachment types `[llm]` says the model can take directly.
+#[derive(Clone, Copy, Default)]
+struct AttachmentSupport {
+    images: bool,
+    pdf: bool,
+}
+
 /// Builds the OpenAI/Ollama-style `{role, content}` message `agent_loop.rs`
 /// clones straight into its `messages` array (PROJECT.md: the guest treats
 /// `content` as an opaque JSON value, string or block-array alike, so
 /// nothing on the guest side needs to know attachments exist).
 ///
 /// No attachments → plain string content, unchanged from before. With
-/// attachments: an image gets embedded as a base64 `image_url` block only
-/// if `supports_vision` is on (config.toml `[llm] supports_vision` — no
-/// reliable way to detect this automatically for an arbitrary
-/// OpenAI-compatible endpoint) *and* the file's extension maps to a known
-/// image type; anything else (vision off, non-image file, unreadable file)
-/// just gets named in the text so the agent can `read_file`/`list_dir` it
-/// itself instead of the model silently never learning it exists.
-fn turn_to_message(agent_home: &Path, supports_vision: bool, turn: &SessionTurn) -> Value {
+/// attachments, on a turn where `embed` is set: an image is embedded as a
+/// base64 `image_url` block if `[llm] supports_vision` is on, a PDF as a
+/// base64 `file` block if `[llm] supports_pdf` is on (no reliable way to
+/// detect either automatically for an arbitrary OpenAI-compatible
+/// endpoint). Anything else (capability off, other file type, too big,
+/// unreadable, or an older turn) just gets named in the text so the agent
+/// can `read_file`/`view_file` it itself instead of the model silently
+/// never learning it exists. `llm_call.rs` reshapes these blocks for
+/// Anthropic/Ollama.
+fn turn_to_message(agent_home: &Path, support: AttachmentSupport, embed: bool, turn: &SessionTurn) -> Value {
     // `[timestamp]` first, then `[sender]` — `sender` only ever set on a
     // `role: "user"` turn (see its doc comment), prefixed onto every
     // historical turn that has one, not just the newest, so a shared
@@ -1916,13 +1938,22 @@ fn turn_to_message(agent_home: &Path, supports_vision: bool, turn: &SessionTurn)
     let mut notes = Vec::new();
     for rel_path in &turn.attachments {
         let mime = mime_for_path(rel_path);
-        let embedded = supports_vision
-            && mime.starts_with("image/")
-            && std::fs::read(agent_home.join(rel_path)).ok().map(|bytes| {
+        let wanted = embed && ((support.images && mime.starts_with("image/")) || (support.pdf && mime == "application/pdf"));
+        let block = wanted
+            .then(|| std::fs::read(agent_home.join(rel_path)).ok())
+            .flatten()
+            .filter(|bytes| bytes.len() <= MAX_EMBED_BYTES)
+            .map(|bytes| {
                 use base64::Engine;
-                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                blocks.push(json!({"type": "image_url", "image_url": {"url": format!("data:{mime};base64,{b64}")}}));
-            }).is_some();
+                let data_url = format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(&bytes));
+                if mime == "application/pdf" {
+                    let filename = Path::new(rel_path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    json!({"type": "file", "file": {"filename": filename, "file_data": data_url}})
+                } else {
+                    json!({"type": "image_url", "image_url": {"url": data_url}})
+                }
+            });
+        let embedded = block.map(|b| blocks.push(b)).is_some();
         if !embedded {
             notes.push(format!("[附件: {rel_path}]"));
         }
@@ -1946,6 +1977,7 @@ fn mime_for_path(path: &str) -> &'static str {
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
         "webp" => "image/webp",
+        "pdf" => "application/pdf",
         _ => "application/octet-stream",
     }
 }

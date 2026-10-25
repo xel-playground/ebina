@@ -346,6 +346,19 @@ pub fn run(trigger: &Value) {
                 };
                 push_tool_result(&mut messages, &result);
             }
+            Some("view_file") => {
+                let path = absolute_path(action.get("path").and_then(|p| p.as_str()).unwrap_or(""));
+                match view_file_block(&path) {
+                    Ok(block) => messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": format!("[tool result] {}", serde_json::json!({"ok": true, "attached": path}))},
+                            block,
+                        ]
+                    })),
+                    Err(e) => push_tool_result(&mut messages, &serde_json::json!({"ok": false, "error": e})),
+                }
+            }
             Some("grep_file") => {
                 // finding one entry in a big log/transcript by content, not position —
                 // read_file's start_line/byte_offset need you to already know roughly
@@ -771,7 +784,17 @@ fn compact_run_messages(messages: &mut Vec<Value>, think_path: &str, turn: u32) 
         .iter()
         .map(|m| {
             let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("?");
-            let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("(non-text content)");
+            // a block array (an attached image/PDF) keeps its text; the file
+            // itself never goes into the summarization prompt
+            let content = match m.get("content") {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Array(blocks)) => blocks
+                    .iter()
+                    .map(|b| b.get("text").and_then(|t| t.as_str()).unwrap_or("[attached file]"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                _ => "(non-text content)".to_string(),
+            };
             format!("{role}: {content}")
         })
         .collect::<Vec<_>>()
@@ -1136,6 +1159,10 @@ fn build_system_prompt(trigger: &Value, retrieved: &[String], retrieved_skills: 
          (each `text` capped at 2,000 bytes), `max_matches` defaults to 50. Use this to find where \
          something is in a big file before deciding how to `read_file` it, rather than guessing a \
          `start_line`\n\
+         - `{{\"action\":\"view_file\",\"path\":\"...\"}}` — *look at* an image (png/jpg/gif/webp) or \
+         read a PDF yourself: the file is attached to your next turn so you see it directly (a chart a \
+         script you ran produced, a screenshot, a report someone uploaded). Use read_file for text files. \
+         Errors if the model you're running on can't take that file type, or the file is over 15 MB\n\
          - `{{\"action\":\"write_file\",\"path\":\"...\",\"content\":\"...\"}}` — overwrites the whole \
          file; refused with a `disk quota exceeded` error (and a `notify`) if it would push agent-home \
          over its total size cap. Scoped to `/workspace/` — see \"## Paths and files\" below\n\
@@ -1837,6 +1864,63 @@ fn config_u64(section: &str, key: &str) -> Option<u64> {
     None
 }
 
+/// `[section] key = true|false` — same hand-rolled extraction as
+/// `config_u64`.
+fn config_bool(section: &str, key: &str) -> Option<bool> {
+    let config_text = fs::read_to_string("/config.toml").unwrap_or_default();
+    let header = format!("[{section}]");
+    let mut in_section = false;
+    for line in config_text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_section = line == header;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix(key).map(str::trim_start).and_then(|rest| rest.strip_prefix('=')) {
+            return value.split('#').next().unwrap_or("").trim().parse().ok();
+        }
+    }
+    None
+}
+
+const VIEW_FILE_MAX_BYTES: usize = 15 * 1024 * 1024;
+
+/// The content block `view_file` attaches to the next turn — the same
+/// OpenAI-style shapes `kernel/src/gateway.rs` uses for chat attachments
+/// (`llm_call` reshapes them per provider). Gated on `[llm]
+/// supports_vision`/`supports_pdf`, since only the operator knows what the
+/// configured model accepts.
+fn view_file_block(path: &str) -> Result<Value, String> {
+    use base64::Engine;
+    let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "pdf" => "application/pdf",
+        _ => return Err(format!("{path}: view_file takes images (png/jpg/gif/webp) or PDFs — use read_file for text")),
+    };
+    let (flag, kind) = if mime == "application/pdf" { ("supports_pdf", "PDFs") } else { ("supports_vision", "images") };
+    if config_bool("llm", flag) != Some(true) {
+        return Err(format!("the configured model can't take {kind} directly (`[llm] {flag}` is off)"));
+    }
+    let bytes = fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    if bytes.len() > VIEW_FILE_MAX_BYTES {
+        return Err(format!("{path} is {} bytes, over the {VIEW_FILE_MAX_BYTES}-byte view_file limit", bytes.len()));
+    }
+    let data_url = format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(&bytes));
+    Ok(if mime == "application/pdf" {
+        let filename = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        serde_json::json!({"type": "file", "file": {"filename": filename, "file_data": data_url}})
+    } else {
+        serde_json::json!({"type": "image_url", "image_url": {"url": data_url}})
+    })
+}
+
 const DEFAULT_NOTE_SOFT_MAX_TOKENS: u64 = 2000;
 const DEFAULT_NOTE_MAX_TOKENS: u64 = 4000;
 
@@ -2058,5 +2142,23 @@ mod parse_action_tests {
         assert!(parse_action("no json here").is_err());
         assert!(parse_action(r#"{"action":"done","summary":"unterminated"#).is_err());
         assert!(parse_action("[1,2,3]").is_err());
+    }
+}
+
+#[cfg(test)]
+mod view_file_tests {
+    use super::*;
+
+    #[test]
+    fn text_files_are_pointed_at_read_file() {
+        let err = view_file_block("/workspace/notes.txt").unwrap_err();
+        assert!(err.contains("read_file"));
+    }
+
+    #[test]
+    fn capability_flags_gate_images_and_pdfs() {
+        // no /config.toml in the test process, so both flags read as off
+        assert!(view_file_block("/workspace/chart.png").unwrap_err().contains("supports_vision"));
+        assert!(view_file_block("/workspace/report.pdf").unwrap_err().contains("supports_pdf"));
     }
 }

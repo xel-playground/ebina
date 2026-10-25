@@ -71,6 +71,10 @@ pub fn read_to_string(p: impl AsRef<Path>) -> io::Result<String> {
     std::fs::read_to_string(resolve(p)?)
 }
 
+pub fn read(p: impl AsRef<Path>) -> io::Result<Vec<u8>> {
+    std::fs::read(resolve(p)?)
+}
+
 pub fn write(p: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> io::Result<()> {
     std::fs::write(resolve(p)?, contents)
 }

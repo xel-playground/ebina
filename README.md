@@ -432,6 +432,26 @@ reasoning_effort = "medium"
 With OpenAI the Live Log panel shows no reasoning, only the final output —
 OpenAI doesn't expose it over Chat Completions.
 
+### Images and PDFs
+
+Two manual `[llm]` toggles say what the configured model can take directly
+(there's no reliable way to detect it on an arbitrary endpoint):
+`supports_vision` for images (png/jpg/gif/webp) and `supports_pdf` for PDFs.
+With them on:
+
+- a file uploaded in chat (webui or Discord) is embedded into the
+  conversation — but only on the last 3 turns, since `history` is resent in
+  full every call; older attachments are just named, and anything over
+  15 MB too
+- the agent can `view_file` an image or PDF in its own workspace (e.g. a
+  chart a script it ran produced) to have it attached to its next turn
+
+Blocks are OpenAI-shaped (`image_url`, `file`) and reshaped per provider in
+`llm_call` (Anthropic `image`/`document`, Ollama `images`; Ollama has no
+document input). Transcripts store the request with every embedded file
+replaced by a size note. With a toggle off, files are only named in the
+text, and `view_file` says so.
+
 ### No embed provider available? Run one locally
 
 Some API keys (e.g. an Ollama Cloud key on the free tier) only cover chat

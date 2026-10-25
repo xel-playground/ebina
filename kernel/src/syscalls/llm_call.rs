@@ -245,10 +245,10 @@ pub fn call(state: &mut AgentState, req: Value) -> Value {
             }
         }
     }
-    if provider == "anthropic" {
-        normalize_for_anthropic(&mut body);
-    } else {
-        collapse_content_blocks(&mut body);
+    match provider.as_str() {
+        "anthropic" => normalize_for_anthropic(&mut body),
+        "ollama" => shape_blocks_for_ollama(&mut body),
+        _ => shape_blocks_for_openai(&mut body),
     }
 
     // reqwest's blocking default (30s per read) cuts off a reasoning model
@@ -764,20 +764,104 @@ fn normalize_for_anthropic(body: &mut Value) {
         };
         map.insert("system".to_string(), system_value);
     }
+    if let Some(Value::Array(messages)) = map.get_mut("messages") {
+        for msg in messages.iter_mut() {
+            let Some(Value::Array(blocks)) = msg.get("content").cloned() else { continue };
+            msg["content"] = Value::Array(blocks.iter().filter_map(anthropic_block).collect());
+        }
+    }
+}
+
+/// One OpenAI-style content block (what `gateway.rs` and the agent's
+/// `view_file` produce) in Anthropic's shape: `image_url` data URLs become
+/// `image` blocks, PDF `file` blocks become `document` blocks.
+fn anthropic_block(block: &Value) -> Option<Value> {
+    match block.get("type").and_then(|t| t.as_str()) {
+        Some("image_url") => {
+            let (mime, data) = split_data_url(block.pointer("/image_url/url")?.as_str()?)?;
+            Some(serde_json::json!({"type": "image", "source": {"type": "base64", "media_type": mime, "data": data}}))
+        }
+        Some("file") => {
+            let (mime, data) = split_data_url(block.pointer("/file/file_data")?.as_str()?)?;
+            Some(serde_json::json!({"type": "document", "source": {"type": "base64", "media_type": mime, "data": data}}))
+        }
+        _ => Some(serde_json::json!({"type": "text", "text": block.get("text")?.as_str()?})),
+    }
+}
+
+/// `data:<mime>;base64,<data>` → (mime, data)
+fn split_data_url(url: &str) -> Option<(&str, &str)> {
+    let (meta, data) = url.strip_prefix("data:")?.split_once(',')?;
+    Some((meta.strip_suffix(";base64")?, data))
 }
 
 /// Non-Anthropic providers (openai/ollama) don't understand the `cache`
 /// hint on a system content block — collapses `agent_loop.rs`'s stable/
 /// volatile split back into the one plain string those APIs expect, same
 /// as before per-provider prompt caching existed.
-fn collapse_content_blocks(body: &mut Value) {
+/// OpenAI chat completions: the system prompt's cache-split blocks join
+/// back into one string (the `cache` marker is Anthropic-only), a message
+/// that's all text becomes a plain string, and one carrying an image or
+/// file keeps its block array — dropping it (as this used to, for every
+/// non-Anthropic provider) silently threw the attachment away.
+fn shape_blocks_for_openai(body: &mut Value) {
     let Value::Object(map) = body else { return };
     let Some(Value::Array(messages)) = map.get_mut("messages") else { return };
     for msg in messages.iter_mut() {
         let Some(Value::Array(blocks)) = msg.get("content").cloned() else { continue };
-        let joined: String = blocks.iter().filter_map(|b| b.get("text").and_then(|t| t.as_str())).collect();
-        msg["content"] = Value::String(joined);
+        let is_system = msg.get("role").and_then(|r| r.as_str()) == Some("system");
+        let all_text = blocks.iter().all(|b| b.get("type").and_then(|t| t.as_str()).unwrap_or("text") == "text");
+        if is_system || all_text {
+            msg["content"] = Value::String(joined_text(&blocks));
+        } else {
+            msg["content"] = Value::Array(
+                blocks
+                    .iter()
+                    .map(|b| match b.get("text").and_then(|t| t.as_str()) {
+                        Some(text) if b.get("type").and_then(|t| t.as_str()).unwrap_or("text") == "text" => {
+                            serde_json::json!({"type": "text", "text": text})
+                        }
+                        _ => b.clone(),
+                    })
+                    .collect(),
+            );
+        }
     }
+}
+
+/// Ollama's native `/api/chat`: `content` is always a string; images ride
+/// along as raw base64 in a separate `images` array. It has no document
+/// input, so a PDF is reduced to a note in the text.
+fn shape_blocks_for_ollama(body: &mut Value) {
+    let Value::Object(map) = body else { return };
+    let Some(Value::Array(messages)) = map.get_mut("messages") else { return };
+    for msg in messages.iter_mut() {
+        let Some(Value::Array(blocks)) = msg.get("content").cloned() else { continue };
+        let mut text = joined_text(&blocks);
+        let mut images = Vec::new();
+        for b in &blocks {
+            match b.get("type").and_then(|t| t.as_str()) {
+                Some("image_url") => {
+                    if let Some((_, data)) = b.pointer("/image_url/url").and_then(|u| u.as_str()).and_then(split_data_url) {
+                        images.push(Value::String(data.to_string()));
+                    }
+                }
+                Some("file") => {
+                    let name = b.pointer("/file/filename").and_then(|n| n.as_str()).unwrap_or("file");
+                    text.push_str(&format!("\n[{name} attached, but this model can't read files directly]"));
+                }
+                _ => {}
+            }
+        }
+        msg["content"] = Value::String(text);
+        if !images.is_empty() {
+            msg["images"] = Value::Array(images);
+        }
+    }
+}
+
+fn joined_text(blocks: &[Value]) -> String {
+    blocks.iter().filter_map(|b| b.get("text").and_then(|t| t.as_str())).collect()
 }
 
 #[cfg(test)]
@@ -874,7 +958,7 @@ mod cache_block_tests {
     }
 
     #[test]
-    fn collapse_content_blocks_joins_text_for_non_anthropic() {
+    fn openai_joins_text_only_blocks() {
         let mut body = serde_json::json!({
             "messages": [
                 {"role": "system", "content": [
@@ -883,8 +967,92 @@ mod cache_block_tests {
                 ]}
             ]
         });
-        collapse_content_blocks(&mut body);
+        shape_blocks_for_openai(&mut body);
         assert_eq!(body["messages"][0]["content"], "stablevolatile");
+    }
+
+    fn message_with_attachments() -> Value {
+        serde_json::json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "look"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            {"type": "file", "file": {"filename": "r.pdf", "file_data": "data:application/pdf;base64,BBBB"}}
+        ]}]})
+    }
+
+    #[test]
+    fn openai_keeps_image_and_file_blocks() {
+        let mut body = message_with_attachments();
+        shape_blocks_for_openai(&mut body);
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[1]["type"], "image_url");
+        assert_eq!(blocks[2]["file"]["filename"], "r.pdf");
+    }
+
+    #[test]
+    fn anthropic_gets_image_and_document_blocks() {
+        let mut body = message_with_attachments();
+        normalize_for_anthropic(&mut body);
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks[0], serde_json::json!({"type": "text", "text": "look"}));
+        assert_eq!(blocks[1]["source"], serde_json::json!({"type": "base64", "media_type": "image/png", "data": "AAAA"}));
+        assert_eq!(blocks[2]["type"], "document");
+        assert_eq!(blocks[2]["source"]["media_type"], "application/pdf");
+    }
+
+    #[test]
+    fn ollama_moves_images_aside_and_notes_files() {
+        let mut body = message_with_attachments();
+        shape_blocks_for_ollama(&mut body);
+        let msg = &body["messages"][0];
+        assert_eq!(msg["images"], serde_json::json!(["AAAA"]));
+        assert!(msg["content"].as_str().unwrap().starts_with("look"));
+        assert!(msg["content"].as_str().unwrap().contains("r.pdf"));
+    }
+
+    #[test]
+    fn transcripts_drop_embedded_payloads() {
+        let big = "A".repeat(2000);
+        let mut req = serde_json::json!({"messages": [{"content": [
+            {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{big}")}},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": big.clone()}},
+            {"type": "text", "text": big.clone()}
+        ], "images": [big.clone()]}]});
+        redact_embedded_files(&mut req);
+        let blocks = &req["messages"][0]["content"];
+        assert_eq!(blocks[0]["image_url"]["url"], "data:image/png;base64,<2022 chars omitted>");
+        assert_eq!(blocks[1]["source"]["data"], "<2000 chars omitted>");
+        assert_eq!(blocks[2]["text"], big, "ordinary long text is kept");
+        assert_eq!(req["messages"][0]["images"][0], "<2000 chars omitted>");
+    }
+}
+
+/// Replaces base64 file payloads — a `data:` URL (OpenAI shape), an
+/// Anthropic `source.data`, an Ollama `images` entry — with a size note.
+fn redact_embedded_files(value: &mut Value) {
+    const KEEP_UNDER: usize = 512;
+    match value {
+        Value::Object(map) => {
+            let is_base64_source = map.get("type").and_then(|t| t.as_str()) == Some("base64");
+            for (key, v) in map.iter_mut() {
+                match v {
+                    Value::String(s) if s.len() > KEEP_UNDER && (s.starts_with("data:") || (is_base64_source && key == "data")) => {
+                        let prefix = s.split_once(',').map(|(p, _)| format!("{p},")).unwrap_or_default();
+                        *s = format!("{prefix}<{} chars omitted>", s.len());
+                    }
+                    Value::Array(items) if key == "images" => {
+                        for item in items.iter_mut() {
+                            if let Value::String(s) = item {
+                                *s = format!("<{} chars omitted>", s.len());
+                            }
+                        }
+                    }
+                    _ => redact_embedded_files(v),
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(redact_embedded_files),
+        _ => {}
     }
 }
 
@@ -895,6 +1063,10 @@ fn write_transcript(state: &AgentState, request: &Value, response: &Value, sourc
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    // the request goes to disk minus any embedded file — a single PDF would
+    // otherwise be copied into every transcript of every turn that resent it
+    let mut request = request.clone();
+    redact_embedded_files(&mut request);
     let _ = std::fs::write(
         &path,
         serde_json::to_vec_pretty(&serde_json::json!({"request": request, "response": response, "source": source}))
